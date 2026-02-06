@@ -14,7 +14,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 # 🔗 モジュール読み込みチェック
 # =========================================================
 try:
-    from logic_engine import MarketDataEngine, PortfolioAnalyzer, PortfolioDiagnosticEngine
+    from simulation_engine import MarketDataEngine, PortfolioAnalyzer, PortfolioDiagnosticEngine
     from pdf_generator import create_pdf_report
 except ImportError as e:
     st.error(f"❌ 重要ファイルが見つかりません: {e}")
