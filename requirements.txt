@@ -2,9 +2,12 @@ streamlit
 pandas
 numpy
 yfinance>=0.2.0
-plotly
+reportlab
 statsmodels
 scikit-learn
 pandas-datareader
 requests
 openpyxl
+kaleido==0.2.1
+plotly
+lxml
