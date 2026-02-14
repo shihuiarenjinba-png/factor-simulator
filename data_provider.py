@@ -4,13 +4,14 @@ import pandas as pd
 import numpy as np
 import datetime
 from scipy.stats import linregress
+from concurrent.futures import ThreadPoolExecutor  # 【追加】並列処理用
 
 # ---------------------------------------------------------
 # 0. 基本設定 (Config)
 # ---------------------------------------------------------
 st.set_page_config(layout="wide", page_title="Market Factor Lab Pro (Modular)")
 
-# 分析対象ユニバース（全銘柄へ拡張する場合、ここに追加するだけでOK）
+# 分析対象ユニバース（既存のロジックを維持するため残しています）
 NIKKEI_225_SAMPLE = [
     "7203.T", "6758.T", "6861.T", "9984.T", "9983.T", "8035.T", "6098.T", "4063.T", "6367.T", "9432.T",
     "4502.T", "4503.T", "6501.T", "7267.T", "8058.T", "8001.T", "6954.T", "6981.T", "9020.T", "9022.T",
@@ -26,34 +27,47 @@ TOPIX_100_SAMPLE = [
 ]
 
 # ---------------------------------------------------------
-# 【NEW】Module 1: Data Provider (データ取得基盤)
+# 【Modified】Module 1: Data Provider (並列処理・高速化・堅牢版)
 # ---------------------------------------------------------
 class DataProvider:
     """
-    データ取得とキャッシュ管理を担当する独立モジュール
+    データ取得とキャッシュ管理を担当する独立モジュール (v2.0 High-Speed)
     """
-    
+
+    @staticmethod
+    def get_universe_tickers(mode="Nikkei 225"):
+        """
+        ベンチマークに応じた銘柄リストを動的に返す（将来的な拡張用）
+        """
+        if "Nikkei" in mode:
+            # 必要に応じて全銘柄リストなどをここに記述
+            return NIKKEI_225_SAMPLE
+        elif "TOPIX" in mode:
+            return TOPIX_100_SAMPLE
+        return []
+
     @staticmethod
     @st.cache_data(ttl=3600)  # 1時間はキャッシュを保持
     def fetch_fundamentals(tickers):
         """
-        ファンダメンタルズ情報（時価総額、ROE、PBRなど）を取得
+        ファンダメンタルズ情報（時価総額、ROE、PBRなど）を並列処理で高速取得
         """
-        data_list = []
-        # プログレスバーの表示（UX向上）
-        bar = st.progress(0)
-        status = st.empty()
+        # 重複削除
+        unique_tickers = list(set(tickers))
         
-        total = len(tickers)
-        for i, ticker in enumerate(tickers):
-            status.text(f"Fetching Metadata: {ticker} ({i+1}/{total})")
+        # 内部関数: 1銘柄ごとの取得ロジック
+        def get_single_stock(ticker):
             try:
-                # yfinanceのTickerオブジェクト作成
-                stock = yf.Ticker(ticker)
-                info = stock.info
+                tk = yf.Ticker(ticker)
+                # fast_infoではなく、より詳細な info を使用
+                info = tk.info
                 
-                # 必要なデータのみ抽出して軽量化
-                data_list.append({
+                # 【バリデーション】 必須データ欠損チェック
+                # 価格情報が取れないものは、上場廃止やエラーの可能性が高いため除外
+                if info is None or 'currentPrice' not in info or info['currentPrice'] is None:
+                    return None
+                
+                return {
                     'Ticker': ticker,
                     'Name': info.get('shortName', ticker),
                     'Price': info.get('currentPrice', np.nan),
@@ -61,29 +75,70 @@ class DataProvider:
                     'PBR': info.get('priceToBook', np.nan),     # Value用
                     'ROE': info.get('returnOnEquity', np.nan),  # Quality用
                     'Growth': info.get('revenueGrowth', np.nan) # Investment用
-                })
+                }
             except Exception:
-                # 取得失敗しても止まらずスキップ
-                pass
-            bar.progress((i + 1) / total)
-            
-        bar.empty()
-        status.empty()
-        return pd.DataFrame(data_list)
+                # 取得失敗時はNoneを返し、後でリストから除外する
+                return None
+
+        # 並列処理の実行 (最大20スレッドで同時取得)
+        results = []
+        # UX向上のためspinnerは呼び出し元で制御推奨だが、ここではバックグラウンド処理
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            # mapは入力順序を保持する
+            fetched_data = list(executor.map(get_single_stock, unique_tickers))
+        
+        # None (取得失敗) をリストから除外
+        results = [d for d in fetched_data if d is not None]
+
+        if not results:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(results)
+        
+        # 数値型の強制変換（念のためエラー回避）
+        num_cols = ['Price', 'Size_Raw', 'PBR', 'ROE', 'Growth']
+        for c in num_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+
+        return df
 
     @staticmethod
-    @st.cache_data(ttl=3600)
+    @st.cache_data(ttl=86400) # ヒストリカルデータは1日保持
     def fetch_historical_prices(tickers, days=365):
         """
-        ヒストリカルデータ（株価推移）を一括取得
+        ヒストリカルデータ（株価推移）を一括取得 (v2.0 Robust)
         """
         end_date = datetime.datetime.now()
         start_date = end_date - datetime.timedelta(days=days)
         
-        # yf.downloadで一括取得（ループより高速）
+        if not tickers:
+            return pd.DataFrame()
+
         try:
-            df = yf.download(tickers, start=start_date, end=end_date, progress=False)['Close']
-            return df
+            # yf.downloadは内部でマルチスレッド化されているため高速
+            # group_by='ticker' で構造を固定化
+            df = yf.download(tickers, start=start_date, end=end_date, progress=False, group_by='ticker', auto_adjust=True)
+            
+            # DataFrame構造の正規化
+            if len(tickers) == 1:
+                # 1銘柄の場合: Index=Date, Columns=[Open, High, Low, Close...]
+                ticker = tickers[0]
+                # 'Close'列が存在するか確認
+                if 'Close' in df.columns:
+                    return pd.DataFrame({ticker: df['Close']})
+                else:
+                    return pd.DataFrame() # データなし
+            else:
+                # 複数銘柄の場合: MultiIndex (Ticker, OHLC) -> (Ticker, Close) を抽出
+                try:
+                    # xsを使って 'Close' レベルを抽出 (axis=1)
+                    df_close = df.xs('Close', axis=1, level=1, drop_level=True)
+                    return df_close
+                except KeyError:
+                    # まれに構造が違う場合やデータ欠損への対策
+                    return pd.DataFrame()
+                    
         except Exception as e:
             st.error(f"Historical Data Error: {e}")
             return pd.DataFrame()
@@ -290,12 +345,12 @@ if st.sidebar.button("Run Full Analysis", type="primary"):
     user_df_base = pd.DataFrame(input_data)
     user_tickers = user_df_base['Ticker'].tolist()
     
-    # B. Module 1: データ取得 (キャッシュ効くので2回目以降爆速)
+    # B. Module 1: データ取得 (High-Speed & Parallel)
     with st.spinner("Fetching Market Data (Module 1)..."):
         # ユニバース + ユーザー銘柄 + ベンチマークETF
         all_tickers = list(set(selected_universe + user_tickers + [bench_ticker]))
         
-        # 1. ファンダメンタルズ取得
+        # 1. ファンダメンタルズ取得 (並列処理)
         df_fund = DataProvider.fetch_fundamentals(all_tickers)
         
         # 2. ヒストリカル取得
