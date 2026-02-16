@@ -5,7 +5,7 @@ from scipy.stats import linregress
 class QuantEngine:
     """
     ポートフォリオの数値計算、スコアリング、インサイト生成を担当するエンジン
-    【修正版】データ型チェックとエラーハンドリングを強化
+    【修正版 Step 1】入力データの型変換とエラーハンドリングを強化
     """
     
     @staticmethod
@@ -13,22 +13,37 @@ class QuantEngine:
         """
         時系列データからBetaとMomentumを計算し、Fundamental DataFrameに結合して返す
         """
-        df = df_fund.copy()
-        betas = {}
-        momenta = {}
+        # --- [Step 1 修正] 入力データの安全化 ---
         
-        # 【修正1】入力データの型チェックを厳格化
-        # DataFrameでない、または空の場合はデフォルト値を返す
+        # 1. df_fund が DataFrame でない場合（リスト等が来た場合）の救済
+        if not isinstance(df_fund, pd.DataFrame):
+            # リストなら DataFrame に変換を試みる
+            try:
+                df = pd.DataFrame(df_fund)
+                if 'Ticker' not in df.columns and 0 in df.columns:
+                    df.rename(columns={0: 'Ticker'}, inplace=True)
+            except:
+                # 変換不可なら空のDataFrameにして返す（エラー回避）
+                return pd.DataFrame()
+        else:
+            df = df_fund.copy()
+
+        # 2. df_hist が DataFrame でない、または空の場合のデフォルト値設定
+        #    文字列などが渡された場合の AttributeError を防ぐ
         if not isinstance(df_hist, pd.DataFrame) or df_hist.empty:
-            df['Beta_Raw'] = 1.0
-            df['Momentum_Raw'] = 0.0
+            # カラムが存在しない場合は作成
+            if 'Beta_Raw' not in df.columns:
+                df['Beta_Raw'] = 1.0
+            if 'Momentum_Raw' not in df.columns:
+                df['Momentum_Raw'] = 0.0
             return df
+
+        # --- 以下、計算ロジック ---
 
         # リターン計算
         try:
             rets = df_hist.pct_change().dropna()
         except Exception:
-            # pct_changeで予期せぬエラーが出た場合も安全に抜ける
             df['Beta_Raw'] = 1.0
             df['Momentum_Raw'] = 0.0
             return df
@@ -42,19 +57,21 @@ class QuantEngine:
         bench_ret = rets[benchmark_ticker]
         bench_var = bench_ret.var()
 
+        # 結果を格納する辞書
+        betas = {}
+        momenta = {}
+
         for t in df['Ticker']:
             # Beta
             if t in rets.columns:
                 try:
                     cov = rets[t].cov(bench_ret)
-                    # 分散が0に近い場合のゼロ除算対策
                     betas[t] = cov / bench_var if bench_var > 1e-8 else 1.0
                 except:
                     betas[t] = 1.0
                 
-                # Momentum (簡易: 期間全体の騰落率)
+                # Momentum
                 try:
-                    # 【修正2】カラム存在確認とデータ欠損チェック
                     if t in df_hist.columns:
                         series = df_hist[t].dropna()
                         if not series.empty:
@@ -77,17 +94,16 @@ class QuantEngine:
 
     @staticmethod
     def process_raw_factors(df):
-        """
-        生データをファクター分析用の形式に加工 (Log化、逆数化など)
-        """
+        """生データをファクター分析用の形式に加工"""
         # Value (PBRの逆数)
-        df['Value_Raw'] = df['PBR'].apply(lambda x: 1/x if (pd.notnull(x) and x > 0) else np.nan)
+        if 'PBR' in df.columns:
+            df['Value_Raw'] = df['PBR'].apply(lambda x: 1/x if (pd.notnull(x) and x > 0) else np.nan)
+        
         # Size (時価総額の対数)
-        df['Size_Log'] = np.log(pd.to_numeric(df['Size_Raw'], errors='coerce').replace(0, np.nan))
+        if 'Size_Raw' in df.columns:
+            df['Size_Log'] = np.log(pd.to_numeric(df['Size_Raw'], errors='coerce').replace(0, np.nan))
         
         # カラム名統一
-        # DataProviderから来るキー: ROE, Growth
-        # 分析用キー: Quality_Raw, Investment_Raw
         if 'ROE' in df.columns:
             df['Quality_Raw'] = df['ROE']
         if 'Growth' in df.columns:
@@ -97,12 +113,10 @@ class QuantEngine:
 
     @staticmethod
     def compute_z_scores(df_target, stats):
-        """
-        市場統計(stats)を用いてZスコアを計算する。直交化処理も含む。
-        """
+        """市場統計(stats)を用いてZスコアを計算する"""
         df = df_target.copy()
         
-        # 1. 直交化 (Quality vs Investment)
+        # 1. 直交化
         slope = stats.get('ortho_slope', 0)
         intercept = stats.get('ortho_intercept', 0)
         
@@ -110,22 +124,23 @@ class QuantEngine:
             q = row.get('Quality_Raw', np.nan)
             i = row.get('Investment_Raw', np.nan)
             if pd.isna(q): return np.nan
-            if pd.isna(i): return q # Investmentがない場合はQualityそのまま
+            if pd.isna(i): return q 
             return q - (slope * i + intercept)
             
         df['Quality_Orthogonal'] = df.apply(apply_ortho, axis=1)
 
         # 2. Zスコア計算
         factors = ['Beta', 'Value', 'Size', 'Momentum', 'Quality', 'Investment']
-        r_squared_map = {} # 今回は簡易実装のため空
+        r_squared_map = {} 
 
         for f in factors:
             if f not in stats: continue
             
-            # 参照カラム
             if f == 'Quality': col_name = 'Quality_Orthogonal'
             else: col_name = stats[f]['col']
             
+            if col_name not in df.columns: continue
+
             mu = stats[f]['mean']
             sigma = stats[f]['std']
             z_col = f"{f}_Z"
@@ -133,7 +148,7 @@ class QuantEngine:
             def calc_z(val):
                 if pd.isna(val) or sigma == 0: return 0.0
                 z = (val - mu) / sigma
-                if f == 'Size': z = -z # SMB反転 (小型株プラス)
+                if f == 'Size': z = -z 
                 return z
             
             df[z_col] = df[col_name].apply(calc_z)
