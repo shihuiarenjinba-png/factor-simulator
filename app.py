@@ -18,7 +18,7 @@ except ImportError as e:
 # ---------------------------------------------------------
 st.set_page_config(layout="wide", page_title="Market Factor Lab (Pro)")
 
-# カスタムCSS (カードデザインとフォント調整)
+# カスタムCSS
 st.markdown("""
 <style>
     .metric-card {
@@ -48,7 +48,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ベンチマーク定義 (日経225採用銘柄の一部 + ETF)
+# ---------------------------------------------------------
+# 1. 定数定義 (ベンチマーク用ユニバース)
+# ---------------------------------------------------------
+# 日経225 (サンプル)
 NIKKEI_225_SAMPLE = [
     "7203.T", "6758.T", "8035.T", "9984.T", "9983.T", "6098.T", "4063.T", "6367.T", "9432.T", "4502.T",
     "4503.T", "6501.T", "7267.T", "8058.T", "8001.T", "6954.T", "6981.T", "9020.T", "9022.T", "7741.T",
@@ -57,75 +60,80 @@ NIKKEI_225_SAMPLE = [
     "8591.T", "8801.T", "8802.T", "9021.T", "9101.T", "9433.T", "9434.T", "9501.T", "9502.T"
 ]
 
+# TOPIX Core 30 (サンプル: 日本を代表する超大型株)
+TOPIX_CORE_30 = [
+    "7203.T", "6758.T", "8306.T", "9984.T", "9432.T", "6861.T", "8035.T", "6098.T", "8316.T", "4063.T",
+    "9983.T", "6367.T", "4502.T", "7974.T", "8058.T", "8001.T", "2914.T", "6501.T", "7267.T", "8411.T",
+    "6954.T", "6902.T", "7741.T", "9020.T", "9022.T", "4452.T", "5108.T", "8801.T", "6752.T", "6273.T"
+]
+
 # ---------------------------------------------------------
-# 1. ヘルパー関数 (Beta計算 & インサイト生成)
+# 2. ヘルパー関数
 # ---------------------------------------------------------
-def calculate_beta_momentum(tickers, benchmark_ticker="1321.T"):
+def parse_portfolio_input(input_text):
     """
-    時系列データからBetaとMomentumを計算する
+    入力テキストを解析し、{Ticker: Weight} の辞書を返す
+    形式1: "7203.T, 9984.T" -> 均等配分
+    形式2: "7203.T:0.5, 9984.T:0.5" -> 指定配分
     """
-    needed_tickers = list(set(tickers + [benchmark_ticker]))
-    df_hist = DataProvider.fetch_historical_prices(needed_tickers, days=365)
+    weights = {}
+    raw_items = [x.strip() for x in input_text.replace('\n', ',').split(',') if x.strip()]
     
-    betas = {}
-    momenta = {}
+    if not raw_items:
+        return {}
+
+    # コロンが含まれているかチェック (重み付けモード)
+    is_weighted = any(':' in item for item in raw_items)
     
-    if df_hist.empty:
-        return pd.Series(dtype=float), pd.Series(dtype=float)
-
-    rets = df_hist.pct_change().dropna()
-    if benchmark_ticker not in rets.columns:
-        return pd.Series(dtype=float), pd.Series(dtype=float)
-
-    bench_ret = rets[benchmark_ticker]
-    bench_var = bench_ret.var()
-
-    for t in tickers:
-        if t in rets.columns:
-            # Beta
-            try:
-                cov = rets[t].cov(bench_ret)
-                betas[t] = cov / bench_var if bench_var > 0 else 1.0
-            except:
-                betas[t] = 1.0
-            # Momentum (12M Return)
-            try:
-                p_start = df_hist[t].iloc[0]
-                p_end = df_hist[t].iloc[-1]
-                momenta[t] = (p_end / p_start) - 1 if p_start > 0 else 0.0
-            except:
-                momenta[t] = 0.0
-        else:
-            betas[t] = np.nan
-            momenta[t] = np.nan
+    if is_weighted:
+        for item in raw_items:
+            if ':' in item:
+                parts = item.split(':')
+                ticker = parts[0].strip()
+                try:
+                    w = float(parts[1])
+                except ValueError:
+                    w = 0.0
+                weights[ticker] = w
+            else:
+                # コロンがない場合はとりあえず0扱い（後で正規化も可能だが今回はスキップ）
+                weights[item] = 0.0
+    else:
+        # 均等配分モード
+        count = len(raw_items)
+        for item in raw_items:
+            weights[item] = 1.0 / count
             
-    return pd.Series(betas), pd.Series(momenta)
+    # 重みの正規化 (合計が1になるように調整)
+    total_w = sum(weights.values())
+    if total_w > 0:
+        for k in weights:
+            weights[k] = weights[k] / total_w
+            
+    return weights
 
 def generate_insights(z_scores):
-    """
-    Zスコアに基づいて日本語の診断メッセージを生成する
-    """
+    """Zスコアに基づいて日本語の診断メッセージを生成する"""
     insights = []
     
-    # 1. Size (大型 vs 小型)
-    # 反転済み: プラス=小型, マイナス=大型
+    # 1. Size
     size_z = z_scores.get('Size', 0)
     if size_z < -1.0:
         insights.append("✅ **大型株中心**: 財務基盤が安定した大型株への配分が高く、市場変動に対する耐久性が期待できます。")
     elif size_z > 1.0:
         insights.append("🚀 **小型株効果**: 時価総額の小さい銘柄が多く、市場平均を上回る成長ポテンシャルを秘めています。")
         
-    # 2. Value (割安 vs 割高)
+    # 2. Value
     value_z = z_scores.get('Value', 0)
     if value_z > 1.0:
         insights.append("💰 **バリュー投資**: 純資産に対して割安な銘柄が多く、下値リスクが限定的である可能性があります。")
         
-    # 3. Quality (高収益 vs 低収益)
+    # 3. Quality
     qual_z = z_scores.get('Quality', 0)
     if qual_z > 1.0:
         insights.append("💎 **高クオリティ**: ROE等の収益性が市場平均より高く、経営効率の良い企業群です。")
         
-    # 4. Momentum (順張り vs 逆張り)
+    # 4. Momentum
     mom_z = z_scores.get('Momentum', 0)
     if mom_z < -1.0:
         insights.append("🔄 **リバーサル狙い**: 直近で株価が出遅れている銘柄が多く、反発（見直し買い）を狙う構成です。")
@@ -138,43 +146,60 @@ def generate_insights(z_scores):
     return insights
 
 # ---------------------------------------------------------
-# 2. UI レイアウト & 入力
+# 3. UI レイアウト & 入力 (サイドバー強化)
 # ---------------------------------------------------------
 st.sidebar.header("📊 Settings")
 
-# ベンチマーク
-benchmark_etf = "1321.T"
-universe_tickers = NIKKEI_225_SAMPLE
+# --- Step 2: ベンチマーク選択 ---
+bench_mode = st.sidebar.selectbox(
+    "Benchmark Index",
+    ["Nikkei 225", "TOPIX Core 30"]
+)
 
-# ポートフォリオ入力
+if bench_mode == "Nikkei 225":
+    benchmark_etf = "1321.T"
+    universe_tickers = NIKKEI_225_SAMPLE
+else:
+    benchmark_etf = "1306.T" # TOPIX連動ETF
+    universe_tickers = TOPIX_CORE_30
+
+st.sidebar.markdown("---")
+
+# --- Step 2: ポートフォリオ入力 (比率対応) ---
 st.sidebar.subheader("My Portfolio")
-default_input = "7203.T, 9984.T, 6758.T, 8035.T"
-input_text = st.sidebar.text_area("Tickers (comma separated)", default_input, height=100)
+st.sidebar.caption("Format: `Ticker` or `Ticker:Weight`")
+
+# デフォルト値を少しリッチに変更
+default_input = "7203.T: 40, 6758.T: 30, 9984.T: 30"
+input_text = st.sidebar.text_area("Input", default_input, height=120)
 
 run_btn = st.sidebar.button("Run Analysis", type="primary")
 
 # ---------------------------------------------------------
-# 3. メイン処理フロー
+# 4. メイン処理フロー
 # ---------------------------------------------------------
 if run_btn:
     st.title("🛡️ Market Factor Lab (Pro)")
     
-    # [Step 1] 入力解析
-    user_tickers = [x.strip() for x in input_text.split(',') if x.strip()]
+    # [Step 1] 入力解析 (ウェイト対応)
+    portfolio_dict = parse_portfolio_input(input_text)
+    user_tickers = list(portfolio_dict.keys())
+    
     if not user_tickers:
         st.warning("銘柄を入力してください。")
         st.stop()
-
-    # [Step 2] データ取得 & 市場統計作成 (Benchmark Construction)
+        
+    # [Step 2] データ取得 & 市場統計作成
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    status_text.text("Fetching Market Data...")
+    status_text.text(f"Fetching Market Data ({bench_mode})...")
     df_bench_fund = DataProvider.fetch_fundamentals(universe_tickers)
     progress_bar.progress(20)
     
     status_text.text("Calculating Market Beta & Momentum...")
-    s_beta_bench, s_mom_bench = calculate_beta_momentum(universe_tickers, benchmark_etf)
+    s_beta_bench, s_mom_bench = QuantEngine.calculate_beta_momentum(universe_tickers, benchmark_etf)
+    
     df_bench_fund['Beta_Raw'] = df_bench_fund['Ticker'].map(s_beta_bench)
     df_bench_fund['Momentum_Raw'] = df_bench_fund['Ticker'].map(s_mom_bench)
     progress_bar.progress(40)
@@ -183,17 +208,19 @@ if run_btn:
     market_stats, df_bench_processed = UniverseManager.generate_market_stats(df_bench_fund)
     progress_bar.progress(60)
 
-    # [Step 3] ユーザーポートフォリオ評価 (User Scoring)
+    # [Step 3] ユーザーポートフォリオ評価
     status_text.text("Analyzing Your Portfolio...")
     df_user_fund = DataProvider.fetch_fundamentals(user_tickers)
-    s_beta_user, s_mom_user = calculate_beta_momentum(user_tickers, benchmark_etf)
+    
+    s_beta_user, s_mom_user = QuantEngine.calculate_beta_momentum(user_tickers, benchmark_etf)
+    
     df_user_fund['Beta_Raw'] = df_user_fund['Ticker'].map(s_beta_user)
     df_user_fund['Momentum_Raw'] = df_user_fund['Ticker'].map(s_mom_user)
     
-    # 生データ加工 (Log化など)
+    # 生データ加工
     df_user_proc = QuantEngine.process_raw_factors(df_user_fund)
     
-    # 直交化 (ユーザーデータの補正)
+    # 直交化
     slope = market_stats['ortho_slope']
     intercept = market_stats['ortho_intercept']
     def apply_ortho(row):
@@ -204,45 +231,57 @@ if run_btn:
         return q - (slope * i + intercept)
     df_user_proc['Quality_Orthogonal'] = df_user_proc.apply(apply_ortho, axis=1)
 
-    # Zスコア計算 (市場基準との比較)
+    # Zスコア計算
     df_scored, r_squared_map = QuantEngine.compute_z_scores(df_user_proc, market_stats)
+    
+    # --- 重要: ウェイト情報をマージ ---
+    df_scored['Weight'] = df_scored['Ticker'].map(portfolio_dict)
     
     progress_bar.progress(100)
     status_text.empty()
     progress_bar.empty()
 
     # -----------------------------------------------------
-    # [Step 4] 結果表示 (Visualization)
+    # [Step 4] 結果表示 (加重平均対応)
     # -----------------------------------------------------
     
-    # 全体ウェイト (現状は均等配分と仮定)
-    total_weight = 1.0 / len(df_scored)
-    
-    # ポートフォリオ全体のZスコア平均を算出
+    # 加重平均Zスコアの算出
     z_cols = [c for c in df_scored.columns if c.endswith('_Z')]
     portfolio_exposure = {}
     
     for col in z_cols:
-        # Zスコアの単純平均 (本来はウェイト加重平均推奨)
-        score = df_scored[col].mean()
-        factor_name = col.replace('_Z', '')
-        portfolio_exposure[factor_name] = score
+        # np.average を使用して加重平均を計算 (欠損値ケア)
+        valid_rows = df_scored.dropna(subset=[col, 'Weight'])
+        if not valid_rows.empty:
+            w_avg = np.average(valid_rows[col], weights=valid_rows['Weight'])
+            factor_name = col.replace('_Z', '')
+            portfolio_exposure[factor_name] = w_avg
+        else:
+            portfolio_exposure[col.replace('_Z', '')] = 0.0
 
     # --- Layout: Top KPI Cards ---
-    st.subheader("📊 Portfolio Diagnostic")
+    st.subheader(f"📊 Portfolio Diagnostic (vs {bench_mode})")
     
     col1, col2, col3 = st.columns(3)
     
-    # Beta (平均)
-    avg_beta = df_user_fund['Beta_Raw'].mean()
+    # Weighted Beta
+    # ベータも加重平均する
+    valid_beta = df_user_fund.dropna(subset=['Beta_Raw'])
+    # df_user_fund に weight 情報がないので df_scored から持ってくるか、mapで対応
+    valid_beta['Weight'] = valid_beta['Ticker'].map(portfolio_dict)
+    if not valid_beta.empty:
+        avg_beta = np.average(valid_beta['Beta_Raw'], weights=valid_beta['Weight'])
+    else:
+        avg_beta = 0.0
+
     col1.markdown(f"""
     <div class="metric-card">
-        <div class="metric-label">Avg Beta (Risk)</div>
+        <div class="metric-label">Weighted Beta</div>
         <div class="metric-value">{avg_beta:.2f}</div>
     </div>
     """, unsafe_allow_html=True)
     
-    # Quality Z-Score
+    # Quality Score
     qual_score = portfolio_exposure.get('Quality', 0)
     q_color = "green" if qual_score > 0 else "red"
     col2.markdown(f"""
@@ -252,7 +291,7 @@ if run_btn:
     </div>
     """, unsafe_allow_html=True)
     
-    # Active Share (簡易: 銘柄数で表現)
+    # Holdings
     col3.markdown(f"""
     <div class="metric-card">
         <div class="metric-label">Holdings</div>
@@ -266,23 +305,19 @@ if run_btn:
     c_chart, c_insight = st.columns([2, 1])
     
     with c_chart:
-        st.subheader("Factor Exposure (vs Market Natural)")
+        st.subheader("Factor Exposure (Weighted)")
         
-        # グラフ用データ作成
         factors = list(portfolio_exposure.keys())
         scores = list(portfolio_exposure.values())
         
-        # R²の表示用テキスト作成
         y_labels = []
         for f in factors:
             r2 = r_squared_map.get(f)
             if r2 is not None:
-                # ファクター名に R² を添える
                 y_labels.append(f"{f} (R²: {r2:.2f})")
             else:
                 y_labels.append(f)
         
-        # Plotly Bar Chart
         fig = go.Figure()
         fig.add_trace(go.Bar(
             x=scores,
@@ -298,34 +333,28 @@ if run_btn:
         ))
         
         fig.update_layout(
-            title="Portfolio Z-Scores (0 = Market Benchmark)",
+            title=f"Weighted Z-Scores (0 = {bench_mode})",
             xaxis_title="Standard Deviation (σ)",
-            yaxis=dict(autorange="reversed"), # 上から順に表示
+            yaxis=dict(autorange="reversed"),
             height=400,
             margin=dict(l=20, r=20, t=40, b=20)
         )
         
-        # 基準線 (0)
         fig.add_vline(x=0, line_width=2, line_dash="dash", line_color="black")
-        
         st.plotly_chart(fig, use_container_width=True)
 
     with c_insight:
         st.subheader("AI Insight")
-        
         insights = generate_insights(portfolio_exposure)
-        
         for msg in insights:
             st.markdown(f'<div class="insight-box">{msg}</div>', unsafe_allow_html=True)
-            
         st.info("※ Sizeは反転しています (＋方向 = 小型株効果)")
 
     # --- Layout: Data Table ---
     with st.expander("Show Detailed Factor Data", expanded=True):
-        # 表示用に整理
-        disp_cols = ['Ticker', 'Name'] + z_cols
+        # Weight列も表示に追加
+        disp_cols = ['Ticker', 'Name', 'Weight'] + z_cols
         
-        # スタイリング
         def color_z(val):
             try:
                 v = float(val)
@@ -335,7 +364,11 @@ if run_btn:
             except:
                 return ''
                 
+        # フォーマット指定: Weightはパーセント表示
+        format_dict = {col: "{:.2f}" for col in z_cols}
+        format_dict['Weight'] = "{:.1%}"
+        
         st.dataframe(
-            df_scored[disp_cols].style.applymap(color_z, subset=z_cols).format("{:.2f}", subset=z_cols),
+            df_scored[disp_cols].style.applymap(color_z, subset=z_cols).format(format_dict),
             use_container_width=True
         )
