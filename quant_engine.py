@@ -5,6 +5,7 @@ from scipy.stats import linregress
 class QuantEngine:
     """
     ポートフォリオの数値計算、スコアリング、インサイト生成を担当するエンジン
+    【修正版】データ型チェックとエラーハンドリングを強化
     """
     
     @staticmethod
@@ -16,13 +17,21 @@ class QuantEngine:
         betas = {}
         momenta = {}
         
-        if df_hist.empty:
+        # 【修正1】入力データの型チェックを厳格化
+        # DataFrameでない、または空の場合はデフォルト値を返す
+        if not isinstance(df_hist, pd.DataFrame) or df_hist.empty:
             df['Beta_Raw'] = 1.0
             df['Momentum_Raw'] = 0.0
             return df
 
         # リターン計算
-        rets = df_hist.pct_change().dropna()
+        try:
+            rets = df_hist.pct_change().dropna()
+        except Exception:
+            # pct_changeで予期せぬエラーが出た場合も安全に抜ける
+            df['Beta_Raw'] = 1.0
+            df['Momentum_Raw'] = 0.0
+            return df
         
         # ベンチマークが存在しない場合のフォールバック
         if benchmark_ticker not in rets.columns:
@@ -38,15 +47,24 @@ class QuantEngine:
             if t in rets.columns:
                 try:
                     cov = rets[t].cov(bench_ret)
-                    betas[t] = cov / bench_var if bench_var > 0 else 1.0
+                    # 分散が0に近い場合のゼロ除算対策
+                    betas[t] = cov / bench_var if bench_var > 1e-8 else 1.0
                 except:
                     betas[t] = 1.0
                 
                 # Momentum (簡易: 期間全体の騰落率)
                 try:
-                    p_start = df_hist[t].iloc[0]
-                    p_end = df_hist[t].iloc[-1]
-                    momenta[t] = (p_end / p_start) - 1 if p_start > 0 else 0.0
+                    # 【修正2】カラム存在確認とデータ欠損チェック
+                    if t in df_hist.columns:
+                        series = df_hist[t].dropna()
+                        if not series.empty:
+                            p_start = series.iloc[0]
+                            p_end = series.iloc[-1]
+                            momenta[t] = (p_end / p_start) - 1 if p_start > 0 else 0.0
+                        else:
+                            momenta[t] = 0.0
+                    else:
+                        momenta[t] = 0.0
                 except:
                     momenta[t] = 0.0
             else:
