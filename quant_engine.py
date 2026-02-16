@@ -4,157 +4,151 @@ from scipy.stats import linregress
 
 class QuantEngine:
     """
-    【Module 2】 高精度計算エンジン (Pro Version)
-    
-    特徴:
-    1. ロバスト統計 (Robust Statistics): 平均・標準偏差ではなく、中央値・MADを用いて外れ値の影響を排除。
-    2. 因子直交化 (Orthogonalization): 成長要因を排除した純粋なQualityを算出。
-    3. 統計的適合度 (R-squared): モデルの信頼性を数値化して返す。
+    ポートフォリオの数値計算、スコアリング、インサイト生成を担当するエンジン
     """
-
+    
     @staticmethod
-    def winsorize_series(series, lower_percentile=0.01, upper_percentile=0.99):
+    def calculate_beta_momentum(df_fund, df_hist, benchmark_ticker="1321.T"):
         """
-        【外れ値処理】
-        極端な異常値（上下1%など）を閾値で丸める処理。
-        計算が破綻するのを防ぐための第一防衛ライン。
+        時系列データからBetaとMomentumを計算し、Fundamental DataFrameに結合して返す
         """
-        if series.empty:
-            return series
+        df = df_fund.copy()
+        betas = {}
+        momenta = {}
         
-        # 数値データのみを対象にする
-        series = pd.to_numeric(series, errors='coerce')
-        
-        lower = series.quantile(lower_percentile)
-        upper = series.quantile(upper_percentile)
-        return series.clip(lower=lower, upper=upper)
+        if df_hist.empty:
+            df['Beta_Raw'] = 1.0
+            df['Momentum_Raw'] = 0.0
+            return df
 
-    @staticmethod
-    def calculate_robust_z_score(val, median, mad):
-        """
-        【ロバストZスコア計算】
-        Modified Z-Score = 0.6745 * (x - median) / MAD
+        # リターン計算
+        rets = df_hist.pct_change().dropna()
         
-        通常のZスコアは異常値に弱いが、これは中央値ベースなので
-        「トヨタ」や「ユニクロ」のような巨大企業が混ざっても基準がズレない。
-        """
-        if pd.isna(val) or mad == 0:
-            return 0.0
+        # ベンチマークが存在しない場合のフォールバック
+        if benchmark_ticker not in rets.columns:
+            df['Beta_Raw'] = 1.0
+            df['Momentum_Raw'] = 0.0
+            return df
+
+        bench_ret = rets[benchmark_ticker]
+        bench_var = bench_ret.var()
+
+        for t in df['Ticker']:
+            # Beta
+            if t in rets.columns:
+                try:
+                    cov = rets[t].cov(bench_ret)
+                    betas[t] = cov / bench_var if bench_var > 0 else 1.0
+                except:
+                    betas[t] = 1.0
+                
+                # Momentum (簡易: 期間全体の騰落率)
+                try:
+                    p_start = df_hist[t].iloc[0]
+                    p_end = df_hist[t].iloc[-1]
+                    momenta[t] = (p_end / p_start) - 1 if p_start > 0 else 0.0
+                except:
+                    momenta[t] = 0.0
+            else:
+                betas[t] = 1.0
+                momenta[t] = 0.0
         
-        # 正規分布相当に補正するための係数 0.6745 (approx 1/1.4826)
-        z = 0.6745 * (val - median) / mad
-        
-        # 実用的な範囲（±5.0）にクリップしてグラフを見やすくする
-        return max(min(z, 5.0), -5.0)
+        df['Beta_Raw'] = df['Ticker'].map(betas)
+        df['Momentum_Raw'] = df['Ticker'].map(momenta)
+        return df
 
     @staticmethod
     def process_raw_factors(df):
         """
-        生データ(Raw)から、分析用の指標(Metrics)を厳密に計算する
+        生データをファクター分析用の形式に加工 (Log化、逆数化など)
         """
-        df = df.copy()
-        
-        # 1. Size: 対数変換 (Log Normalization)
-        # 時価総額は桁が違いすぎるため、対数をとって正規分布に近づける
+        # Value (PBRの逆数)
+        df['Value_Raw'] = df['PBR'].apply(lambda x: 1/x if (pd.notnull(x) and x > 0) else np.nan)
+        # Size (時価総額の対数)
         df['Size_Log'] = np.log(pd.to_numeric(df['Size_Raw'], errors='coerce').replace(0, np.nan))
         
-        # 2. Value: PBRの逆数 (Book-to-Market)
-        # 学術的には B/M (1/PBR) が正統なバリュー指標
-        df['Value_Raw'] = pd.to_numeric(df['PBR'], errors='coerce')
-        df['Value_Metric'] = df['Value_Raw'].apply(lambda x: 1/x if (pd.notnull(x) and x > 0) else np.nan)
-        
-        # 他の指標の数値化（エラーハンドリング付き）
-        df['Momentum_Metric'] = pd.to_numeric(df['Momentum_Raw'], errors='coerce')
-        df['Quality_Metric'] = pd.to_numeric(df['ROE'], errors='coerce')      # ROE
-        df['Investment_Metric'] = pd.to_numeric(df['Growth'], errors='coerce') # 売上成長率
-        
+        # カラム名統一
+        # DataProviderから来るキー: ROE, Growth
+        # 分析用キー: Quality_Raw, Investment_Raw
+        if 'ROE' in df.columns:
+            df['Quality_Raw'] = df['ROE']
+        if 'Growth' in df.columns:
+            df['Investment_Raw'] = df['Growth']
+            
         return df
 
     @staticmethod
-    def calculate_orthogonalization(df):
+    def compute_z_scores(df_target, stats):
         """
-        【直交化 & R²算出】
-        Quality (ROE) から Investment (Growth) の影響を回帰分析で取り除く。
-        同時に、その回帰の「決定係数(R²)」を算出し、分析の信頼度として返す。
+        市場統計(stats)を用いてZスコアを計算する。直交化処理も含む。
         """
-        df = df.copy()
-        mask = df['Quality_Metric'].notna() & df['Investment_Metric'].notna()
+        df = df_target.copy()
         
-        # データ不足時の安全策
-        if mask.sum() < 10:
-            df['Quality_Orthogonal'] = df['Quality_Metric']
-            return df, {'slope': 0, 'intercept': 0, 'r_squared': 0.0}
-            
-        x = df.loc[mask, 'Investment_Metric']
-        y = df.loc[mask, 'Quality_Metric']
+        # 1. 直交化 (Quality vs Investment)
+        slope = stats.get('ortho_slope', 0)
+        intercept = stats.get('ortho_intercept', 0)
         
-        # 線形回帰 (SciPy使用)
-        res = linregress(x, y)
-        
-        slope = res.slope
-        intercept = res.intercept
-        r_squared = res.rvalue ** 2  # 決定係数
-        
-        # 残差（Residuals）= 純粋なQuality
-        def get_residual(row):
-            q = row['Quality_Metric']
-            i = row['Investment_Metric']
+        def apply_ortho(row):
+            q = row.get('Quality_Raw', np.nan)
+            i = row.get('Investment_Raw', np.nan)
             if pd.isna(q): return np.nan
-            if pd.isna(i): return q
+            if pd.isna(i): return q # Investmentがない場合はQualityそのまま
             return q - (slope * i + intercept)
             
-        df['Quality_Orthogonal'] = df.apply(get_residual, axis=1)
-        
-        return df, {'slope': slope, 'intercept': intercept, 'r_squared': r_squared}
+        df['Quality_Orthogonal'] = df.apply(apply_ortho, axis=1)
+
+        # 2. Zスコア計算
+        factors = ['Beta', 'Value', 'Size', 'Momentum', 'Quality', 'Investment']
+        r_squared_map = {} # 今回は簡易実装のため空
+
+        for f in factors:
+            if f not in stats: continue
+            
+            # 参照カラム
+            if f == 'Quality': col_name = 'Quality_Orthogonal'
+            else: col_name = stats[f]['col']
+            
+            mu = stats[f]['mean']
+            sigma = stats[f]['std']
+            z_col = f"{f}_Z"
+            
+            def calc_z(val):
+                if pd.isna(val) or sigma == 0: return 0.0
+                z = (val - mu) / sigma
+                if f == 'Size': z = -z # SMB反転 (小型株プラス)
+                return z
+            
+            df[z_col] = df[col_name].apply(calc_z)
+            
+        return df, r_squared_map
 
     @staticmethod
-    def compute_z_scores(target_df, stats_dict):
-        """
-        Zスコア計算 & SMB反転 & R²付与
-        Module 3で作られた「市場のモノサシ(stats_dict)」を使ってスコアリングする。
-        """
-        df = target_df.copy()
+    def generate_insights(z_scores):
+        """Zスコア辞書からインサイト文章を生成"""
+        insights = []
         
-        # ファクター設定
-        # invert: Trueなら「値が大きいほどスコアをマイナスにする」（例：サイズ因子）
-        factors_map = {
-            'Beta':      {'col': 'Beta_Raw',           'invert': False},
-            'Size':      {'col': 'Size_Log',           'invert': True},  # 小型株効果（Small is Plus）
-            'Value':     {'col': 'Value_Metric',       'invert': False},
-            'Momentum':  {'col': 'Momentum_Metric',    'invert': False},
-            'Quality':   {'col': 'Quality_Orthogonal', 'invert': False},
-            'Investment':{'col': 'Investment_Metric',  'invert': False}
-        }
-        
-        r_squared_values = {} # 各ファクターの信頼度（あれば）
-        
-        for factor, config in factors_map.items():
-            if factor not in stats_dict:
-                continue
+        # Size
+        if z_scores.get('Size', 0) < -1.0:
+            insights.append("✅ **大型株中心**: 財務基盤が安定した大型株への配分が高く、市場変動に対する耐久性が期待できます。")
+        elif z_scores.get('Size', 0) > 1.0:
+            insights.append("🚀 **小型株効果**: 時価総額の小さい銘柄が多く、市場平均を上回る成長ポテンシャルを秘めています。")
             
-            # 統計データの取り出し
-            stat = stats_dict[factor]
-            median = stat.get('median', 0)
-            mad = stat.get('mad', 1) # MADがない場合は1（標準偏差代用）として扱う
+        # Value
+        if z_scores.get('Value', 0) > 1.0:
+            insights.append("💰 **バリュー投資**: 純資産に対して割安な銘柄が多く、下値リスクが限定的である可能性があります。")
             
-            col_name = config['col']
-            invert = config['invert']
-            z_col = f"{factor}_Z"
+        # Quality
+        if z_scores.get('Quality', 0) > 1.0:
+            insights.append("💎 **高クオリティ**: ROE等の収益性が市場平均より高く、経営効率の良い企業群です。")
             
-            # ロバストZスコアの適用
-            df[z_col] = df[col_name].apply(lambda x: QuantEngine.calculate_robust_z_score(x, median, mad))
-            
-            # 符号反転 (SMB: 大型株をマイナス評価にする等)
-            if invert:
-                df[z_col] = -df[z_col]
-            
-            # UI表示用に生データも残す
-            df[f"{factor}_Display_Raw"] = df[col_name]
+        # Momentum
+        mom_z = z_scores.get('Momentum', 0)
+        if mom_z < -1.0:
+            insights.append("🔄 **リバーサル狙い**: 直近で株価が出遅れている銘柄が多く、反発（見直し買い）を狙う構成です。")
+        elif mom_z > 1.0:
+            insights.append("📈 **モメンタム重視**: 直近の株価パフォーマンスが良い銘柄に乗る「順張り」の傾向があります。")
 
-            # R²情報の取得（もし統計データに含まれていれば）
-            if 'r_squared' in stat:
-                r_squared_values[factor] = stat['r_squared']
-            else:
-                r_squared_values[factor] = None
-                
-        return df, r_squared_values
+        if not insights:
+            insights.append("⚖️ **市場中立**: 特定のファクターへの極端な偏りがなく、市場全体（インデックス）に近いバランスです。")
+            
+        return insights
