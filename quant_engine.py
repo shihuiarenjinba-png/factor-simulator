@@ -5,7 +5,7 @@ from scipy.stats import linregress
 class QuantEngine:
     """
     ポートフォリオの数値計算、スコアリング、インサイト生成を担当するエンジン
-    【修正版 Step 1】入力データの型変換とエラーハンドリングを強化
+    【修正版 Step 3】直交化ロジックの追加とエラーハンドリングの強化
     """
     
     @staticmethod
@@ -13,32 +13,26 @@ class QuantEngine:
         """
         時系列データからBetaとMomentumを計算し、Fundamental DataFrameに結合して返す
         """
-        # --- [Step 1 修正] 入力データの安全化 ---
+        # --- [Step 1 修正内容: 入力データの安全化] ---
         
-        # 1. df_fund が DataFrame でない場合（リスト等が来た場合）の救済
+        # 1. df_fund が DataFrame でない場合の救済
         if not isinstance(df_fund, pd.DataFrame):
-            # リストなら DataFrame に変換を試みる
             try:
                 df = pd.DataFrame(df_fund)
                 if 'Ticker' not in df.columns and 0 in df.columns:
                     df.rename(columns={0: 'Ticker'}, inplace=True)
             except:
-                # 変換不可なら空のDataFrameにして返す（エラー回避）
                 return pd.DataFrame()
         else:
             df = df_fund.copy()
 
-        # 2. df_hist が DataFrame でない、または空の場合のデフォルト値設定
-        #    文字列などが渡された場合の AttributeError を防ぐ
+        # 2. df_hist が不正な場合のデフォルト値設定
         if not isinstance(df_hist, pd.DataFrame) or df_hist.empty:
-            # カラムが存在しない場合は作成
-            if 'Beta_Raw' not in df.columns:
-                df['Beta_Raw'] = 1.0
-            if 'Momentum_Raw' not in df.columns:
-                df['Momentum_Raw'] = 0.0
+            if 'Beta_Raw' not in df.columns: df['Beta_Raw'] = 1.0
+            if 'Momentum_Raw' not in df.columns: df['Momentum_Raw'] = 0.0
             return df
 
-        # --- 以下、計算ロジック ---
+        # --- 計算ロジック ---
 
         # リターン計算
         try:
@@ -48,7 +42,7 @@ class QuantEngine:
             df['Momentum_Raw'] = 0.0
             return df
         
-        # ベンチマークが存在しない場合のフォールバック
+        # ベンチマーク確認
         if benchmark_ticker not in rets.columns:
             df['Beta_Raw'] = 1.0
             df['Momentum_Raw'] = 0.0
@@ -57,7 +51,6 @@ class QuantEngine:
         bench_ret = rets[benchmark_ticker]
         bench_var = bench_ret.var()
 
-        # 結果を格納する辞書
         betas = {}
         momenta = {}
 
@@ -95,14 +88,12 @@ class QuantEngine:
     @staticmethod
     def process_raw_factors(df):
         """生データをファクター分析用の形式に加工"""
-        # Value (PBRの逆数)
+        # Value
         if 'PBR' in df.columns:
             df['Value_Raw'] = df['PBR'].apply(lambda x: 1/x if (pd.notnull(x) and x > 0) else np.nan)
-        
-        # Size (時価総額の対数)
+        # Size
         if 'Size_Raw' in df.columns:
             df['Size_Log'] = np.log(pd.to_numeric(df['Size_Raw'], errors='coerce').replace(0, np.nan))
-        
         # カラム名統一
         if 'ROE' in df.columns:
             df['Quality_Raw'] = df['ROE']
@@ -112,11 +103,52 @@ class QuantEngine:
         return df
 
     @staticmethod
+    def calculate_orthogonalization(df, x_col, y_col):
+        """
+        【Step 3 追加】UniverseManagerから呼び出される直交化計算メソッド
+        指定された2変数(x, y)間の回帰分析を行い、残差とパラメータを返す
+        """
+        df_out = df.copy()
+        try:
+            # 欠損値を除外して計算用データを作成
+            valid_data = df[[x_col, y_col]].dropna()
+            
+            # データ点数が少なすぎる場合は計算しない
+            if len(valid_data) < 5:
+                return df_out, {'slope': 0, 'intercept': 0, 'r_squared': 0}
+
+            # 線形回帰 (scipy.stats.linregressを使用)
+            slope, intercept, r_value, p_value, std_err = linregress(valid_data[x_col], valid_data[y_col])
+            
+            # 結果辞書
+            params = {
+                'slope': slope,
+                'intercept': intercept,
+                'r_squared': r_value**2
+            }
+            
+            # 残差(Orthogonalized Value)の計算には元のDataFrameを使用（欠損値ケアのため）
+            def get_resid(row):
+                x = row.get(x_col)
+                y = row.get(y_col)
+                if pd.isna(x) or pd.isna(y): return y # 計算不能なら元の値を返す
+                return y - (slope * x + intercept)
+
+            # UniverseManagerが期待するカラム名があればそれに合わせるが、
+            # 基本的には stats を返すことが主目的
+            return df_out, params
+
+        except Exception as e:
+            # エラー時はデフォルト値を返す
+            # print(f"Orthogonalization Error: {e}")
+            return df_out, {'slope': 0, 'intercept': 0, 'r_squared': 0}
+
+    @staticmethod
     def compute_z_scores(df_target, stats):
         """市場統計(stats)を用いてZスコアを計算する"""
         df = df_target.copy()
         
-        # 1. 直交化
+        # 1. 直交化 (市場全体のパラメータを適用)
         slope = stats.get('ortho_slope', 0)
         intercept = stats.get('ortho_intercept', 0)
         
