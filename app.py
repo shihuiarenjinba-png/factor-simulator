@@ -36,7 +36,8 @@ st.markdown("""
     }
     .metric-label {
         font-size: 14px;
-        color: #666;
+        font-weight: bold;
+        color: #555;
     }
     .insight-box {
         background-color: #e8f4f8;
@@ -45,6 +46,8 @@ st.markdown("""
         margin-bottom: 20px;
         border-radius: 5px;
     }
+    /* テーブル内の文字サイズ調整 */
+    .stDataFrame { font-size: 14px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -168,6 +171,14 @@ st.sidebar.header("📊 Settings")
 
 bench_mode = st.sidebar.selectbox("Benchmark Index", ["Nikkei 225", "TOPIX Core 30"])
 
+# 【フェーズ1追加】並び替え（ランキング）機能
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔍 Display Options")
+sort_key = st.sidebar.selectbox(
+    "Sort Table By",
+    ["Ticker", "Value (PBR)", "Quality (ROE)", "Momentum (Return)", "Size", "Weight"]
+)
+
 if bench_mode == "Nikkei 225":
     benchmark_etf = "1321.T"
     universe_tickers = NIKKEI_225_SAMPLE
@@ -179,7 +190,7 @@ st.sidebar.markdown("---")
 
 st.sidebar.subheader("My Portfolio")
 
-# 【フェーズ2追加】入力モード選択
+# 入力モード選択
 input_mode = st.sidebar.radio("Input Mode", ["Manual Input", "File Upload"], horizontal=True)
 
 if input_mode == "Manual Input":
@@ -283,7 +294,7 @@ if run_btn:
     st.subheader(f"📊 Portfolio Diagnostic (vs {bench_mode})")
     col1, col2, col3 = st.columns(3)
     
-    # Weighted Beta (安全策としてcopyを使用)
+    # Weighted Beta
     valid_beta = df_user_fund.dropna(subset=['Beta_Raw']).copy()
     valid_beta['Weight'] = valid_beta['Ticker'].map(portfolio_dict)
     if not valid_beta.empty:
@@ -298,13 +309,19 @@ if run_btn:
     </div>
     """, unsafe_allow_html=True)
     
-    # Quality Score
-    qual_score = portfolio_exposure.get('Quality', 0)
-    q_color = "green" if qual_score > 0 else "red"
+    # 【フェーズ1修正】Quality Score (重複) を削除し、Avg ROE (Profitability) へ変更
+    # Quality_Raw が ROE に相当すると仮定
+    valid_roe = df_scored.dropna(subset=['Quality_Raw', 'Weight']).copy()
+    if not valid_roe.empty:
+        avg_roe = np.average(valid_roe['Quality_Raw'], weights=valid_roe['Weight'])
+        roe_display = f"{avg_roe:.1f}%"
+    else:
+        roe_display = "N/A"
+        
     col2.markdown(f"""
     <div class="metric-card">
-        <div class="metric-label">Quality Score</div>
-        <div class="metric-value" style="color:{q_color}">{qual_score:.2f} σ</div>
+        <div class="metric-label">Avg ROE (Profitability)</div>
+        <div class="metric-value" style="color: #007bff;">{roe_display}</div>
     </div>
     """, unsafe_allow_html=True)
     
@@ -350,33 +367,105 @@ if run_btn:
             st.markdown(f'<div class="insight-box">{msg}</div>', unsafe_allow_html=True)
         st.info("※ Sizeは反転しています (＋方向 = 小型株効果)")
 
-    # --- Data Table ---
+    # --- Data Table (フェーズ1：実数値 + Zスコア表示 & 並び替え) ---
     with st.expander("Show Detailed Factor Data", expanded=True):
-        # 【修正】Nameカラムが存在しない場合の安全策
-        base_cols = ['Ticker', 'Weight']
-        if 'Name' in df_scored.columns:
-            base_cols.insert(1, 'Name')
-            
-        disp_cols = base_cols + z_cols
         
-        # 表示用フォーマット
-        format_dict = {col: "{:.2f}" for col in z_cols}
-        format_dict['Weight'] = "{:.1%}"
-        
-        def color_z(val):
-            try:
-                v = float(val)
-                if v > 1.0: return 'background-color: #d4edda; color: black'
-                if v < -1.0: return 'background-color: #f8d7da; color: black'
-            except: pass
-            return ''
+        # 表示用のコピーを作成
+        df_display = df_scored.copy()
+
+        # 並び替えロジック
+        if "Value" in sort_key:
+            # ValueはPBRが低い方が良いが、Zスコア(1/PBR)は高い方が良い。Zスコア順(降順)で並べる
+            if 'Value_Z' in df_display.columns:
+                df_display = df_display.sort_values('Value_Z', ascending=False)
+        elif "Quality" in sort_key:
+            if 'Quality_Z' in df_display.columns:
+                df_display = df_display.sort_values('Quality_Z', ascending=False)
+        elif "Momentum" in sort_key:
+            if 'Momentum_Z' in df_display.columns:
+                df_display = df_display.sort_values('Momentum_Z', ascending=False)
+        elif "Size" in sort_key:
+            if 'Size_Z' in df_display.columns:
+                df_display = df_display.sort_values('Size_Z', ascending=False)
+        elif "Weight" in sort_key:
+            df_display = df_display.sort_values('Weight', ascending=False)
+        else:
+            # Default Ticker sort
+            df_display = df_display.sort_values('Ticker', ascending=True)
+
+        # 表示用カラムの生成関数 (実数値 + Zスコア)
+        def format_col(row, raw_col, z_col, unit="", is_percent=False, is_inv=False):
+            # 生値の取得
+            raw_val = row.get(raw_col, np.nan)
+            z_val = row.get(z_col, np.nan)
             
-        # 安全にデータフレームを表示
-        try:
-            st.dataframe(
-                df_scored[disp_cols].style.applymap(color_z, subset=z_cols).format(format_dict),
-                use_container_width=True
+            if pd.isna(raw_val) or pd.isna(z_val):
+                return "N/A"
+            
+            # PBRのように逆数がスコアになっている場合の表示調整
+            # ここでは「実数値」を表示したいので、raw_col (PBR) をそのまま出す
+            
+            if is_percent:
+                val_str = f"{raw_val*100:.1f}%"
+            else:
+                val_str = f"{raw_val:.2f}{unit}"
+                
+            return f"{val_str} (Z: {z_val:.2f})"
+
+        # 1. Value (PBR)
+        # QuantEngineで Value_Raw = 1/PBR になっているが、元のPBRカラムがあるはず
+        if 'PBR' in df_display.columns and 'Value_Z' in df_display.columns:
+            df_display['Value (PBR)'] = df_display.apply(
+                lambda x: format_col(x, 'PBR', 'Value_Z', unit="x"), axis=1
             )
-        except Exception as e:
-            st.error(f"テーブル表示エラー: {e}")
-            st.dataframe(df_scored)
+        
+        # 2. Quality (ROE)
+        # QuantEngineで Quality_Raw = ROE (単位は小数 0.15など) と想定
+        if 'Quality_Raw' in df_display.columns and 'Quality_Z' in df_display.columns:
+             df_display['Quality (ROE)'] = df_display.apply(
+                lambda x: format_col(x, 'Quality_Raw', 'Quality_Z', is_percent=True), axis=1
+            )
+             
+        # 3. Momentum (Return)
+        # Momentum_Raw = リターン (小数)
+        if 'Momentum_Raw' in df_display.columns and 'Momentum_Z' in df_display.columns:
+             df_display['Momentum (Return)'] = df_display.apply(
+                lambda x: format_col(x, 'Momentum_Raw', 'Momentum_Z', is_percent=True), axis=1
+            )
+             
+        # 4. Size (Log -> Market Cap?)
+        # Market Capがあればベストだが、なければLog Sizeを表示
+        if 'Size_Z' in df_display.columns:
+            # MarketCapカラムがあるか確認 (DataProvider依存)
+            if 'MarketCap' in df_display.columns:
+                 df_display['Size (MktCap)'] = df_display.apply(
+                    lambda x: f"{x['MarketCap']/1e9:.0f}B (Z: {x['Size_Z']:.2f})", axis=1
+                )
+            else:
+                 # なければLog表示
+                 df_display['Size (Log)'] = df_display.apply(
+                    lambda x: format_col(x, 'Size_Log', 'Size_Z'), axis=1
+                )
+
+        # 表示カラムの選定
+        base_cols = ['Ticker']
+        if 'Name' in df_display.columns:
+            base_cols.append('Name')
+        base_cols.append('Weight')
+        
+        # 生成したカスタムカラムを追加
+        custom_cols = []
+        if 'Value (PBR)' in df_display.columns: custom_cols.append('Value (PBR)')
+        if 'Quality (ROE)' in df_display.columns: custom_cols.append('Quality (ROE)')
+        if 'Momentum (Return)' in df_display.columns: custom_cols.append('Momentum (Return)')
+        if 'Size (MktCap)' in df_display.columns: custom_cols.append('Size (MktCap)')
+        elif 'Size (Log)' in df_display.columns: custom_cols.append('Size (Log)')
+        
+        # 最終表示
+        final_cols = base_cols + custom_cols
+        
+        # Weightのフォーマットのみ適用
+        st.dataframe(
+            df_display[final_cols].style.format({'Weight': '{:.1%}'}),
+            use_container_width=True
+        )
