@@ -128,19 +128,11 @@ class QuantEngine:
             }
             
             # 残差(Orthogonalized Value)の計算には元のDataFrameを使用（欠損値ケアのため）
-            def get_resid(row):
-                x = row.get(x_col)
-                y = row.get(y_col)
-                if pd.isna(x) or pd.isna(y): return y # 計算不能なら元の値を返す
-                return y - (slope * x + intercept)
-
-            # UniverseManagerが期待するカラム名があればそれに合わせるが、
-            # 基本的には stats を返すことが主目的
+            # ここでは計算ロジックのみを提供し、実際の適用は呼び出し元またはcompute_z_scoresで行う
             return df_out, params
 
         except Exception as e:
             # エラー時はデフォルト値を返す
-            # print(f"Orthogonalization Error: {e}")
             return df_out, {'slope': 0, 'intercept': 0, 'r_squared': 0}
 
     @staticmethod
