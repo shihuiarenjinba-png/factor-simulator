@@ -107,34 +107,7 @@ def parse_portfolio_input(input_text):
             
     return weights
 
-def generate_insights(z_scores):
-    """Zスコアに基づいて日本語の診断メッセージを生成する"""
-    insights = []
-    
-    size_z = z_scores.get('Size', 0)
-    if size_z < -1.0:
-        insights.append("✅ **大型株中心**: 財務基盤が安定した大型株への配分が高く、市場変動に対する耐久性が期待できます。")
-    elif size_z > 1.0:
-        insights.append("🚀 **小型株効果**: 時価総額の小さい銘柄が多く、市場平均を上回る成長ポテンシャルを秘めています。")
-        
-    value_z = z_scores.get('Value', 0)
-    if value_z > 1.0:
-        insights.append("💰 **バリュー投資**: 純資産に対して割安な銘柄が多く、下値リスクが限定的である可能性があります。")
-        
-    qual_z = z_scores.get('Quality', 0)
-    if qual_z > 1.0:
-        insights.append("💎 **高クオリティ**: ROE等の収益性が市場平均より高く、経営効率の良い企業群です。")
-        
-    mom_z = z_scores.get('Momentum', 0)
-    if mom_z < -1.0:
-        insights.append("🔄 **リバーサル狙い**: 直近で株価が出遅れている銘柄が多く、反発（見直し買い）を狙う構成です。")
-    elif mom_z > 1.0:
-        insights.append("📈 **モメンタム重視**: 直近の株価パフォーマンスが良い銘柄に乗る「順張り」の傾向があります。")
-
-    if not insights:
-        insights.append("⚖️ **市場中立**: 特定のファクターへの極端な偏りがなく、市場全体（インデックス）に近いバランスです。")
-        
-    return insights
+# Note: generate_insights 関数は削除し、QuantEngineのメソッドを使用します
 
 # ---------------------------------------------------------
 # 3. UI レイアウト & 入力
@@ -181,7 +154,6 @@ if run_btn:
     # 1. ベンチマークデータの取得
     status_text.text(f"Fetching Market Data ({bench_mode})...")
     
-    # 【変更点】ファンダメンタルと株価(ヒストリカル)の両方を取得する
     df_bench_fund = DataProvider.fetch_fundamentals(universe_tickers)
     df_bench_hist = DataProvider.fetch_historical_prices(universe_tickers + [benchmark_etf])
     
@@ -190,7 +162,6 @@ if run_btn:
     # 2. ベンチマークの計算
     status_text.text("Calculating Market Beta & Momentum...")
     
-    # 【変更点】エンジンに「表」を渡す形に修正。戻り値もDataFrameで受け取る。
     df_bench_fund = QuantEngine.calculate_beta_momentum(df_bench_fund, df_bench_hist, benchmark_etf)
     
     progress_bar.progress(40)
@@ -207,25 +178,16 @@ if run_btn:
     df_user_hist = DataProvider.fetch_historical_prices(user_tickers + [benchmark_etf])
     
     # 4. ユーザーデータの計算
-    # 【変更点】同様に「表」を渡す形に修正
     df_user_fund = QuantEngine.calculate_beta_momentum(df_user_fund, df_user_hist, benchmark_etf)
     
     # 生データ加工
     df_user_proc = QuantEngine.process_raw_factors(df_user_fund)
     
-    # 直交化
-    # ※ 本来はQuantEngineに移すべきロジックですが、まずはエラー解消のため現行維持
-    slope = market_stats['ortho_slope']
-    intercept = market_stats['ortho_intercept']
-    def apply_ortho(row):
-        q = row.get('Quality_Raw', np.nan) # 【変更点】カラム名をQuantEngineと統一 (Quality_Metric -> Quality_Raw)
-        i = row.get('Investment_Raw', np.nan) # Investment_Metric -> Investment_Raw
-        if pd.isna(q): return np.nan
-        if pd.isna(i): return q
-        return q - (slope * i + intercept)
-    df_user_proc['Quality_Orthogonal'] = df_user_proc.apply(apply_ortho, axis=1)
-
-    # Zスコア計算
+    # --- 【修正】直交化ロジックの削除 ---
+    # 以前ここにあった apply_ortho 関数とその適用処理は、
+    # 次の compute_z_scores 内で自動的に行われるため不要になりました。
+    
+    # Zスコア計算 (ここで内部的に直交化も実行されます)
     df_scored, r_squared_map = QuantEngine.compute_z_scores(df_user_proc, market_stats)
     
     # ウェイト情報をマージ
@@ -298,7 +260,7 @@ if run_btn:
         st.subheader("Factor Exposure (Weighted)")
         factors = list(portfolio_exposure.keys())
         scores = list(portfolio_exposure.values())
-        y_labels = [f"{f}" for f in factors] # R2は一旦省略
+        y_labels = [f"{f}" for f in factors]
         
         fig = go.Figure()
         fig.add_trace(go.Bar(
@@ -317,7 +279,8 @@ if run_btn:
 
     with c_insight:
         st.subheader("AI Insight")
-        insights = generate_insights(portfolio_exposure)
+        # 【修正】QuantEngineのメソッドを使用
+        insights = QuantEngine.generate_insights(portfolio_exposure)
         for msg in insights:
             st.markdown(f'<div class="insight-box">{msg}</div>', unsafe_allow_html=True)
         st.info("※ Sizeは反転しています (＋方向 = 小型株効果)")
