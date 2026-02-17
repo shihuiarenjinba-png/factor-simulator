@@ -71,9 +71,7 @@ TOPIX_CORE_30 = [
 # 2. ヘルパー関数
 # ---------------------------------------------------------
 def parse_portfolio_input(input_text):
-    """
-    入力テキストを解析し、{Ticker: Weight} の辞書を返す
-    """
+    """入力テキストを解析し、{Ticker: Weight} の辞書を返す"""
     weights = {}
     raw_items = [x.strip() for x in input_text.replace('\n', ',').split(',') if x.strip()]
     
@@ -107,7 +105,61 @@ def parse_portfolio_input(input_text):
             
     return weights
 
-# Note: generate_insights 関数は削除し、QuantEngineのメソッドを使用します
+def parse_uploaded_file(uploaded_file):
+    """アップロードされたファイルを解析して {Ticker: Weight} を返す"""
+    try:
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+    except Exception as e:
+        st.error(f"ファイル読み込みエラー: {e}")
+        return {}
+    
+    # カラム名のゆらぎ吸収 (大文字小文字無視)
+    df.columns = [c.strip().lower() for c in df.columns]
+    
+    # Tickerカラムの特定
+    ticker_col = None
+    possible_ticker_cols = ['ticker', 'code', 'symbol', 'stock', '銘柄コード', 'コード']
+    for c in possible_ticker_cols:
+        if c in df.columns:
+            ticker_col = c
+            break
+            
+    if not ticker_col:
+        st.error("CSV/Excelに「Ticker」または「Code」列が見つかりません。")
+        return {}
+    
+    # Weightカラムの特定 (なければ均等)
+    weight_col = None
+    possible_weight_cols = ['weight', 'ratio', 'share', 'portfolio%', '比率', 'ウェイト']
+    for c in possible_weight_cols:
+        if c in df.columns:
+            weight_col = c
+            break
+            
+    weights = {}
+    count = len(df)
+    
+    for _, row in df.iterrows():
+        t = str(row[ticker_col]).strip()
+        if weight_col:
+            try:
+                w = float(row[weight_col])
+            except:
+                w = 0.0
+        else:
+            w = 1.0 / count
+        weights[t] = w
+        
+    # 重みの正規化
+    total_w = sum(weights.values())
+    if total_w > 0:
+        for k in weights:
+            weights[k] = weights[k] / total_w
+            
+    return weights
 
 # ---------------------------------------------------------
 # 3. UI レイアウト & 入力
@@ -126,10 +178,19 @@ else:
 st.sidebar.markdown("---")
 
 st.sidebar.subheader("My Portfolio")
-st.sidebar.caption("Format: `Ticker` or `Ticker:Weight`")
 
-default_input = "7203.T: 40, 6758.T: 30, 9984.T: 30"
-input_text = st.sidebar.text_area("Input", default_input, height=120)
+# 【フェーズ2追加】入力モード選択
+input_mode = st.sidebar.radio("Input Mode", ["Manual Input", "File Upload"], horizontal=True)
+
+if input_mode == "Manual Input":
+    st.sidebar.caption("Format: `Ticker` or `Ticker:Weight`")
+    default_input = "7203.T: 40, 6758.T: 30, 9984.T: 30"
+    input_text = st.sidebar.text_area("Input", default_input, height=120)
+    uploaded_file = None
+else:
+    st.sidebar.caption("Support: CSV, Excel (Columns: Ticker, Weight)")
+    uploaded_file = st.sidebar.file_uploader("Upload Portfolio", type=['csv', 'xlsx'])
+    input_text = ""
 
 run_btn = st.sidebar.button("Run Analysis", type="primary")
 
@@ -139,12 +200,20 @@ run_btn = st.sidebar.button("Run Analysis", type="primary")
 if run_btn:
     st.title("🛡️ Market Factor Lab (Pro)")
     
-    # [Step 1] 入力解析
-    portfolio_dict = parse_portfolio_input(input_text)
+    # [Step 1] 入力解析 (モード分岐)
+    if input_mode == "Manual Input":
+        portfolio_dict = parse_portfolio_input(input_text)
+    else:
+        if uploaded_file is not None:
+            portfolio_dict = parse_uploaded_file(uploaded_file)
+        else:
+            st.warning("ファイルをアップロードしてください。")
+            st.stop()
+            
     user_tickers = list(portfolio_dict.keys())
     
     if not user_tickers:
-        st.warning("銘柄を入力してください。")
+        st.warning("有効な銘柄が見つかりませんでした。入力形式を確認してください。")
         st.stop()
         
     # [Step 2] データ取得 & 市場統計作成
@@ -183,10 +252,6 @@ if run_btn:
     # 生データ加工
     df_user_proc = QuantEngine.process_raw_factors(df_user_fund)
     
-    # --- 【修正】直交化ロジックの削除 ---
-    # 以前ここにあった apply_ortho 関数とその適用処理は、
-    # 次の compute_z_scores 内で自動的に行われるため不要になりました。
-    
     # Zスコア計算 (ここで内部的に直交化も実行されます)
     df_scored, r_squared_map = QuantEngine.compute_z_scores(df_user_proc, market_stats)
     
@@ -218,8 +283,8 @@ if run_btn:
     st.subheader(f"📊 Portfolio Diagnostic (vs {bench_mode})")
     col1, col2, col3 = st.columns(3)
     
-    # Weighted Beta
-    valid_beta = df_user_fund.dropna(subset=['Beta_Raw'])
+    # Weighted Beta (安全策としてcopyを使用)
+    valid_beta = df_user_fund.dropna(subset=['Beta_Raw']).copy()
     valid_beta['Weight'] = valid_beta['Ticker'].map(portfolio_dict)
     if not valid_beta.empty:
         avg_beta = np.average(valid_beta['Beta_Raw'], weights=valid_beta['Weight'])
@@ -279,7 +344,7 @@ if run_btn:
 
     with c_insight:
         st.subheader("AI Insight")
-        # 【修正】QuantEngineのメソッドを使用
+        # QuantEngineのメソッドを使用
         insights = QuantEngine.generate_insights(portfolio_exposure)
         for msg in insights:
             st.markdown(f'<div class="insight-box">{msg}</div>', unsafe_allow_html=True)
@@ -287,7 +352,13 @@ if run_btn:
 
     # --- Data Table ---
     with st.expander("Show Detailed Factor Data", expanded=True):
-        disp_cols = ['Ticker', 'Name', 'Weight'] + z_cols
+        # 【修正】Nameカラムが存在しない場合の安全策
+        base_cols = ['Ticker', 'Weight']
+        if 'Name' in df_scored.columns:
+            base_cols.insert(1, 'Name')
+            
+        disp_cols = base_cols + z_cols
+        
         # 表示用フォーマット
         format_dict = {col: "{:.2f}" for col in z_cols}
         format_dict['Weight'] = "{:.1%}"
@@ -300,7 +371,12 @@ if run_btn:
             except: pass
             return ''
             
-        st.dataframe(
-            df_scored[disp_cols].style.applymap(color_z, subset=z_cols).format(format_dict),
-            use_container_width=True
-        )
+        # 安全にデータフレームを表示
+        try:
+            st.dataframe(
+                df_scored[disp_cols].style.applymap(color_z, subset=z_cols).format(format_dict),
+                use_container_width=True
+            )
+        except Exception as e:
+            st.error(f"テーブル表示エラー: {e}")
+            st.dataframe(df_scored)
