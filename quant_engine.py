@@ -5,7 +5,7 @@ from scipy.stats import linregress
 class QuantEngine:
     """
     ポートフォリオの数値計算、スコアリング、インサイト生成を担当するエンジン
-    【修正版 Step 3】直交化ロジックの追加とエラーハンドリングの強化
+    【修正版 Step 3】UniverseManagerとの統計指標の整合性確保（median/mad対応）
     """
     
     @staticmethod
@@ -36,7 +36,8 @@ class QuantEngine:
 
         # リターン計算
         try:
-            rets = df_hist.pct_change().dropna()
+            # 【修正】FutureWarning対策: fill_method=None を指定
+            rets = df_hist.pct_change(fill_method=None).dropna()
         except Exception:
             df['Beta_Raw'] = 1.0
             df['Momentum_Raw'] = 0.0
@@ -106,7 +107,6 @@ class QuantEngine:
     def calculate_orthogonalization(df, x_col, y_col):
         """
         【Step 3 追加】UniverseManagerから呼び出される直交化計算メソッド
-        指定された2変数(x, y)間の回帰分析を行い、残差とパラメータを返す
         """
         df_out = df.copy()
         try:
@@ -128,7 +128,6 @@ class QuantEngine:
             }
             
             # 残差(Orthogonalized Value)の計算には元のDataFrameを使用（欠損値ケアのため）
-            # ここでは計算ロジックのみを提供し、実際の適用は呼び出し元またはcompute_z_scoresで行う
             return df_out, params
 
         except Exception as e:
@@ -165,12 +164,17 @@ class QuantEngine:
             
             if col_name not in df.columns: continue
 
-            mu = stats[f]['mean']
-            sigma = stats[f]['std']
+            # 【重要修正】UniverseManagerに合わせて mean -> median, std -> mad に変更
+            mu = stats[f].get('median', 0)
+            sigma = stats[f].get('mad', 1)
+            
+            # 安全策: ゼロ除算回避
+            if sigma == 0: sigma = 1e-6
+
             z_col = f"{f}_Z"
             
             def calc_z(val):
-                if pd.isna(val) or sigma == 0: return 0.0
+                if pd.isna(val): return 0.0
                 z = (val - mu) / sigma
                 if f == 'Size': z = -z 
                 return z
