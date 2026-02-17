@@ -171,12 +171,12 @@ st.sidebar.header("📊 Settings")
 
 bench_mode = st.sidebar.selectbox("Benchmark Index", ["Nikkei 225", "TOPIX Core 30"])
 
-# 【フェーズ1追加】並び替え（ランキング）機能
+# 【フェーズ2修正】Investment (Growth) をソート対象に追加
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔍 Display Options")
 sort_key = st.sidebar.selectbox(
     "Sort Table By",
-    ["Ticker", "Value (PBR)", "Quality (ROE)", "Momentum (Return)", "Size", "Weight"]
+    ["Ticker", "Value (PBR)", "Quality (ROE)", "Momentum (Return)", "Investment (Growth)", "Size", "Weight"]
 )
 
 if bench_mode == "Nikkei 225":
@@ -309,7 +309,7 @@ if run_btn:
     </div>
     """, unsafe_allow_html=True)
     
-    # 【フェーズ1修正】Quality Score (重複) を削除し、Avg ROE (Profitability) へ変更
+    # Quality Score (重複) を削除し、Avg ROE (Profitability) へ変更
     # Quality_Raw が ROE に相当すると仮定
     valid_roe = df_scored.dropna(subset=['Quality_Raw', 'Weight']).copy()
     if not valid_roe.empty:
@@ -367,7 +367,7 @@ if run_btn:
             st.markdown(f'<div class="insight-box">{msg}</div>', unsafe_allow_html=True)
         st.info("※ Sizeは反転しています (＋方向 = 小型株効果)")
 
-    # --- Data Table (フェーズ1：実数値 + Zスコア表示 & 並び替え) ---
+    # --- Data Table (フェーズ2：Investment追加 & 指標同期) ---
     with st.expander("Show Detailed Factor Data", expanded=True):
         
         # 表示用のコピーを作成
@@ -375,7 +375,6 @@ if run_btn:
 
         # 並び替えロジック
         if "Value" in sort_key:
-            # ValueはPBRが低い方が良いが、Zスコア(1/PBR)は高い方が良い。Zスコア順(降順)で並べる
             if 'Value_Z' in df_display.columns:
                 df_display = df_display.sort_values('Value_Z', ascending=False)
         elif "Quality" in sort_key:
@@ -384,6 +383,10 @@ if run_btn:
         elif "Momentum" in sort_key:
             if 'Momentum_Z' in df_display.columns:
                 df_display = df_display.sort_values('Momentum_Z', ascending=False)
+        # 【追加】Investmentソート
+        elif "Investment" in sort_key:
+            if 'Investment_Z' in df_display.columns:
+                df_display = df_display.sort_values('Investment_Z', ascending=False)
         elif "Size" in sort_key:
             if 'Size_Z' in df_display.columns:
                 df_display = df_display.sort_values('Size_Z', ascending=False)
@@ -402,9 +405,6 @@ if run_btn:
             if pd.isna(raw_val) or pd.isna(z_val):
                 return "N/A"
             
-            # PBRのように逆数がスコアになっている場合の表示調整
-            # ここでは「実数値」を表示したいので、raw_col (PBR) をそのまま出す
-            
             if is_percent:
                 val_str = f"{raw_val*100:.1f}%"
             else:
@@ -413,36 +413,36 @@ if run_btn:
             return f"{val_str} (Z: {z_val:.2f})"
 
         # 1. Value (PBR)
-        # QuantEngineで Value_Raw = 1/PBR になっているが、元のPBRカラムがあるはず
         if 'PBR' in df_display.columns and 'Value_Z' in df_display.columns:
             df_display['Value (PBR)'] = df_display.apply(
                 lambda x: format_col(x, 'PBR', 'Value_Z', unit="x"), axis=1
             )
         
         # 2. Quality (ROE)
-        # QuantEngineで Quality_Raw = ROE (単位は小数 0.15など) と想定
         if 'Quality_Raw' in df_display.columns and 'Quality_Z' in df_display.columns:
              df_display['Quality (ROE)'] = df_display.apply(
                 lambda x: format_col(x, 'Quality_Raw', 'Quality_Z', is_percent=True), axis=1
             )
              
         # 3. Momentum (Return)
-        # Momentum_Raw = リターン (小数)
         if 'Momentum_Raw' in df_display.columns and 'Momentum_Z' in df_display.columns:
              df_display['Momentum (Return)'] = df_display.apply(
                 lambda x: format_col(x, 'Momentum_Raw', 'Momentum_Z', is_percent=True), axis=1
             )
-             
-        # 4. Size (Log -> Market Cap?)
-        # Market Capがあればベストだが、なければLog Sizeを表示
+        
+        # 【追加】4. Investment (Growth)
+        if 'Investment_Raw' in df_display.columns and 'Investment_Z' in df_display.columns:
+             df_display['Investment (Growth)'] = df_display.apply(
+                lambda x: format_col(x, 'Investment_Raw', 'Investment_Z', is_percent=True), axis=1
+            )
+
+        # 5. Size (Log -> Market Cap?)
         if 'Size_Z' in df_display.columns:
-            # MarketCapカラムがあるか確認 (DataProvider依存)
             if 'MarketCap' in df_display.columns:
                  df_display['Size (MktCap)'] = df_display.apply(
                     lambda x: f"{x['MarketCap']/1e9:.0f}B (Z: {x['Size_Z']:.2f})", axis=1
                 )
             else:
-                 # なければLog表示
                  df_display['Size (Log)'] = df_display.apply(
                     lambda x: format_col(x, 'Size_Log', 'Size_Z'), axis=1
                 )
@@ -458,6 +458,9 @@ if run_btn:
         if 'Value (PBR)' in df_display.columns: custom_cols.append('Value (PBR)')
         if 'Quality (ROE)' in df_display.columns: custom_cols.append('Quality (ROE)')
         if 'Momentum (Return)' in df_display.columns: custom_cols.append('Momentum (Return)')
+        # 【追加】Investmentカラム
+        if 'Investment (Growth)' in df_display.columns: custom_cols.append('Investment (Growth)')
+        
         if 'Size (MktCap)' in df_display.columns: custom_cols.append('Size (MktCap)')
         elif 'Size (Log)' in df_display.columns: custom_cols.append('Size (Log)')
         
