@@ -5,17 +5,13 @@ from scipy.stats import linregress
 class QuantEngine:
     """
     ポートフォリオの数値計算、スコアリング、インサイト生成を担当するエンジン
-    【修正版 Step 1】直交化メソッドの実体化 (計算済みDataFrameを返すように修正)
+    【完成版】Step 1〜4の全修正適用済み
     """
     
     @staticmethod
     def calculate_beta_momentum(df_fund, df_hist, benchmark_ticker="1321.T"):
-        """
-        時系列データからBetaとMomentumを計算し、Fundamental DataFrameに結合して返す
-        """
-        # --- [Step 1 修正内容: 入力データの安全化] ---
-        
-        # 1. df_fund が DataFrame でない場合の救済
+        """時系列データからBetaとMomentumを計算"""
+        # 1. df_fund救済
         if not isinstance(df_fund, pd.DataFrame):
             try:
                 df = pd.DataFrame(df_fund)
@@ -26,24 +22,20 @@ class QuantEngine:
         else:
             df = df_fund.copy()
 
-        # 2. df_hist が不正な場合のデフォルト値設定
+        # 2. df_hist救済
         if not isinstance(df_hist, pd.DataFrame) or df_hist.empty:
             if 'Beta_Raw' not in df.columns: df['Beta_Raw'] = 1.0
             if 'Momentum_Raw' not in df.columns: df['Momentum_Raw'] = 0.0
             return df
 
-        # --- 計算ロジック ---
-
-        # リターン計算
+        # 計算ロジック
         try:
-            # 【修正】FutureWarning対策: fill_method=None を指定
             rets = df_hist.pct_change(fill_method=None).dropna()
         except Exception:
             df['Beta_Raw'] = 1.0
             df['Momentum_Raw'] = 0.0
             return df
         
-        # ベンチマーク確認
         if benchmark_ticker not in rets.columns:
             df['Beta_Raw'] = 1.0
             df['Momentum_Raw'] = 0.0
@@ -56,7 +48,6 @@ class QuantEngine:
         momenta = {}
 
         for t in df['Ticker']:
-            # Beta
             if t in rets.columns:
                 try:
                     cov = rets[t].cov(bench_ret)
@@ -64,7 +55,6 @@ class QuantEngine:
                 except:
                     betas[t] = 1.0
                 
-                # Momentum
                 try:
                     if t in df_hist.columns:
                         series = df_hist[t].dropna()
@@ -89,77 +79,59 @@ class QuantEngine:
     @staticmethod
     def process_raw_factors(df):
         """生データをファクター分析用の形式に加工"""
-        # Value
         if 'PBR' in df.columns:
             df['Value_Raw'] = df['PBR'].apply(lambda x: 1/x if (pd.notnull(x) and x > 0) else np.nan)
-        # Size
         if 'Size_Raw' in df.columns:
             df['Size_Log'] = np.log(pd.to_numeric(df['Size_Raw'], errors='coerce').replace(0, np.nan))
-        # カラム名統一
         if 'ROE' in df.columns:
             df['Quality_Raw'] = df['ROE']
         if 'Growth' in df.columns:
             df['Investment_Raw'] = df['Growth']
-            
         return df
 
     @staticmethod
     def calculate_orthogonalization(df, x_col, y_col):
-        """
-        【修正 Step 1】DataFrameを返し、直交化後の値をカラムに追加する
-        """
+        """直交化メソッド (Step 1対応: DataFrame返却)"""
         df_out = df.copy()
-        
-        # デフォルトのパラメータ
         params = {'slope': 0, 'intercept': 0, 'r_squared': 0}
-        col_name = f"{y_col}_Orthogonal" if "_Orthogonal" not in y_col else y_col # カラム名生成
+        col_name = f"{y_col}_Orthogonal"
 
         try:
-            # 欠損値を除外して計算用データを作成
             valid_data = df[[x_col, y_col]].dropna()
-            
-            # データ点数が少なすぎる場合は計算しない (生値をそのままコピー)
             if len(valid_data) < 5:
                 df_out[col_name] = df_out[y_col]
                 return df_out, params
 
-            # 線形回帰 (scipy.stats.linregressを使用)
             slope, intercept, r_value, p_value, std_err = linregress(valid_data[x_col], valid_data[y_col])
             
-            # 結果辞書
             params = {
                 'slope': slope,
                 'intercept': intercept,
                 'r_squared': r_value**2
             }
             
-            # 残差(Orthogonalized Value)の計算
-            # Y - (slope * X + intercept)
-            # ※ df全体に対して適用（欠損値がある行はNaNになる）
             def apply_resid(row):
                 y = row.get(y_col, np.nan)
                 x = row.get(x_col, np.nan)
                 if pd.isna(y) or pd.isna(x):
-                    return y # 計算できない場合は元の値を返す（あるいはNaN）
+                    return y 
                 return y - (slope * x + intercept)
 
             df_out[col_name] = df_out.apply(apply_resid, axis=1)
-            
             return df_out, params
 
         except Exception as e:
-            # エラー時は元の値をそのまま入れる
             if col_name not in df_out.columns:
                 df_out[col_name] = df_out[y_col]
             return df_out, params
 
     @staticmethod
     def compute_z_scores(df_target, stats):
-        """市場統計(stats)を用いてZスコアを計算する"""
+        """
+        Zスコア計算 (Step 3対応: クリップ処理とサイズ判定修正)
+        """
         df = df_target.copy()
         
-        # 1. 直交化 (市場全体のパラメータを適用)
-        # ユーザーPFに対しては、UniverseManagerで計算した「市場の傾き」を使って直交化する
         slope = stats.get('ortho_slope', 0)
         intercept = stats.get('ortho_intercept', 0)
         
@@ -167,71 +139,106 @@ class QuantEngine:
             q = row.get('Quality_Raw', np.nan)
             i = row.get('Investment_Raw', np.nan)
             if pd.isna(q): return np.nan
-            # Investmentがない場合は直交化できないため、生値(Quality)を使うか、NaNにするか
-            # ここでは「生値」を使うことでスコアが消えるのを防ぐ
-            if pd.isna(i): return q 
+            if pd.isna(i): return q
             return q - (slope * i + intercept)
             
-        df['Quality_Orthogonal'] = df.apply(apply_ortho, axis=1)
+        df['Quality_Raw_Orthogonal'] = df.apply(apply_ortho, axis=1)
+        df['Quality_Orthogonal'] = df['Quality_Raw_Orthogonal']
 
-        # 2. Zスコア計算
         factors = ['Beta', 'Value', 'Size', 'Momentum', 'Quality', 'Investment']
         r_squared_map = {} 
 
         for f in factors:
             if f not in stats: continue
             
-            if f == 'Quality': col_name = 'Quality_Orthogonal'
-            else: col_name = stats[f]['col']
+            target_col = stats[f]['col']
             
-            if col_name not in df.columns: continue
+            if target_col not in df.columns:
+                if f == 'Quality':
+                    if 'Quality_Raw_Orthogonal' in df.columns: target_col = 'Quality_Raw_Orthogonal'
+                    elif 'Quality_Orthogonal' in df.columns: target_col = 'Quality_Orthogonal'
+                    else: continue
+                else:
+                    continue
 
-            # UniverseManagerに合わせて median, mad を使用
             mu = stats[f].get('median', 0)
             sigma = stats[f].get('mad', 1)
-            
-            # 安全策: ゼロ除算回避
             if sigma == 0: sigma = 1e-6
 
             z_col = f"{f}_Z"
             
             def calc_z(val):
-                if pd.isna(val): return 0.0 # あるいは np.nan
+                if pd.isna(val): return 0.0 
                 z = (val - mu) / sigma
+                
+                # サイズ反転ロジック (Step 3)
                 if f == 'Size': z = -z 
+                
+                # クリップ処理 (Step 3)
+                if z > 3.0: z = 3.0
+                if z < -3.0: z = -3.0
                 return z
             
-            df[z_col] = df[col_name].apply(calc_z)
+            df[z_col] = df[target_col].apply(calc_z)
             
         return df, r_squared_map
 
     @staticmethod
     def generate_insights(z_scores):
-        """Zスコア辞書からインサイト文章を生成"""
+        """
+        【修正 Step 4】インサイト生成ロジックの高度化
+        - しきい値を 0.7 に緩和
+        - 複合条件の追加
+        - 中間的な評価の追加
+        """
         insights = []
         
-        # Size
-        if z_scores.get('Size', 0) < -1.0:
-            insights.append("✅ **大型株中心**: 財務基盤が安定した大型株への配分が高く、市場変動に対する耐久性が期待できます。")
-        elif z_scores.get('Size', 0) > 1.0:
-            insights.append("🚀 **小型株効果**: 時価総額の小さい銘柄が多く、市場平均を上回る成長ポテンシャルを秘めています。")
-            
-        # Value
-        if z_scores.get('Value', 0) > 1.0:
-            insights.append("💰 **バリュー投資**: 純資産に対して割安な銘柄が多く、下値リスクが限定的である可能性があります。")
-            
-        # Quality
-        if z_scores.get('Quality', 0) > 1.0:
-            insights.append("💎 **高クオリティ**: ROE等の収益性が市場平均より高く、経営効率の良い企業群です。")
-            
-        # Momentum
-        mom_z = z_scores.get('Momentum', 0)
-        if mom_z < -1.0:
-            insights.append("🔄 **リバーサル狙い**: 直近で株価が出遅れている銘柄が多く、反発（見直し買い）を狙う構成です。")
-        elif mom_z > 1.0:
-            insights.append("📈 **モメンタム重視**: 直近の株価パフォーマンスが良い銘柄に乗る「順張り」の傾向があります。")
+        # 値の取得 (デフォルト0)
+        z_size = z_scores.get('Size', 0)
+        z_val  = z_scores.get('Value', 0)
+        z_qual = z_scores.get('Quality', 0)
+        z_mom  = z_scores.get('Momentum', 0)
+        z_inv  = z_scores.get('Investment', 0)
 
+        # 1. Size (サイズ)
+        if z_size < -0.7:
+            insights.append("🐘 **大型株中心**: 財務基盤が安定した大型株への配分が高く、市場変動に対する耐久性が期待できます。")
+        elif z_size > 0.7:
+            insights.append("🚀 **小型株効果**: 時価総額の小さい銘柄が多く、市場平均を上回る成長ポテンシャルを秘めています。")
+        
+        # 2. Value (バリュー)
+        if z_val > 0.7:
+            insights.append("💰 **バリュー投資**: 純資産に対して割安な銘柄が多く、下値リスクが限定的である可能性があります。")
+        elif z_val < -0.7:
+            insights.append("💎 **グロース寄り**: 将来の成長期待が高い銘柄が含まれており、割高でも買われている傾向があります。")
+
+        # 3. Quality (クオリティ)
+        if z_qual > 0.7:
+            insights.append("👑 **高クオリティ**: 収益性(ROE)が高く、経営効率の良い「質の高い」企業群です。")
+            
+        # 4. Momentum (モメンタム)
+        if z_mom > 0.7:
+            insights.append("📈 **順張りトレンド**: 直近のパフォーマンスが良い銘柄に乗る「モメンタム重視」の構成です。")
+        elif z_mom < -0.7:
+            insights.append("🔄 **逆張り/出遅れ**: 直近で株価が軟調な銘柄が多く、反発（リバーサル）狙いの可能性があります。")
+
+        # 5. Investment (投資性向)
+        if z_inv > 0.7:
+            insights.append("🏗️ **積極投資**: 設備投資や資産拡大に積極的な企業が含まれています（過剰投資リスクに注意）。")
+        elif z_inv < -0.7:
+            insights.append("🛡️ **保守的経営**: 資産拡大を抑え、筋肉質な経営を行っている企業群です（Investment効果）。")
+
+        # --- 複合条件 (Advanced) ---
+        # 「クオリティが高くて割安」 = お宝銘柄の可能性
+        if z_qual > 0.5 and z_val > 0.5:
+            insights.append("✨ **クオリティ・バリュー**: 質が高いのに割安に放置されている、理想的な銘柄群が含まれています。")
+            
+        # 「小型でモメンタムが強い」 = 急成長株
+        if z_size > 0.5 and z_mom > 0.5:
+            insights.append("🔥 **小型モメンタム**: 小型株かつ上昇トレンドにある、爆発力のある構成です。")
+
+        # 特徴がない場合
         if not insights:
-            insights.append("⚖️ **市場中立**: 特定のファクターへの極端な偏りがなく、市場全体（インデックス）に近いバランスです。")
+            insights.append("⚖️ **市場中立 (バランス型)**: 特定のファクターへの偏りが少なく、インデックス（市場平均）に近い安定した構成です。")
             
         return insights
