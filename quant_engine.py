@@ -5,7 +5,7 @@ from scipy.stats import linregress
 class QuantEngine:
     """
     ポートフォリオの数値計算、スコアリング、インサイト生成を担当するエンジン
-    【修正版 Step 3】UniverseManagerとの統計指標の整合性確保（median/mad対応）
+    【修正版 Step 1】直交化メソッドの実体化 (計算済みDataFrameを返すように修正)
     """
     
     @staticmethod
@@ -106,16 +106,22 @@ class QuantEngine:
     @staticmethod
     def calculate_orthogonalization(df, x_col, y_col):
         """
-        【Step 3 追加】UniverseManagerから呼び出される直交化計算メソッド
+        【修正 Step 1】DataFrameを返し、直交化後の値をカラムに追加する
         """
         df_out = df.copy()
+        
+        # デフォルトのパラメータ
+        params = {'slope': 0, 'intercept': 0, 'r_squared': 0}
+        col_name = f"{y_col}_Orthogonal" if "_Orthogonal" not in y_col else y_col # カラム名生成
+
         try:
             # 欠損値を除外して計算用データを作成
             valid_data = df[[x_col, y_col]].dropna()
             
-            # データ点数が少なすぎる場合は計算しない
+            # データ点数が少なすぎる場合は計算しない (生値をそのままコピー)
             if len(valid_data) < 5:
-                return df_out, {'slope': 0, 'intercept': 0, 'r_squared': 0}
+                df_out[col_name] = df_out[y_col]
+                return df_out, params
 
             # 線形回帰 (scipy.stats.linregressを使用)
             slope, intercept, r_value, p_value, std_err = linregress(valid_data[x_col], valid_data[y_col])
@@ -127,12 +133,25 @@ class QuantEngine:
                 'r_squared': r_value**2
             }
             
-            # 残差(Orthogonalized Value)の計算には元のDataFrameを使用（欠損値ケアのため）
+            # 残差(Orthogonalized Value)の計算
+            # Y - (slope * X + intercept)
+            # ※ df全体に対して適用（欠損値がある行はNaNになる）
+            def apply_resid(row):
+                y = row.get(y_col, np.nan)
+                x = row.get(x_col, np.nan)
+                if pd.isna(y) or pd.isna(x):
+                    return y # 計算できない場合は元の値を返す（あるいはNaN）
+                return y - (slope * x + intercept)
+
+            df_out[col_name] = df_out.apply(apply_resid, axis=1)
+            
             return df_out, params
 
         except Exception as e:
-            # エラー時はデフォルト値を返す
-            return df_out, {'slope': 0, 'intercept': 0, 'r_squared': 0}
+            # エラー時は元の値をそのまま入れる
+            if col_name not in df_out.columns:
+                df_out[col_name] = df_out[y_col]
+            return df_out, params
 
     @staticmethod
     def compute_z_scores(df_target, stats):
@@ -140,6 +159,7 @@ class QuantEngine:
         df = df_target.copy()
         
         # 1. 直交化 (市場全体のパラメータを適用)
+        # ユーザーPFに対しては、UniverseManagerで計算した「市場の傾き」を使って直交化する
         slope = stats.get('ortho_slope', 0)
         intercept = stats.get('ortho_intercept', 0)
         
@@ -147,6 +167,8 @@ class QuantEngine:
             q = row.get('Quality_Raw', np.nan)
             i = row.get('Investment_Raw', np.nan)
             if pd.isna(q): return np.nan
+            # Investmentがない場合は直交化できないため、生値(Quality)を使うか、NaNにするか
+            # ここでは「生値」を使うことでスコアが消えるのを防ぐ
             if pd.isna(i): return q 
             return q - (slope * i + intercept)
             
@@ -164,7 +186,7 @@ class QuantEngine:
             
             if col_name not in df.columns: continue
 
-            # 【重要修正】UniverseManagerに合わせて mean -> median, std -> mad に変更
+            # UniverseManagerに合わせて median, mad を使用
             mu = stats[f].get('median', 0)
             sigma = stats[f].get('mad', 1)
             
@@ -174,7 +196,7 @@ class QuantEngine:
             z_col = f"{f}_Z"
             
             def calc_z(val):
-                if pd.isna(val): return 0.0
+                if pd.isna(val): return 0.0 # あるいは np.nan
                 z = (val - mu) / sigma
                 if f == 'Size': z = -z 
                 return z
