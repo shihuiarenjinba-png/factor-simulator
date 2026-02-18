@@ -5,7 +5,7 @@ from quant_engine import QuantEngine
 class UniverseManager:
     """
     【Module 3】 市場統計管理 (Pro Version)
-    【修正版 Step 3】QuantEngineとの整合性を確保し、エラーを解消
+    【修正版 Step 2】指標名称の完全統一と直交化フローの整合性確保
     """
 
     @staticmethod
@@ -13,33 +13,31 @@ class UniverseManager:
         """
         市場全体の生データを受け取り、統計情報(Stats)と処理済みデータを返す
         """
-        # 1. 生データを計算可能な指標に変換
+        # 1. 生データを計算可能な指標に変換 (_Raw, _Log カラムが生成される)
         df_proc = QuantEngine.process_raw_factors(df_universe_raw)
 
         # 2. 統計作成用の外れ値処理 (Winsorization)
-        # エンジンとの名称統一 (Metric -> Raw)
+        # エンジン側で使用するすべての「Raw指標」を対象にする
         numeric_cols = [
             'Size_Log', 
-            'Value_Raw',      # Value_Metric -> Value_Raw
-            'Momentum_Raw',   # Momentum_Metric -> Momentum_Raw
-            'Quality_Raw',    # Quality_Metric -> Quality_Raw
-            'Investment_Raw'  # Investment_Metric -> Investment_Raw
+            'Value_Raw',
+            'Momentum_Raw',
+            'Quality_Raw',
+            'Investment_Raw',
+            'Beta_Raw'
         ]
         
-        # 統計計算用の一時データフレーム
         df_for_stats = df_proc.copy()
         
         for col in numeric_cols:
             if col in df_for_stats.columns:
-                # 【修正】QuantEngineにwinsorize_seriesがないため、pandas標準機能で代用
-                # 上下1%をクリップする処理
+                # 上下1%をクリップして異常値による中央値・MADの歪みを防ぐ
                 lower = df_for_stats[col].quantile(0.01)
                 upper = df_for_stats[col].quantile(0.99)
                 df_for_stats[col] = df_for_stats[col].clip(lower, upper)
 
-        # 3. 直交化パラメータ & R² の算出 (Quality vs Investment)
-        # 【修正】引数を新しいQuantEngineの仕様 (df, x_col, y_col) に合わせる
-        # Investment(成長)に対してQuality(質)を直交化する
+        # 3. 直交化パラメータ & R² の算出 (Investmentに対してQualityを直交化)
+        # 【重要】Step 1 で修正したエンジンを呼び出し、計算済みの df_ortho を受け取る
         df_ortho, ortho_params = QuantEngine.calculate_orthogonalization(
             df_for_stats, 
             x_col='Investment_Raw', 
@@ -53,20 +51,26 @@ class UniverseManager:
             'ortho_r_squared': ortho_params.get('r_squared', 0.0)
         }
 
-        # 統計をとる対象カラム
+        # 統計を抽出する対象と、参照するカラム名のマッピング
+        # ここで名称がズレると、Zスコア計算時に「市場平均=0」となり、解説がバグる原因になる
         target_factors = {
             'Beta': 'Beta_Raw',          
             'Size': 'Size_Log',
-            'Value': 'Value_Raw',       # Value_Metric -> Value_Raw
-            'Momentum': 'Momentum_Raw', # Momentum_Metric -> Momentum_Raw
-            'Quality': 'Quality_Orthogonal', # 直交化後の値
-            'Investment': 'Investment_Raw'   # Investment_Metric -> Investment_Raw
+            'Value': 'Value_Raw',
+            'Momentum': 'Momentum_Raw',
+            'Quality': 'Quality_Raw_Orthogonal', # エンジン側で生成される名称に合わせる
+            'Investment': 'Investment_Raw'
         }
 
         for factor, col in target_factors.items():
+            # カラムが存在しない場合の救済措置
             if col not in df_ortho.columns:
-                stats[factor] = {'median': 0.0, 'mad': 1.0, 'col': col}
-                continue
+                # Quality_Raw_Orthogonal が見つからない場合は Quality_Raw で代用（フォールバック）
+                if factor == 'Quality' and 'Quality_Raw' in df_ortho.columns:
+                    col = 'Quality_Raw'
+                else:
+                    stats[factor] = {'median': 0.0, 'mad': 1.0, 'col': col}
+                    continue
 
             series = df_ortho[col].dropna()
 
@@ -80,7 +84,7 @@ class UniverseManager:
                 abs_deviation = np.abs(series - median_val)
                 mad_val = abs_deviation.median()
                 
-                # 安全策: MADが0の場合は標準偏差で代用
+                # 安全策: 分散が0の場合は標準偏差、それも0なら1.0
                 if mad_val == 0:
                     mad_val = series.std() if series.std() > 0 else 1.0
 
