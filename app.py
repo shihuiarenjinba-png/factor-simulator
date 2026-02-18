@@ -274,9 +274,22 @@ if run_btn:
     progress_bar.empty()
 
     # -----------------------------------------------------
-    # [Step 4] 結果表示
+    # [Step 4] 結果表示 (Phase 4: Safety & Polish)
     # -----------------------------------------------------
     
+    # [Phase 4] 安全装置: データが空の場合は停止
+    if df_scored.empty:
+        st.error("データの取得に失敗しました。時間をおいて再試行するか、銘柄コードを確認してください。")
+        st.stop()
+
+    # [Phase 4] データ健全性のチェック
+    valid_cols = [c for c in df_scored.columns if c.endswith('_Z')]
+    valid_count = df_scored.dropna(subset=valid_cols).shape[0]
+    total_count = len(df_scored)
+    
+    if valid_count < total_count:
+        st.warning(f"⚠️ 一部のデータが取得できませんでした (有効: {valid_count}/{total_count} 銘柄)。N/A の項目が含まれます。")
+
     # 加重平均Zスコアの算出
     z_cols = [c for c in df_scored.columns if c.endswith('_Z')]
     portfolio_exposure = {}
@@ -367,7 +380,7 @@ if run_btn:
             st.markdown(f'<div class="insight-box">{msg}</div>', unsafe_allow_html=True)
         st.info("※ Sizeは反転しています (＋方向 = 小型株効果)")
 
-    # --- Data Table (フェーズ2：Investment追加 & 指標同期) ---
+    # --- Data Table (フェーズ2：Investment追加 & 指標同期 & Phase 4 Polish) ---
     with st.expander("Show Detailed Factor Data", expanded=True):
         
         # 表示用のコピーを作成
@@ -468,7 +481,9 @@ if run_btn:
         final_cols = base_cols + custom_cols
         
         # Weightのフォーマットのみ適用
+        # [Phase 4] hide_index=True でUIをクリーンにし、use_container_width=True を維持
         st.dataframe(
             df_display[final_cols].style.format({'Weight': '{:.1%}'}),
-            use_container_width=True
+            use_container_width=True,
+            hide_index=True
         )
