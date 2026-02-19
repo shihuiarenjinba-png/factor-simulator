@@ -1,7 +1,7 @@
 streamlit
 pandas
 numpy
-yfinance>=0.2.0
+yfinance
 reportlab
 statsmodels
 scikit-learn
