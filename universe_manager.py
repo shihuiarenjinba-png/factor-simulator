@@ -5,7 +5,7 @@ from quant_engine import QuantEngine
 class UniverseManager:
     """
     【Module 3】 市場統計管理 (Pro Version)
-    【修正版 Step 4】Investmentの定義変更に伴う統計基準の同期
+    【完了版 Step 3】エンジン側の出力名称(Investment_Raw等)との完全同期
     """
 
     @staticmethod
@@ -14,16 +14,17 @@ class UniverseManager:
         市場全体の生データを受け取り、統計情報(Stats)と処理済みデータを返す
         """
         # 1. 生データを計算可能な指標に変換 
-        # (ここで Investment_Raw = 総資産増加率 が生成される)
+        # (ここで Investment_Raw = 総資産増加率, MarketCap等が生成される)
         df_proc = QuantEngine.process_raw_factors(df_universe_raw)
 
         # 2. 統計作成用の外れ値処理 (Winsorization)
+        # Zスコア計算の基となるカラムを指定
         numeric_cols = [
             'Size_Log', 
             'Value_Raw',
             'Momentum_Raw',
             'Quality_Raw',
-            'Investment_Raw', # Step 3で計算式が変更された指標
+            'Investment_Raw', # Step 2で計算式が変更・確定された指標
             'Beta_Raw'
         ]
         
@@ -54,7 +55,7 @@ class UniverseManager:
             'ortho_r_squared': ortho_params.get('r_squared', 0.0)
         }
 
-        # 統計を抽出する対象と、参照するカラム名のマッピング
+        # 統計を抽出する対象と、参照するカラム名のマッピング (エンジンと完全同期)
         target_factors = {
             'Beta': 'Beta_Raw',          
             'Size': 'Size_Log',
