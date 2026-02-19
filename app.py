@@ -171,7 +171,7 @@ st.sidebar.header("📊 Settings")
 
 bench_mode = st.sidebar.selectbox("Benchmark Index", ["Nikkei 225", "TOPIX Core 30"])
 
-# 【修正】ソート対象を Asset Growth に変更
+# ソート対象を Asset Growth に変更
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔍 Display Options")
 sort_key = st.sidebar.selectbox(
@@ -288,7 +288,7 @@ if run_btn:
     total_count = len(df_scored)
     
     if valid_count < total_count:
-        st.warning(f"⚠️ 一部のデータが取得できませんでした (有効: {valid_count}/{total_count} 銘柄)。N/A の項目が含まれます。")
+        st.warning(f"⚠️ 一部のデータが取得できませんでした (完全なデータ: {valid_count}/{total_count} 銘柄)。N/A の項目が含まれる可能性があります。")
 
     # 加重平均Zスコアの算出
     z_cols = [c for c in df_scored.columns if c.endswith('_Z')]
@@ -322,8 +322,7 @@ if run_btn:
     </div>
     """, unsafe_allow_html=True)
     
-    # Quality Score (重複) を削除し、Avg ROE (Profitability) へ変更
-    # Quality_Raw が ROE に相当すると仮定
+    # Avg ROE (Profitability)
     valid_roe = df_scored.dropna(subset=['Quality_Raw', 'Weight']).copy()
     if not valid_roe.empty:
         avg_roe = np.average(valid_roe['Quality_Raw'], weights=valid_roe['Weight'])
@@ -374,57 +373,50 @@ if run_btn:
 
     with c_insight:
         st.subheader("AI Insight")
-        # QuantEngineのメソッドを使用
         insights = QuantEngine.generate_insights(portfolio_exposure)
         for msg in insights:
             st.markdown(f'<div class="insight-box">{msg}</div>', unsafe_allow_html=True)
-        # 【修正】反転している要素を正確にユーザーへ伝達
         st.info("※ SizeとInvestmentは反転しています（＋方向 = 小型株 / 保守的経営）")
 
-    # --- Data Table (フェーズ2：Investment追加 & 指標同期 & Phase 4 Polish) ---
+    # --- Data Table ---
     with st.expander("Show Detailed Factor Data", expanded=True):
         
-        # 表示用のコピーを作成
         df_display = df_scored.copy()
 
         # 並び替えロジック
         if "Value" in sort_key:
-            if 'Value_Z' in df_display.columns:
-                df_display = df_display.sort_values('Value_Z', ascending=False)
+            if 'Value_Z' in df_display.columns: df_display = df_display.sort_values('Value_Z', ascending=False)
         elif "Quality" in sort_key:
-            if 'Quality_Z' in df_display.columns:
-                df_display = df_display.sort_values('Quality_Z', ascending=False)
+            if 'Quality_Z' in df_display.columns: df_display = df_display.sort_values('Quality_Z', ascending=False)
         elif "Momentum" in sort_key:
-            if 'Momentum_Z' in df_display.columns:
-                df_display = df_display.sort_values('Momentum_Z', ascending=False)
-        # 【修正】Investmentソート
+            if 'Momentum_Z' in df_display.columns: df_display = df_display.sort_values('Momentum_Z', ascending=False)
         elif "Investment" in sort_key:
-            if 'Investment_Z' in df_display.columns:
-                df_display = df_display.sort_values('Investment_Z', ascending=False)
+            if 'Investment_Z' in df_display.columns: df_display = df_display.sort_values('Investment_Z', ascending=False)
         elif "Size" in sort_key:
-            if 'Size_Z' in df_display.columns:
-                df_display = df_display.sort_values('Size_Z', ascending=False)
+            if 'Size_Z' in df_display.columns: df_display = df_display.sort_values('Size_Z', ascending=False)
         elif "Weight" in sort_key:
             df_display = df_display.sort_values('Weight', ascending=False)
         else:
-            # Default Ticker sort
             df_display = df_display.sort_values('Ticker', ascending=True)
 
-        # 表示用カラムの生成関数 (実数値 + Zスコア)
-        def format_col(row, raw_col, z_col, unit="", is_percent=False, is_inv=False):
-            # 生値の取得
+        # 【修正】表示用カラムの生成関数 (Zスコアが無くても生データを表示するようガードを緩和)
+        def format_col(row, raw_col, z_col, unit="", is_percent=False):
             raw_val = row.get(raw_col, np.nan)
             z_val = row.get(z_col, np.nan)
             
-            if pd.isna(raw_val) or pd.isna(z_val):
+            # 生データ自体が無い場合は N/A
+            if pd.isna(raw_val):
                 return "N/A"
+            
+            # 生データがあればZスコアがNaNでも表示する
+            z_str = f"{z_val:.2f}" if pd.notna(z_val) else "N/A"
             
             if is_percent:
                 val_str = f"{raw_val*100:.1f}%"
             else:
                 val_str = f"{raw_val:.2f}{unit}"
                 
-            return f"{val_str} (Z: {z_val:.2f})"
+            return f"{val_str} (Z: {z_str})"
 
         # 1. Value (PBR)
         if 'PBR' in df_display.columns and 'Value_Z' in df_display.columns:
@@ -444,18 +436,24 @@ if run_btn:
                 lambda x: format_col(x, 'Momentum_Raw', 'Momentum_Z', is_percent=True), axis=1
             )
         
-        # 【修正】4. Investment (Asset Growth) へ表記変更
+        # 4. Investment (Asset Growth)
         if 'Investment_Raw' in df_display.columns and 'Investment_Z' in df_display.columns:
              df_display['Investment (Asset Growth)'] = df_display.apply(
                 lambda x: format_col(x, 'Investment_Raw', 'Investment_Z', is_percent=True), axis=1
             )
 
-        # 5. Size (Log -> Market Cap?)
-        if 'Size_Z' in df_display.columns:
+        # 【修正】5. Size (Market Cap)
+        # Zスコアが欠損していてもMarketCapがあれば表示させる
+        if 'Size_Z' in df_display.columns or 'MarketCap' in df_display.columns:
             if 'MarketCap' in df_display.columns:
-                 df_display['Size (MktCap)'] = df_display.apply(
-                    lambda x: f"{x['MarketCap']/1e9:.0f}B (Z: {x['Size_Z']:.2f})", axis=1
-                )
+                 def format_size(x):
+                     mcap = x.get('MarketCap', np.nan)
+                     z_val = x.get('Size_Z', np.nan)
+                     if pd.isna(mcap): return "N/A"
+                     z_str = f"{z_val:.2f}" if pd.notna(z_val) else "N/A"
+                     return f"{mcap/1e9:.0f}B (Z: {z_str})"
+                 
+                 df_display['Size (MktCap)'] = df_display.apply(format_size, axis=1)
             else:
                  df_display['Size (Log)'] = df_display.apply(
                     lambda x: format_col(x, 'Size_Log', 'Size_Z'), axis=1
@@ -472,7 +470,6 @@ if run_btn:
         if 'Value (PBR)' in df_display.columns: custom_cols.append('Value (PBR)')
         if 'Quality (ROE)' in df_display.columns: custom_cols.append('Quality (ROE)')
         if 'Momentum (Return)' in df_display.columns: custom_cols.append('Momentum (Return)')
-        # 【修正】Investmentカラム名変更
         if 'Investment (Asset Growth)' in df_display.columns: custom_cols.append('Investment (Asset Growth)')
         
         if 'Size (MktCap)' in df_display.columns: custom_cols.append('Size (MktCap)')
@@ -481,10 +478,9 @@ if run_btn:
         # 最終表示
         final_cols = base_cols + custom_cols
         
-        # Weightのフォーマットのみ適用
-        # 【修正】将来のStreamlitバージョンエラーを防ぐため width="stretch" を指定
+        # 【修正】将来のStreamlitバージョンエラーを防ぐため use_container_width=True を指定
         st.dataframe(
             df_display[final_cols].style.format({'Weight': '{:.1%}'}),
-            width="stretch",
+            use_container_width=True,
             hide_index=True
         )
