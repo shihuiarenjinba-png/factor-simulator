@@ -5,7 +5,7 @@ from scipy.stats import linregress
 class QuantEngine:
     """
     ポートフォリオの数値計算、スコアリング、インサイト生成を担当するエンジン
-    【修正版 Step 3】Investmentファクターを「総資産増加率」に変更
+    【修正版 Step 2】内部名称の統一と欠損フォールバックの強化
     """
     
     @staticmethod
@@ -80,7 +80,7 @@ class QuantEngine:
     def process_raw_factors(df):
         """
         生データをファクター分析用の形式に加工
-        【修正】Investmentを総資産増加率に変更
+        【修正】Sizeの名称同期 (MarketCap) と、Investmentのフォールバック強化
         """
         # Value (PBR逆数)
         if 'PBR' in df.columns:
@@ -89,6 +89,8 @@ class QuantEngine:
         # Size (時価総額対数)
         if 'Size_Raw' in df.columns:
             df['Size_Log'] = np.log(pd.to_numeric(df['Size_Raw'], errors='coerce').replace(0, np.nan))
+            # 【追加】app.pyの表示ロジックに合わせて 'MarketCap' カラムを明示的に作成
+            df['MarketCap'] = pd.to_numeric(df['Size_Raw'], errors='coerce')
         
         # Quality (ROE)
         if 'ROE' in df.columns:
@@ -97,7 +99,6 @@ class QuantEngine:
         # Investment (総資産増加率)
         # Formula: (当期総資産 / 前期総資産) - 1
         if 'Total_Assets' in df.columns and 'Total_Assets_Prev' in df.columns:
-            # 前期資産が0やNaNの場合は計算不可
             prev = pd.to_numeric(df['Total_Assets_Prev'], errors='coerce')
             curr = pd.to_numeric(df['Total_Assets'], errors='coerce')
             
@@ -105,12 +106,11 @@ class QuantEngine:
             ratio = curr / prev.replace(0, np.nan)
             df['Investment_Raw'] = ratio - 1.0
         else:
-            # データがない場合はGrowth(売上)で代用するか、NaNにする
-            # ここでは安全策としてNaN (後続の統計処理で弾かれる)
-            if 'Growth' in df.columns:
-                df['Investment_Raw'] = df['Growth'] # フォールバック
-            else:
-                df['Investment_Raw'] = np.nan
+            df['Investment_Raw'] = np.nan
+            
+        # 【追加】総資産が取得できず Investment_Raw が NaN の場合、Growth (売上成長) で穴埋めする
+        if 'Growth' in df.columns:
+            df['Investment_Raw'] = df['Investment_Raw'].fillna(pd.to_numeric(df['Growth'], errors='coerce'))
             
         return df
 
@@ -154,7 +154,6 @@ class QuantEngine:
     def compute_z_scores(df_target, stats):
         """
         Zスコア計算
-        【修正】Investmentも「小さい方が良い(Conservative)」として反転させるロジックを追加
         """
         df = df_target.copy()
         
@@ -197,7 +196,7 @@ class QuantEngine:
                 if pd.isna(val): return 0.0 
                 z = (val - mu) / sigma
                 
-                # 【修正】サイズとInvestmentの反転ロジック
+                # サイズとInvestmentの反転ロジック
                 # Size: 小さいほどプラス (小型株効果)
                 # Investment: 資産拡大が小さい(Conservative)ほどプラス
                 if f == 'Size' or f == 'Investment': 
@@ -246,7 +245,6 @@ class QuantEngine:
             insights.append("🔄 **逆張り/出遅れ**: 直近で株価が軟調な銘柄が多く、反発（リバーサル）狙いの可能性があります。")
 
         # 5. Investment
-        # 反転ロジックを入れたので、プラス(=Conservative)が良い、マイナス(=Aggressive)が過剰投資
         if z_inv > 0.7:
             insights.append("🛡️ **保守的経営**: 資産拡大を抑え、筋肉質な経営を行っている企業群です（CMA効果）。")
         elif z_inv < -0.7:
