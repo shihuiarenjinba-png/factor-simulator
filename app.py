@@ -171,12 +171,12 @@ st.sidebar.header("📊 Settings")
 
 bench_mode = st.sidebar.selectbox("Benchmark Index", ["Nikkei 225", "TOPIX Core 30"])
 
-# 【フェーズ2修正】Investment (Growth) をソート対象に追加
+# 【修正】ソート対象を Asset Growth に変更
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔍 Display Options")
 sort_key = st.sidebar.selectbox(
     "Sort Table By",
-    ["Ticker", "Value (PBR)", "Quality (ROE)", "Momentum (Return)", "Investment (Growth)", "Size", "Weight"]
+    ["Ticker", "Value (PBR)", "Quality (ROE)", "Momentum (Return)", "Investment (Asset Growth)", "Size", "Weight"]
 )
 
 if bench_mode == "Nikkei 225":
@@ -378,7 +378,8 @@ if run_btn:
         insights = QuantEngine.generate_insights(portfolio_exposure)
         for msg in insights:
             st.markdown(f'<div class="insight-box">{msg}</div>', unsafe_allow_html=True)
-        st.info("※ Sizeは反転しています (＋方向 = 小型株効果)")
+        # 【修正】反転している要素を正確にユーザーへ伝達
+        st.info("※ SizeとInvestmentは反転しています（＋方向 = 小型株 / 保守的経営）")
 
     # --- Data Table (フェーズ2：Investment追加 & 指標同期 & Phase 4 Polish) ---
     with st.expander("Show Detailed Factor Data", expanded=True):
@@ -396,7 +397,7 @@ if run_btn:
         elif "Momentum" in sort_key:
             if 'Momentum_Z' in df_display.columns:
                 df_display = df_display.sort_values('Momentum_Z', ascending=False)
-        # 【追加】Investmentソート
+        # 【修正】Investmentソート
         elif "Investment" in sort_key:
             if 'Investment_Z' in df_display.columns:
                 df_display = df_display.sort_values('Investment_Z', ascending=False)
@@ -443,9 +444,9 @@ if run_btn:
                 lambda x: format_col(x, 'Momentum_Raw', 'Momentum_Z', is_percent=True), axis=1
             )
         
-        # 【追加】4. Investment (Growth)
+        # 【修正】4. Investment (Asset Growth) へ表記変更
         if 'Investment_Raw' in df_display.columns and 'Investment_Z' in df_display.columns:
-             df_display['Investment (Growth)'] = df_display.apply(
+             df_display['Investment (Asset Growth)'] = df_display.apply(
                 lambda x: format_col(x, 'Investment_Raw', 'Investment_Z', is_percent=True), axis=1
             )
 
@@ -471,8 +472,8 @@ if run_btn:
         if 'Value (PBR)' in df_display.columns: custom_cols.append('Value (PBR)')
         if 'Quality (ROE)' in df_display.columns: custom_cols.append('Quality (ROE)')
         if 'Momentum (Return)' in df_display.columns: custom_cols.append('Momentum (Return)')
-        # 【追加】Investmentカラム
-        if 'Investment (Growth)' in df_display.columns: custom_cols.append('Investment (Growth)')
+        # 【修正】Investmentカラム名変更
+        if 'Investment (Asset Growth)' in df_display.columns: custom_cols.append('Investment (Asset Growth)')
         
         if 'Size (MktCap)' in df_display.columns: custom_cols.append('Size (MktCap)')
         elif 'Size (Log)' in df_display.columns: custom_cols.append('Size (Log)')
@@ -481,9 +482,9 @@ if run_btn:
         final_cols = base_cols + custom_cols
         
         # Weightのフォーマットのみ適用
-        # [Phase 4] hide_index=True でUIをクリーンにし、use_container_width=True を維持
+        # 【修正】将来のStreamlitバージョンエラーを防ぐため width="stretch" を指定
         st.dataframe(
             df_display[final_cols].style.format({'Weight': '{:.1%}'}),
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
