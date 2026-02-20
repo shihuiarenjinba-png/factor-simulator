@@ -164,6 +164,14 @@ def parse_uploaded_file(uploaded_file):
             
     return weights
 
+# 【修正】ステップ1：キャッシュ機能の導入
+@st.cache_data(ttl=3600)
+def get_cached_market_data(tickers, bench_etf):
+    """データ取得をキャッシュ化し、重い通信処理をスキップする"""
+    df_fund = DataProvider.fetch_fundamentals(tickers)
+    df_hist = DataProvider.fetch_historical_prices(tickers + [bench_etf])
+    return df_fund, df_hist
+
 # ---------------------------------------------------------
 # 3. UI レイアウト & 入力
 # ---------------------------------------------------------
@@ -234,8 +242,8 @@ if run_btn:
     # 1. ベンチマークデータの取得
     status_text.text(f"Fetching Market Data ({bench_mode})...")
     
-    df_bench_fund = DataProvider.fetch_fundamentals(universe_tickers)
-    df_bench_hist = DataProvider.fetch_historical_prices(universe_tickers + [benchmark_etf])
+    # 【修正】ステップ1：キャッシュ関数の呼び出しに変更
+    df_bench_fund, df_bench_hist = get_cached_market_data(universe_tickers, benchmark_etf)
     
     progress_bar.progress(20)
     
@@ -254,8 +262,8 @@ if run_btn:
     status_text.text("Analyzing Your Portfolio...")
     
     # 3. ユーザーデータの取得
-    df_user_fund = DataProvider.fetch_fundamentals(user_tickers)
-    df_user_hist = DataProvider.fetch_historical_prices(user_tickers + [benchmark_etf])
+    # 【修正】ステップ1：ユーザーデータにもキャッシュ関数を利用
+    df_user_fund, df_user_hist = get_cached_market_data(user_tickers, benchmark_etf)
     
     # 4. ユーザーデータの計算
     df_user_fund = QuantEngine.calculate_beta_momentum(df_user_fund, df_user_hist, benchmark_etf)
