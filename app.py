@@ -182,9 +182,10 @@ bench_mode = st.sidebar.selectbox("Benchmark Index", ["Nikkei 225", "TOPIX Core 
 # ソート対象を Asset Growth に変更
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔍 Display Options")
+# 【修正】モメンタムをソート選択肢から削除
 sort_key = st.sidebar.selectbox(
     "Sort Table By",
-    ["Ticker", "Value (PBR)", "Quality (ROE)", "Momentum (Return)", "Investment (Asset Growth)", "Size", "Weight"]
+    ["Ticker", "Value (PBR)", "Quality (ROE)", "Investment (Asset Growth)", "Size", "Weight"]
 )
 
 if bench_mode == "Nikkei 225":
@@ -248,9 +249,10 @@ if run_btn:
     progress_bar.progress(20)
     
     # 2. ベンチマークの計算
-    status_text.text("Calculating Market Beta & Momentum...")
+    status_text.text("Calculating Market Beta...")
     
-    df_bench_fund = QuantEngine.calculate_beta_momentum(df_bench_fund, df_bench_hist, benchmark_etf)
+    # 【修正】エンジンのメソッド名変更に対応
+    df_bench_fund = QuantEngine.calculate_beta(df_bench_fund, df_bench_hist, benchmark_etf)
     
     progress_bar.progress(40)
     
@@ -266,7 +268,8 @@ if run_btn:
     df_user_fund, df_user_hist = get_cached_market_data(user_tickers, benchmark_etf)
     
     # 4. ユーザーデータの計算
-    df_user_fund = QuantEngine.calculate_beta_momentum(df_user_fund, df_user_hist, benchmark_etf)
+    # 【修正】エンジンのメソッド名変更に対応
+    df_user_fund = QuantEngine.calculate_beta(df_user_fund, df_user_hist, benchmark_etf)
     
     # 生データ加工
     df_user_proc = QuantEngine.process_raw_factors(df_user_fund)
@@ -391,13 +394,11 @@ if run_btn:
         
         df_display = df_scored.copy()
 
-        # 並び替えロジック
+        # 並び替えロジックからモメンタムを削除
         if "Value" in sort_key:
             if 'Value_Z' in df_display.columns: df_display = df_display.sort_values('Value_Z', ascending=False)
         elif "Quality" in sort_key:
             if 'Quality_Z' in df_display.columns: df_display = df_display.sort_values('Quality_Z', ascending=False)
-        elif "Momentum" in sort_key:
-            if 'Momentum_Z' in df_display.columns: df_display = df_display.sort_values('Momentum_Z', ascending=False)
         elif "Investment" in sort_key:
             if 'Investment_Z' in df_display.columns: df_display = df_display.sort_values('Investment_Z', ascending=False)
         elif "Size" in sort_key:
@@ -438,11 +439,7 @@ if run_btn:
                 lambda x: format_col(x, 'Quality_Raw', 'Quality_Z', is_percent=True), axis=1
             )
              
-        # 3. Momentum (Return)
-        if 'Momentum_Raw' in df_display.columns and 'Momentum_Z' in df_display.columns:
-             df_display['Momentum (Return)'] = df_display.apply(
-                lambda x: format_col(x, 'Momentum_Raw', 'Momentum_Z', is_percent=True), axis=1
-            )
+        # 【削除】3. Momentum (Return) の処理ブロックを完全削除
         
         # 4. Investment (Asset Growth)
         if 'Investment_Raw' in df_display.columns and 'Investment_Z' in df_display.columns:
@@ -477,7 +474,6 @@ if run_btn:
         custom_cols = []
         if 'Value (PBR)' in df_display.columns: custom_cols.append('Value (PBR)')
         if 'Quality (ROE)' in df_display.columns: custom_cols.append('Quality (ROE)')
-        if 'Momentum (Return)' in df_display.columns: custom_cols.append('Momentum (Return)')
         if 'Investment (Asset Growth)' in df_display.columns: custom_cols.append('Investment (Asset Growth)')
         
         if 'Size (MktCap)' in df_display.columns: custom_cols.append('Size (MktCap)')
