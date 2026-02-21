@@ -5,12 +5,12 @@ from scipy.stats import linregress
 class QuantEngine:
     """
     ポートフォリオの数値計算、スコアリング、インサイト生成を担当するエンジン
-    【修正版 Step 2】内部名称の統一と欠損フォールバックの強化
+    【修正版 Step 3】モメンタムの完全削除によるFama-French 5ファクターへの純化
     """
     
     @staticmethod
-    def calculate_beta_momentum(df_fund, df_hist, benchmark_ticker="1321.T"):
-        """時系列データからBetaとMomentumを計算"""
+    def calculate_beta(df_fund, df_hist, benchmark_ticker="1321.T"):
+        """時系列データからBetaのみを計算（モメンタム削除）"""
         # 1. df_fund救済
         if not isinstance(df_fund, pd.DataFrame):
             try:
@@ -25,7 +25,6 @@ class QuantEngine:
         # 2. df_hist救済
         if not isinstance(df_hist, pd.DataFrame) or df_hist.empty:
             if 'Beta_Raw' not in df.columns: df['Beta_Raw'] = 1.0
-            if 'Momentum_Raw' not in df.columns: df['Momentum_Raw'] = 0.0
             return df
 
         # 計算ロジック
@@ -33,19 +32,16 @@ class QuantEngine:
             rets = df_hist.pct_change(fill_method=None).dropna()
         except Exception:
             df['Beta_Raw'] = 1.0
-            df['Momentum_Raw'] = 0.0
             return df
         
         if benchmark_ticker not in rets.columns:
             df['Beta_Raw'] = 1.0
-            df['Momentum_Raw'] = 0.0
             return df
 
         bench_ret = rets[benchmark_ticker]
         bench_var = bench_ret.var()
 
         betas = {}
-        momenta = {}
 
         for t in df['Ticker']:
             if t in rets.columns:
@@ -54,26 +50,10 @@ class QuantEngine:
                     betas[t] = cov / bench_var if bench_var > 1e-8 else 1.0
                 except:
                     betas[t] = 1.0
-                
-                try:
-                    if t in df_hist.columns:
-                        series = df_hist[t].dropna()
-                        if not series.empty:
-                            p_start = series.iloc[0]
-                            p_end = series.iloc[-1]
-                            momenta[t] = (p_end / p_start) - 1 if p_start > 0 else 0.0
-                        else:
-                            momenta[t] = 0.0
-                    else:
-                        momenta[t] = 0.0
-                except:
-                    momenta[t] = 0.0
             else:
                 betas[t] = 1.0
-                momenta[t] = 0.0
         
         df['Beta_Raw'] = df['Ticker'].map(betas)
-        df['Momentum_Raw'] = df['Ticker'].map(momenta)
         return df
 
     @staticmethod
@@ -170,7 +150,8 @@ class QuantEngine:
         df['Quality_Raw_Orthogonal'] = df.apply(apply_ortho, axis=1)
         df['Quality_Orthogonal'] = df['Quality_Raw_Orthogonal']
 
-        factors = ['Beta', 'Value', 'Size', 'Momentum', 'Quality', 'Investment']
+        # モメンタムを削除
+        factors = ['Beta', 'Value', 'Size', 'Quality', 'Investment']
         r_squared_map = {} 
 
         for f in factors:
@@ -213,13 +194,12 @@ class QuantEngine:
 
     @staticmethod
     def generate_insights(z_scores):
-        """インサイト生成 (Step 4準拠)"""
+        """インサイト生成 (モメンタム削除版)"""
         insights = []
         
         z_size = z_scores.get('Size', 0)
         z_val  = z_scores.get('Value', 0)
         z_qual = z_scores.get('Quality', 0)
-        z_mom  = z_scores.get('Momentum', 0)
         z_inv  = z_scores.get('Investment', 0)
 
         # 1. Size
@@ -237,14 +217,8 @@ class QuantEngine:
         # 3. Quality
         if z_qual > 0.7:
             insights.append("👑 **高クオリティ**: 収益性(ROE)が高く、経営効率の良い「質の高い」企業群です。")
-            
-        # 4. Momentum
-        if z_mom > 0.7:
-            insights.append("📈 **順張りトレンド**: 直近のパフォーマンスが良い銘柄に乗る「モメンタム重視」の構成です。")
-        elif z_mom < -0.7:
-            insights.append("🔄 **逆張り/出遅れ**: 直近で株価が軟調な銘柄が多く、反発（リバーサル）狙いの可能性があります。")
 
-        # 5. Investment
+        # 4. Investment
         if z_inv > 0.7:
             insights.append("🛡️ **保守的経営**: 資産拡大を抑え、筋肉質な経営を行っている企業群です（CMA効果）。")
         elif z_inv < -0.7:
@@ -253,8 +227,6 @@ class QuantEngine:
         # 複合条件
         if z_qual > 0.5 and z_val > 0.5:
             insights.append("✨ **クオリティ・バリュー**: 質が高いのに割安に放置されている、理想的な銘柄群が含まれています。")
-        if z_size > 0.5 and z_mom > 0.5:
-            insights.append("🔥 **小型モメンタム**: 小型株かつ上昇トレンドにある、爆発力のある構成です。")
 
         if not insights:
             insights.append("⚖️ **市場中立 (バランス型)**: 特定のファクターへの偏りが少なく、インデックス（市場平均）に近い安定した構成です。")
