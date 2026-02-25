@@ -5,7 +5,7 @@ from quant_engine import QuantEngine
 class UniverseManager:
     """
     【Module 3】 市場統計管理 (Pro Version)
-    【完了版 Step 3】エンジン側の出力名称(Investment_Raw等)との完全同期
+    【完了版 Step 4】モメンタムを完全排除し、5ファクター(Beta, Size, Value, Quality, Investment)に特化
     """
 
     @staticmethod
@@ -18,13 +18,12 @@ class UniverseManager:
         df_proc = QuantEngine.process_raw_factors(df_universe_raw)
 
         # 2. 統計作成用の外れ値処理 (Winsorization)
-        # Zスコア計算の基となるカラムを指定
+        # Zスコア計算の基となるカラムを指定 (モメンタムを除外した5ファクター)
         numeric_cols = [
             'Size_Log', 
             'Value_Raw',
-            'Momentum_Raw',
             'Quality_Raw',
-            'Investment_Raw', # Step 2で計算式が変更・確定された指標
+            'Investment_Raw',
             'Beta_Raw'
         ]
         
@@ -55,12 +54,11 @@ class UniverseManager:
             'ortho_r_squared': ortho_params.get('r_squared', 0.0)
         }
 
-        # 統計を抽出する対象と、参照するカラム名のマッピング (エンジンと完全同期)
+        # 統計を抽出する対象と、参照するカラム名のマッピング (5ファクターに完全同期)
         target_factors = {
             'Beta': 'Beta_Raw',          
             'Size': 'Size_Log',
             'Value': 'Value_Raw',
-            'Momentum': 'Momentum_Raw',
             'Quality': 'Quality_Raw_Orthogonal', # 直交化後のクオリティ
             'Investment': 'Investment_Raw'       # 総資産増加率
         }
