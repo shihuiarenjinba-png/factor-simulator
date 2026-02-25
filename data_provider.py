@@ -11,9 +11,10 @@ from urllib3.util.retry import Retry
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 3.0: Investment対応版)
-    - 総資産 (Total Assets) の取得ロジックを追加 (Balance Sheet経由)
-    - yfinanceセッション管理とリトライ機能による安定化
+    【Module 1】データ取得プロバイダー (Ver. 3.1: 超軽量・高速化版)
+    - BS取得を完全廃止し、429エラーを回避
+    - yf.Tickersによるバルク取得へ移行
+    - FMP financial-growth エンドポイントから Asset Growth を直接取得
     """
     
     FMP_API_KEY = st.secrets.get("FMP_API_KEY", os.environ.get("FMP_API_KEY"))
@@ -63,7 +64,7 @@ class DataProvider:
     def _fetch_fmp_ratios(ticker_list):
         """
         FMP APIから財務指標を取得 (Rescue用)
-        Balance Sheet Statementも取得して総資産を補完
+        【修正】Balance Sheetを廃止し、financial-growthからAsset Growthを直接取得
         """
         api_key = DataProvider.FMP_API_KEY
         if not api_key or not ticker_list: return {}
@@ -74,8 +75,8 @@ class DataProvider:
             symbol = t_orig.replace(".T", ".JP") if ".T" in t_orig else t_orig
             # 1. Ratios (ROE, PBR)
             url_ratios = f"https://financialmodelingprep.com/api/v3/ratios-ttm/{symbol}?apikey={api_key}"
-            # 2. Balance Sheet (Total Assets)
-            url_bs = f"https://financialmodelingprep.com/api/v3/balance-sheet-statement/{symbol}?limit=2&apikey={api_key}"
+            # 2. Growth (Asset Growth) -> 【修正】BS取得から切り替え
+            url_growth = f"https://financialmodelingprep.com/api/v3/financial-growth/{symbol}?limit=1&apikey={api_key}"
             
             data_res = {}
             try:
@@ -87,15 +88,12 @@ class DataProvider:
                         data_res['ROE'] = items[0].get('returnOnEquityTTM')
                         data_res['PBR'] = items[0].get('priceToBookRatioTTM')
                 
-                # Balance Sheet
-                r_bs = requests.get(url_bs, timeout=5)
-                if r_bs.status_code == 200:
-                    bs_items = r_bs.json()
-                    if len(bs_items) >= 2:
-                        data_res['Total_Assets'] = bs_items[0].get('totalAssets')
-                        data_res['Total_Assets_Prev'] = bs_items[1].get('totalAssets')
-                    elif len(bs_items) == 1:
-                        data_res['Total_Assets'] = bs_items[0].get('totalAssets')
+                # Growth
+                r_g = requests.get(url_growth, timeout=5)
+                if r_g.status_code == 200:
+                    g_items = r_g.json()
+                    if g_items:
+                        data_res['Growth'] = g_items[0].get('assetGrowth')
                         
                 return t_orig, data_res
             except:
@@ -149,17 +147,27 @@ class DataProvider:
     def fetch_fundamentals(tickers):
         """
         【修正】ファンダメンタルズ情報を取得
-        - Total Assets (当期・前期) をバランスシートから取得
-        - 取得できなかった場合はFMPで補完
+        - yf.Tickersによるバルク取得へ変更
+        - 重いBSを廃止し、infoの代替指標やFMPのGrowthで補完
         """
         unique_tickers = list(set(tickers))
         if not unique_tickers: return pd.DataFrame()
 
         session = DataProvider._create_session()
+        
+        # 【修正】バルク取得（一度の通信でメタデータをまとめる）
+        tickers_str = " ".join(unique_tickers)
+        try:
+            tks = yf.Tickers(tickers_str, session=session)
+        except Exception:
+            tks = None
 
         def get_yf_stock(ticker):
             try:
-                tk = yf.Ticker(ticker, session=session)
+                if not tks: return None
+                tk = tks.tickers.get(ticker)
+                if not tk: return None
+                
                 info = tk.info
                 if info is None or 'currentPrice' not in info: return None
                 
@@ -171,36 +179,15 @@ class DataProvider:
                     'Size_Raw': info.get('marketCap', np.nan),
                     'PBR': info.get('priceToBook', np.nan),
                     'ROE': info.get('returnOnEquity', np.nan),
-                    'Sector_Raw': info.get('sector', info.get('industry', 'Unknown'))
+                    'Sector_Raw': info.get('sector', info.get('industry', 'Unknown')),
+                    # 【修正】BSの代わりにinfoから軽い指標を取得（FMPで上書き可能）
+                    'Growth': info.get('revenueGrowth', np.nan)
                 }
-
-                # 【追加】バランスシートから総資産を取得 (Investment計算用)
-                # balance_sheet は重い処理なので、失敗しても他データは活かす
-                try:
-                    bs = tk.balance_sheet
-                    if not bs.empty and 'Total Assets' in bs.index:
-                        assets = bs.loc['Total Assets']
-                        # 直近2期分を取得
-                        if len(assets) >= 2:
-                            res['Total_Assets'] = assets.iloc[0]      # 最新
-                            res['Total_Assets_Prev'] = assets.iloc[1] # 前期
-                        elif len(assets) == 1:
-                            res['Total_Assets'] = assets.iloc[0]
-                            res['Total_Assets_Prev'] = np.nan
-                    else:
-                        # balance_sheetが空の場合、infoから総資産が取れるか試みる
-                        res['Total_Assets'] = info.get('totalAssets', np.nan)
-                        res['Total_Assets_Prev'] = np.nan
-                except:
-                    # 取得エラー時はNaN
-                    res['Total_Assets'] = np.nan
-                    res['Total_Assets_Prev'] = np.nan
-                
                 return res
             except Exception:
                 return None
 
-        # 並列処理
+        # 並列処理 (yf.Tickersの内部パース処理を並列化)
         with ThreadPoolExecutor(max_workers=5) as executor:
             results = list(executor.map(get_yf_stock, unique_tickers))
         
@@ -210,13 +197,13 @@ class DataProvider:
         if df.empty:
             df = pd.DataFrame({'Ticker': unique_tickers})
             
-        # 必須カラム初期化
-        req_cols = ['ROE', 'PBR', 'Total_Assets', 'Total_Assets_Prev']
+        # 必須カラム初期化 (BS関連を削除し、Growthに変更)
+        req_cols = ['ROE', 'PBR', 'Growth']
         for c in req_cols:
             if c not in df.columns: df[c] = np.nan
 
         # 欠損補完 (FMP)
-        missing_cond = df['ROE'].isna() | df['Total_Assets'].isna()
+        missing_cond = df['ROE'].isna() | df['Growth'].isna()
         missing_tickers = df[missing_cond]['Ticker'].tolist() if not df.empty else unique_tickers
         
         if missing_tickers and DataProvider.FMP_API_KEY:
@@ -230,14 +217,12 @@ class DataProvider:
                     # PBR
                     if pd.isna(row.get('PBR')): 
                         df.at[i, 'PBR'] = fmp_data[t].get('PBR')
-                    # Total Assets
-                    if pd.isna(row.get('Total_Assets')):
-                        df.at[i, 'Total_Assets'] = fmp_data[t].get('Total_Assets')
-                    if pd.isna(row.get('Total_Assets_Prev')):
-                        df.at[i, 'Total_Assets_Prev'] = fmp_data[t].get('Total_Assets_Prev')
+                    # Growth (Asset Growth)
+                    if pd.isna(row.get('Growth')):
+                        df.at[i, 'Growth'] = fmp_data[t].get('Growth')
 
         # 数値型変換
-        num_cols = ['Price', 'Size_Raw', 'PBR', 'ROE', 'Total_Assets', 'Total_Assets_Prev']
+        num_cols = ['Price', 'Size_Raw', 'PBR', 'ROE', 'Growth']
         for c in num_cols:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
