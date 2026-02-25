@@ -5,7 +5,7 @@ from quant_engine import QuantEngine
 class UniverseManager:
     """
     【Module 3】 市場統計管理 (Pro Version)
-    【完了版 Step 4】モメンタムを完全排除し、5ファクター(Beta, Size, Value, Quality, Investment)に特化
+    【完了版 Step 5】直交化パラメータの永続化と、市場の「ものさし」の完全固定
     """
 
     @staticmethod
@@ -14,7 +14,7 @@ class UniverseManager:
         市場全体の生データを受け取り、統計情報(Stats)と処理済みデータを返す
         """
         # 1. 生データを計算可能な指標に変換 
-        # (ここで Investment_Raw = 総資産増加率, MarketCap等が生成される)
+        # (ここで Investment_Raw 等が生成される)
         df_proc = QuantEngine.process_raw_factors(df_universe_raw)
 
         # 2. 統計作成用の外れ値処理 (Winsorization)
@@ -48,9 +48,10 @@ class UniverseManager:
         )
 
         # 4. 各ファクターの統計量(Median, MAD)を算出
+        # 【修正】市場の「ものさし（傾き・切片）」を固定。KeyErrorを防ぐため get() で安全に取得
         stats = {
-            'ortho_slope': ortho_params['slope'],
-            'ortho_intercept': ortho_params['intercept'],
+            'ortho_slope': ortho_params.get('slope', 0.0),
+            'ortho_intercept': ortho_params.get('intercept', 0.0),
             'ortho_r_squared': ortho_params.get('r_squared', 0.0)
         }
 
