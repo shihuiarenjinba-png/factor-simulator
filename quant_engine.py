@@ -5,12 +5,12 @@ from scipy.stats import linregress
 class QuantEngine:
     """
     ポートフォリオの数値計算、スコアリング、インサイト生成を担当するエンジン
-    【修正版 Step 3】モメンタムの完全削除によるFama-French 5ファクターへの純化
+    【修正版 Step 4】BS不要化とInvestment（Growth）の統合、異常値のNaN除外強化
     """
     
     @staticmethod
     def calculate_beta(df_fund, df_hist, benchmark_ticker="1321.T"):
-        """時系列データからBetaのみを計算（モメンタム削除）"""
+        """時系列データからBetaのみを計算（モメンタム削除・異常値はNaN化）"""
         # 1. df_fund救済
         if not isinstance(df_fund, pd.DataFrame):
             try:
@@ -24,18 +24,19 @@ class QuantEngine:
 
         # 2. df_hist救済
         if not isinstance(df_hist, pd.DataFrame) or df_hist.empty:
-            if 'Beta_Raw' not in df.columns: df['Beta_Raw'] = 1.0
+            if 'Beta_Raw' not in df.columns: df['Beta_Raw'] = np.nan
             return df
 
         # 計算ロジック
         try:
-            rets = df_hist.pct_change(fill_method=None).dropna()
+            # Pandasのバージョンによるエラーを回避するため、引数をシンプル化
+            rets = df_hist.pct_change().dropna()
         except Exception:
-            df['Beta_Raw'] = 1.0
+            df['Beta_Raw'] = np.nan
             return df
         
         if benchmark_ticker not in rets.columns:
-            df['Beta_Raw'] = 1.0
+            df['Beta_Raw'] = np.nan
             return df
 
         bench_ret = rets[benchmark_ticker]
@@ -47,11 +48,12 @@ class QuantEngine:
             if t in rets.columns:
                 try:
                     cov = rets[t].cov(bench_ret)
-                    betas[t] = cov / bench_var if bench_var > 1e-8 else 1.0
+                    # エラー値や極端な分散の場合はNaNとして除外
+                    betas[t] = cov / bench_var if bench_var > 1e-8 else np.nan
                 except:
-                    betas[t] = 1.0
+                    betas[t] = np.nan
             else:
-                betas[t] = 1.0
+                betas[t] = np.nan
         
         df['Beta_Raw'] = df['Ticker'].map(betas)
         return df
@@ -60,7 +62,7 @@ class QuantEngine:
     def process_raw_factors(df):
         """
         生データをファクター分析用の形式に加工
-        【修正】Sizeの名称同期 (MarketCap) と、Investmentのフォールバック強化
+        【修正】BS（Total_Assets）依存を完全廃止し、Growthカラムを採用
         """
         # Value (PBR逆数)
         if 'PBR' in df.columns:
@@ -69,28 +71,23 @@ class QuantEngine:
         # Size (時価総額対数)
         if 'Size_Raw' in df.columns:
             df['Size_Log'] = np.log(pd.to_numeric(df['Size_Raw'], errors='coerce').replace(0, np.nan))
-            # 【追加】app.pyの表示ロジックに合わせて 'MarketCap' カラムを明示的に作成
+            # app.pyの表示ロジックに合わせて 'MarketCap' カラムを明示的に作成
             df['MarketCap'] = pd.to_numeric(df['Size_Raw'], errors='coerce')
         
         # Quality (ROE)
         if 'ROE' in df.columns:
             df['Quality_Raw'] = df['ROE']
         
-        # Investment (総資産増加率)
-        # Formula: (当期総資産 / 前期総資産) - 1
-        if 'Total_Assets' in df.columns and 'Total_Assets_Prev' in df.columns:
-            prev = pd.to_numeric(df['Total_Assets_Prev'], errors='coerce')
-            curr = pd.to_numeric(df['Total_Assets'], errors='coerce')
-            
-            # 0除算回避のため、prevが0の場合はNaNにする
-            ratio = curr / prev.replace(0, np.nan)
-            df['Investment_Raw'] = ratio - 1.0
-        else:
+        # Investment (資産成長率)
+        # 【修正】BSの読み込みを廃止したため、DataProviderで取得した 'Growth' 
+        # (FMPのAsset Growth または infoのRevenue Growth) を直接代入して計算負荷をゼロにする
+        try:
+            if 'Growth' in df.columns:
+                df['Investment_Raw'] = pd.to_numeric(df['Growth'], errors='coerce')
+            else:
+                df['Investment_Raw'] = np.nan
+        except Exception:
             df['Investment_Raw'] = np.nan
-            
-        # 【追加】総資産が取得できず Investment_Raw が NaN の場合、Growth (売上成長) で穴埋めする
-        if 'Growth' in df.columns:
-            df['Investment_Raw'] = df['Investment_Raw'].fillna(pd.to_numeric(df['Growth'], errors='coerce'))
             
         return df
 
@@ -133,19 +130,24 @@ class QuantEngine:
     @staticmethod
     def compute_z_scores(df_target, stats):
         """
-        Zスコア計算
+        Zスコア計算 (市場全体の直交化パラメータを適用)
         """
         df = df_target.copy()
         
+        # 市場全体（ベンチマーク）で算出した回帰係数を取得
         slope = stats.get('ortho_slope', 0)
         intercept = stats.get('ortho_intercept', 0)
         
         def apply_ortho(row):
-            q = row.get('Quality_Raw', np.nan)
-            i = row.get('Investment_Raw', np.nan)
-            if pd.isna(q): return np.nan
-            if pd.isna(i): return q
-            return q - (slope * i + intercept)
+            try:
+                q = row.get('Quality_Raw', np.nan)
+                i = row.get('Investment_Raw', np.nan)
+                if pd.isna(q): return np.nan
+                if pd.isna(i): return q
+                # 市場全体の「基準」を使って、ユーザーの銘柄のQualityからInvestmentの影響を除く
+                return q - (slope * i + intercept)
+            except Exception:
+                return np.nan
             
         df['Quality_Raw_Orthogonal'] = df.apply(apply_ortho, axis=1)
         df['Quality_Orthogonal'] = df['Quality_Raw_Orthogonal']
@@ -174,7 +176,7 @@ class QuantEngine:
             z_col = f"{f}_Z"
             
             def calc_z(val):
-                if pd.isna(val): return 0.0 
+                if pd.isna(val): return np.nan # 欠損値は0にせずNaNとして扱う
                 z = (val - mu) / sigma
                 
                 # サイズとInvestmentの反転ロジック
