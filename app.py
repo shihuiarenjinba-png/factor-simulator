@@ -237,52 +237,31 @@ if run_btn:
         st.stop()
         
     # [Step 2] データ取得 & 市場統計作成
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    # 1. ベンチマークデータの取得
-    status_text.text(f"Fetching Market Data ({bench_mode})...")
-    
-    # 【修正】ステップ1：キャッシュ関数の呼び出しに変更
-    df_bench_fund, df_bench_hist = get_cached_market_data(universe_tickers, benchmark_etf)
-    
-    progress_bar.progress(20)
-    
-    # 2. ベンチマークの計算
-    status_text.text("Calculating Market Beta...")
-    
-    # 【修正】エンジンのメソッド名変更に対応
-    df_bench_fund = QuantEngine.calculate_beta(df_bench_fund, df_bench_hist, benchmark_etf)
-    
-    progress_bar.progress(40)
-    
-    status_text.text("Generating Robust Statistics (Universe Manager)...")
-    market_stats, df_bench_processed = UniverseManager.generate_market_stats(df_bench_fund)
-    progress_bar.progress(60)
-
-    # [Step 3] ユーザーポートフォリオ評価
-    status_text.text("Analyzing Your Portfolio...")
-    
-    # 3. ユーザーデータの取得
-    # 【修正】ステップ1：ユーザーデータにもキャッシュ関数を利用
-    df_user_fund, df_user_hist = get_cached_market_data(user_tickers, benchmark_etf)
-    
-    # 4. ユーザーデータの計算
-    # 【修正】エンジンのメソッド名変更に対応
-    df_user_fund = QuantEngine.calculate_beta(df_user_fund, df_user_hist, benchmark_etf)
-    
-    # 生データ加工
-    df_user_proc = QuantEngine.process_raw_factors(df_user_fund)
-    
-    # Zスコア計算 (ここで内部的に直交化も実行されます)
-    df_scored, r_squared_map = QuantEngine.compute_z_scores(df_user_proc, market_stats)
-    
-    # ウェイト情報をマージ
-    df_scored['Weight'] = df_scored['Ticker'].map(portfolio_dict)
-    
-    progress_bar.progress(100)
-    status_text.empty()
-    progress_bar.empty()
+    # 【修正】st.status を用いた詳細な進捗表示 (UIの透明性向上)
+    with st.status("Running Analysis...", expanded=True) as status:
+        st.write(f"1. Fetching Market Data ({bench_mode})...")
+        df_bench_fund, df_bench_hist = get_cached_market_data(universe_tickers, benchmark_etf)
+        
+        st.write("2. Calculating Market Beta...")
+        df_bench_fund = QuantEngine.calculate_beta(df_bench_fund, df_bench_hist, benchmark_etf)
+        
+        st.write("3. Generating Robust Statistics (Universe Manager)...")
+        market_stats, df_bench_processed = UniverseManager.generate_market_stats(df_bench_fund)
+        
+        st.write("4. Analyzing Your Portfolio...")
+        df_user_fund, df_user_hist = get_cached_market_data(user_tickers, benchmark_etf)
+        df_user_fund = QuantEngine.calculate_beta(df_user_fund, df_user_hist, benchmark_etf)
+        
+        # 生データ加工
+        df_user_proc = QuantEngine.process_raw_factors(df_user_fund)
+        
+        # Zスコア計算 (ここで内部的に直交化も実行されます)
+        df_scored, r_squared_map = QuantEngine.compute_z_scores(df_user_proc, market_stats)
+        
+        # ウェイト情報をマージ
+        df_scored['Weight'] = df_scored['Ticker'].map(portfolio_dict)
+        
+        status.update(label="Analysis Complete!", state="complete", expanded=False)
 
     # -----------------------------------------------------
     # [Step 4] 結果表示 (Phase 4: Safety & Polish)
@@ -292,6 +271,11 @@ if run_btn:
     if df_scored.empty:
         st.error("データの取得に失敗しました。時間をおいて再試行するか、銘柄コードを確認してください。")
         st.stop()
+
+    # 【修正】スキップされた銘柄の表示 (YFTzMissingError等のエラーハンドリング)
+    missing_tickers = [t for t in user_tickers if t not in df_scored['Ticker'].values]
+    if missing_tickers:
+        st.warning(f"⚠️ 以下の銘柄はデータが取得できなかったためスキップされました（上場廃止やティッカーミスの可能性があります）:\n`{', '.join(missing_tickers)}`")
 
     # [Phase 4] データ健全性のチェック
     valid_cols = [c for c in df_scored.columns if c.endswith('_Z')]
