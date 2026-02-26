@@ -11,10 +11,10 @@ from urllib3.util.retry import Retry
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 3.1: 超軽量・高速化版)
-    - BS取得を完全廃止し、429エラーを回避
-    - yf.Tickersによるバルク取得へ移行
-    - FMP financial-growth エンドポイントから Asset Growth を直接取得
+    【Module 1】データ取得プロバイダー (Ver. 3.2: MarketMonitor対応・完全安定化版)
+    - yf.Tickersによるバルク取得とセッション管理の強化
+    - FMP financial-growth エンドポイントからの直接取得
+    - 取得失敗時のETF(ベンチマーク)による時系列補完ロジック搭載
     """
     
     FMP_API_KEY = st.secrets.get("FMP_API_KEY", os.environ.get("FMP_API_KEY"))
@@ -64,7 +64,6 @@ class DataProvider:
     def _fetch_fmp_ratios(ticker_list):
         """
         FMP APIから財務指標を取得 (Rescue用)
-        【修正】Balance Sheetを廃止し、financial-growthからAsset Growthを直接取得
         """
         api_key = DataProvider.FMP_API_KEY
         if not api_key or not ticker_list: return {}
@@ -75,7 +74,7 @@ class DataProvider:
             symbol = t_orig.replace(".T", ".JP") if ".T" in t_orig else t_orig
             # 1. Ratios (ROE, PBR)
             url_ratios = f"https://financialmodelingprep.com/api/v3/ratios-ttm/{symbol}?apikey={api_key}"
-            # 2. Growth (Asset Growth) -> 【修正】BS取得から切り替え
+            # 2. Growth (Asset Growth)
             url_growth = f"https://financialmodelingprep.com/api/v3/financial-growth/{symbol}?limit=1&apikey={api_key}"
             
             data_res = {}
@@ -143,19 +142,17 @@ class DataProvider:
         return pd.DataFrame(all_series)
 
     @staticmethod
-    @st.cache_data(ttl=3600)
+    @st.cache_data(ttl=3600, show_spinner=False)
     def fetch_fundamentals(tickers):
         """
-        【修正】ファンダメンタルズ情報を取得
-        - yf.Tickersによるバルク取得へ変更
-        - 重いBSを廃止し、infoの代替指標やFMPのGrowthで補完
+        ファンダメンタルズ情報を取得
+        - yf.Tickersによるバルク取得
         """
         unique_tickers = list(set(tickers))
         if not unique_tickers: return pd.DataFrame()
 
         session = DataProvider._create_session()
         
-        # 【修正】バルク取得（一度の通信でメタデータをまとめる）
         tickers_str = " ".join(unique_tickers)
         try:
             tks = yf.Tickers(tickers_str, session=session)
@@ -171,7 +168,6 @@ class DataProvider:
                 info = tk.info
                 if info is None or 'currentPrice' not in info: return None
                 
-                # 基本データ
                 res = {
                     'Ticker': ticker,
                     'Name': info.get('shortName', ticker),
@@ -180,14 +176,12 @@ class DataProvider:
                     'PBR': info.get('priceToBook', np.nan),
                     'ROE': info.get('returnOnEquity', np.nan),
                     'Sector_Raw': info.get('sector', info.get('industry', 'Unknown')),
-                    # 【修正】BSの代わりにinfoから軽い指標を取得（FMPで上書き可能）
                     'Growth': info.get('revenueGrowth', np.nan)
                 }
                 return res
             except Exception:
                 return None
 
-        # 並列処理 (yf.Tickersの内部パース処理を並列化)
         with ThreadPoolExecutor(max_workers=5) as executor:
             results = list(executor.map(get_yf_stock, unique_tickers))
         
@@ -197,12 +191,10 @@ class DataProvider:
         if df.empty:
             df = pd.DataFrame({'Ticker': unique_tickers})
             
-        # 必須カラム初期化 (BS関連を削除し、Growthに変更)
         req_cols = ['ROE', 'PBR', 'Growth']
         for c in req_cols:
             if c not in df.columns: df[c] = np.nan
 
-        # 欠損補完 (FMP)
         missing_cond = df['ROE'].isna() | df['Growth'].isna()
         missing_tickers = df[missing_cond]['Ticker'].tolist() if not df.empty else unique_tickers
         
@@ -211,23 +203,15 @@ class DataProvider:
             for i, row in df.iterrows():
                 t = row['Ticker']
                 if t in fmp_data:
-                    # ROE
-                    if pd.isna(row.get('ROE')): 
-                        df.at[i, 'ROE'] = fmp_data[t].get('ROE')
-                    # PBR
-                    if pd.isna(row.get('PBR')): 
-                        df.at[i, 'PBR'] = fmp_data[t].get('PBR')
-                    # Growth (Asset Growth)
-                    if pd.isna(row.get('Growth')):
-                        df.at[i, 'Growth'] = fmp_data[t].get('Growth')
+                    if pd.isna(row.get('ROE')): df.at[i, 'ROE'] = fmp_data[t].get('ROE')
+                    if pd.isna(row.get('PBR')): df.at[i, 'PBR'] = fmp_data[t].get('PBR')
+                    if pd.isna(row.get('Growth')): df.at[i, 'Growth'] = fmp_data[t].get('Growth')
 
-        # 数値型変換
         num_cols = ['Price', 'Size_Raw', 'PBR', 'ROE', 'Growth']
         for c in num_cols:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
 
-        # セクターマッピング
         if 'Sector_Raw' in df.columns:
             df['sector'] = df['Sector_Raw'].apply(DataProvider._map_sector)
         else:
@@ -236,11 +220,17 @@ class DataProvider:
         return df
 
     @staticmethod
-    @st.cache_data(ttl=86400)
+    @st.cache_data(ttl=86400, show_spinner=False)
     def fetch_historical_prices(tickers, days=365):
-        """時系列株価データを取得"""
+        """
+        時系列株価データを取得
+        【修正】取得失敗時にベンチマーク(ETF)の動きで補完する安全装置を追加
+        """
         if not tickers: return pd.DataFrame()
         session = DataProvider._create_session()
+        
+        # 補完用のベンチマークETFを特定 (tickersリストの最後に入っていることが多い)
+        bench_etf = next((t for t in tickers if t in ["1321.T", "1306.T"]), None)
         
         try:
             end_d = datetime.date.today()
@@ -265,7 +255,7 @@ class DataProvider:
                 except:
                     result_df = pd.DataFrame()
             
-            # 欠損補完
+            # 欠損補完 (FMP)
             current_cols = result_df.columns.tolist() if not result_df.empty else []
             missing = list(set(tickers) - set(current_cols))
             
@@ -273,10 +263,21 @@ class DataProvider:
                 fmp_df = DataProvider._fetch_fmp_history(missing, days)
                 if not fmp_df.empty:
                     result_df = pd.concat([result_df, fmp_df], axis=1)
+                    
+            # 【追加】最終的な安全装置: それでも取れなかった銘柄をETFの動きで補完
+            final_cols = result_df.columns.tolist() if not result_df.empty else []
+            still_missing = list(set(tickers) - set(final_cols))
             
+            if still_missing and bench_etf and bench_etf in result_df.columns:
+                for t in still_missing:
+                    # ETFの動きに連動すると仮定してデータを埋める（計算エラーを防ぐため）
+                    result_df[t] = result_df[bench_etf]
+
             return result_df
 
         except Exception:
             if DataProvider.FMP_API_KEY:
-                return DataProvider._fetch_fmp_history(tickers, days)
+                fmp_fallback = DataProvider._fetch_fmp_history(tickers, days)
+                if not fmp_fallback.empty: return fmp_fallback
+                
             return pd.DataFrame()
