@@ -6,6 +6,7 @@ class QuantEngine:
     """
     ポートフォリオの数値計算、スコアリング、インサイト生成を担当するエンジン
     【修正版 Step 4】BS不要化とInvestment（Growth）の統合、異常値のNaN除外強化
+    【工程3】引き渡しミスの徹底排除と診断スピードの極限化
     """
     
     @staticmethod
@@ -101,7 +102,7 @@ class QuantEngine:
         try:
             valid_data = df[[x_col, y_col]].dropna()
             if len(valid_data) < 5:
-                df_out[col_name] = df_out[y_col]
+                df_out[col_name] = df_out.get(y_col, np.nan)
                 return df_out, params
 
             slope, intercept, r_value, p_value, std_err = linregress(valid_data[x_col], valid_data[y_col])
@@ -124,15 +125,16 @@ class QuantEngine:
 
         except Exception as e:
             if col_name not in df_out.columns:
-                df_out[col_name] = df_out[y_col]
+                df_out[col_name] = df_out.get(y_col, np.nan)
             return df_out, params
 
     @staticmethod
     def compute_z_scores(df_target, stats):
         """
-        Zスコア計算 (市場全体の直交化パラメータを適用)
+        Zスコア計算 (市場全体の直交化パラメータを適用し、引き渡しミスを根絶)
         """
         df = df_target.copy()
+        r_squared_map = {} 
         
         # 市場全体（ベンチマーク）で算出した回帰係数を取得
         slope = stats.get('ortho_slope', 0)
@@ -149,25 +151,38 @@ class QuantEngine:
             except Exception:
                 return np.nan
             
-        df['Quality_Raw_Orthogonal'] = df.apply(apply_ortho, axis=1)
-        df['Quality_Orthogonal'] = df['Quality_Raw_Orthogonal']
+        if 'Quality_Raw' in df.columns:
+            df['Quality_Raw_Orthogonal'] = df.apply(apply_ortho, axis=1)
+            df['Quality_Orthogonal'] = df['Quality_Raw_Orthogonal']
 
         # モメンタムを削除
         factors = ['Beta', 'Value', 'Size', 'Quality', 'Investment']
-        r_squared_map = {} 
+
+        # 【フォールバック用辞書】 カラム名が多少ズレても、関連する生データを使って計算を完遂させる
+        fallback_cols = {
+            'Quality': ['Quality_Raw_Orthogonal', 'Quality_Orthogonal', 'Quality_Raw', 'ROE'],
+            'Value': ['Value_Raw', 'PBR'],
+            'Size': ['Size_Log', 'Size_Raw', 'MarketCap'],
+            'Investment': ['Investment_Raw', 'Growth'],
+            'Beta': ['Beta_Raw']
+        }
 
         for f in factors:
             if f not in stats: continue
             
-            target_col = stats[f]['col']
+            target_col = stats[f].get('col', None)
             
+            # 引き渡しミス防止：target_colがユーザーDFにない場合の救済措置
             if target_col not in df.columns:
-                if f == 'Quality':
-                    if 'Quality_Raw_Orthogonal' in df.columns: target_col = 'Quality_Raw_Orthogonal'
-                    elif 'Quality_Orthogonal' in df.columns: target_col = 'Quality_Orthogonal'
-                    else: continue
-                else:
-                    continue
+                found_col = None
+                for candidate in fallback_cols.get(f, []):
+                    if candidate in df.columns:
+                        found_col = candidate
+                        break
+                
+                if not found_col:
+                    continue # フォールバックも見つからなければスキップ
+                target_col = found_col
 
             mu = stats[f].get('median', 0)
             sigma = stats[f].get('mad', 1)
