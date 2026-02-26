@@ -1,6 +1,100 @@
 import pandas as pd
 import numpy as np
+import datetime
+import streamlit as st
 from quant_engine import QuantEngine
+
+# --- フォールバック用リスト (スクレイピング失敗時・サイト仕様変更時の保険) ---
+FALLBACK_NIKKEI_225 = [
+    "7203.T", "6758.T", "8035.T", "9984.T", "9983.T", "6098.T", "4063.T", "6367.T", "9432.T", "4502.T",
+    "4503.T", "6501.T", "7267.T", "8058.T", "8001.T", "6954.T", "6981.T", "9020.T", "9022.T", "7741.T",
+    "5108.T", "4452.T", "6902.T", "7974.T", "8031.T", "4519.T", "4568.T", "6273.T", "4543.T", "6702.T",
+    "6503.T", "4901.T", "4911.T", "2502.T", "2802.T", "3382.T", "8306.T", "8316.T", "8411.T", "8766.T",
+    "8591.T", "8801.T", "8802.T", "9021.T", "9101.T", "9433.T", "9434.T", "9501.T", "9502.T"
+]
+
+FALLBACK_TOPIX_CORE30 = [
+    "7203.T", "6758.T", "8306.T", "9984.T", "9432.T", "6861.T", "8035.T", "6098.T", "8316.T", "4063.T",
+    "9983.T", "6367.T", "4502.T", "7974.T", "8058.T", "8001.T", "2914.T", "6501.T", "7267.T", "8411.T",
+    "6954.T", "6902.T", "7741.T", "9020.T", "9022.T", "4452.T", "5108.T", "8801.T", "6752.T", "6273.T"
+]
+
+class MarketMonitor:
+    """
+    【新規追加 Module】市場監視・自動オーケストレーションモジュール
+    市場の「今」を監視し、構成銘柄の最新リスト自動取得と、
+    データの一括（バルク）取得・キャッシュ管理を一手に行う心臓部。
+    """
+    
+    @staticmethod
+    @st.cache_data(ttl=86400) # 銘柄の入れ替えは頻繁ではないため、リスト取得は1日1回更新
+    def get_latest_tickers(bench_mode):
+        if bench_mode == "Nikkei 225":
+            try:
+                # 日経平均プロファイル公式サイトから構成銘柄を直接抽出
+                url = "https://indexes.nikkei.co.jp/nkave/index/component?idx=nk225"
+                dfs = pd.read_html(url)
+                for df in dfs:
+                    if 'コード' in df.columns:
+                        tickers = []
+                        for code in df['コード'].dropna():
+                            try:
+                                tickers.append(f"{int(code)}.T")
+                            except ValueError:
+                                pass
+                        if len(tickers) >= 200:
+                            return tickers
+            except Exception:
+                pass
+            return FALLBACK_NIKKEI_225
+            
+        else: # TOPIX Core 30
+            try:
+                # TOPIX Core 30はWikipediaのリストがパースしやすく安定しているため利用
+                url = "https://ja.wikipedia.org/wiki/TOPIX_Core30"
+                dfs = pd.read_html(url)
+                for df in dfs:
+                    if '証券コード' in df.columns:
+                        tickers = []
+                        for code in df['証券コード'].dropna():
+                            try:
+                                tickers.append(f"{int(code)}.T")
+                            except ValueError:
+                                pass
+                        if len(tickers) >= 25:
+                            return tickers
+            except Exception:
+                pass
+            return FALLBACK_TOPIX_CORE30
+
+    @staticmethod
+    @st.cache_data(ttl=1800) # 市場データは30分間隔でリフレッシュし、時差を最小化
+    def get_market_intelligence(bench_mode, benchmark_etf):
+        """
+        最新の銘柄リストでバルク取得を行い、市場の「ものさし」を計算してメモリに保持する
+        """
+        # 循環参照を防ぐためにメソッド内でインポート
+        from data_provider import DataProvider  
+        
+        # 1. 公式サイトから最新銘柄リストを取得
+        tickers = MarketMonitor.get_latest_tickers(bench_mode)
+        
+        # 2. バルクデータ取得 (DataProviderがyf.Tickersで一括処理するため速い)
+        df_fund = DataProvider.fetch_fundamentals(tickers)
+        df_hist = DataProvider.fetch_historical_prices(tickers + [benchmark_etf])
+        
+        # 3. エンジンでBetaなどを計算
+        df_fund = QuantEngine.calculate_beta(df_fund, df_hist, benchmark_etf)
+        
+        # 4. UniverseManagerで市場全体の平均・標準偏差（ものさし）を算出
+        stats, processed_data = UniverseManager.generate_market_stats(df_fund)
+        
+        return {
+            'stats': stats,
+            'processed_data': processed_data,
+            'last_updated': datetime.datetime.now().strftime("%H:%M:%S")
+        }
+
 
 class UniverseManager:
     """
