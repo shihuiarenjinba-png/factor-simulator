@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import re  # 【追加】正規表現モジュール（4桁数字の判定用）
+import re  # 正規表現モジュール（4桁数字の判定用）
 
 # カスタムモジュールの読み込み
 try:
@@ -19,7 +19,7 @@ except ImportError as e:
 # ---------------------------------------------------------
 st.set_page_config(layout="wide", page_title="Market Factor Lab (Pro)")
 
-# カスタムCSS
+# カスタムCSS (レスポンシブ対応追加)
 st.markdown("""
 <style>
     .metric-card {
@@ -49,6 +49,22 @@ st.markdown("""
     }
     /* テーブル内の文字サイズ調整 */
     .stDataFrame { font-size: 14px; }
+    
+    /* モバイル・小画面用レスポンシブデザイン */
+    @media (max-width: 768px) {
+        .metric-value {
+            font-size: 20px;
+        }
+        .metric-label {
+            font-size: 12px;
+        }
+    }
+    
+    /* ダウンロードボタンの余白 */
+    .stDownloadButton {
+        margin-top: 10px;
+        margin-bottom: 10px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -73,7 +89,7 @@ TOPIX_CORE_30 = [
 # 2. ヘルパー関数
 # ---------------------------------------------------------
 
-# 【追加】ティッカーを自動補正する関数 (例: "7203" -> "7203.T")
+# ティッカーを自動補正する関数 (例: "7203" -> "7203.T")
 def format_ticker(t):
     t_str = str(t).strip().upper()
     # 4桁の数字のみで構成されている場合は '.T' を付与
@@ -91,7 +107,7 @@ def parse_portfolio_input(input_text):
         for item in raw_items:
             if ':' in item:
                 parts = item.split(':')
-                # 【修正】ティッカーを補正関数に通す
+                # ティッカーを補正関数に通す
                 ticker = format_ticker(parts[0])
                 try: w = float(parts[1])
                 except ValueError: w = 0.0
@@ -101,7 +117,7 @@ def parse_portfolio_input(input_text):
     else:
         count = len(raw_items)
         for item in raw_items:
-            # 【修正】ティッカーを補正関数に通す
+            # ティッカーを補正関数に通す
             weights[format_ticker(item)] = 1.0 / count
             
     total_w = sum(weights.values())
@@ -121,7 +137,7 @@ def parse_uploaded_file(uploaded_file):
     # 列名をすべて文字列にし、空白を消し、小文字化（揺らぎ吸収）
     df.columns = [str(c).strip().lower() for c in df.columns]
     
-    # 【修正】認識できる列名のバリエーションを大幅増加
+    # 認識できる列名のバリエーションを大幅増加
     possible_ticker_cols = ['ticker', 'code', 'symbol', 'stock', '銘柄コード', 'コード', '銘柄']
     possible_weight_cols = ['weight', 'ratio', 'share', 'portfolio%', '比率', 'ウェイト', '割合', '%']
 
@@ -136,7 +152,7 @@ def parse_uploaded_file(uploaded_file):
     count = len(df)
     
     for _, row in df.iterrows():
-        # 【修正】ティッカーを補正関数に通す
+        # ティッカーを補正関数に通す
         t = format_ticker(row[ticker_col])
         try: w = float(row[weight_col]) if weight_col else 1.0 / count
         except: w = 0.0
@@ -153,6 +169,12 @@ def get_cached_market_data(tickers, bench_etf):
     df_fund = DataProvider.fetch_fundamentals(tickers)
     df_hist = DataProvider.fetch_historical_prices(tickers + [bench_etf])
     return df_fund, df_hist
+
+# データフレームをCSVダウンロード用データに変換するヘルパー関数
+@st.cache_data
+def convert_df_to_csv(df):
+    # 日本語の文字化けを防ぐためにutf-8-sigを使用
+    return df.to_csv(index=False).encode('utf-8-sig')
 
 # --- 表示用データフレーム整形ヘルパー ---
 def create_display_dataframe(df_to_format, sort_val, is_portfolio=True):
@@ -228,7 +250,7 @@ st.sidebar.subheader("My Portfolio")
 input_mode = st.sidebar.radio("Input Mode", ["Manual Input", "File Upload"], horizontal=True)
 
 if input_mode == "Manual Input":
-    # 【修正】数字だけの入力を許容する旨をキャプションに追加
+    # 数字だけの入力を許容する旨をキャプションに追加
     st.sidebar.caption("Format: `7203` or `7203:40` (.T is auto-added)")
     default_input = "7203: 40, 6758: 30, 9984: 30"
     input_text = st.sidebar.text_area("Input", default_input, height=120)
@@ -364,7 +386,8 @@ if run_btn:
                 height=400, margin=dict(l=20, r=20, t=40, b=20)
             )
             fig.add_vline(x=0, line_width=2, line_dash="dash", line_color="black")
-            st.plotly_chart(fig)
+            # レスポンシブ対応: use_container_width=True
+            st.plotly_chart(fig, use_container_width=True)
 
         with c_insight:
             st.subheader("AI Insight")
@@ -375,7 +398,18 @@ if run_btn:
 
         with st.expander("Show Detailed Factor Data", expanded=True):
             df_port_disp = create_display_dataframe(df_scored, sort_key, is_portfolio=True)
-            st.dataframe(df_port_disp.style.format({'Weight': '{:.1%}'}), hide_index=True)
+            
+            # CSVダウンロード機能の追加
+            csv_port = convert_df_to_csv(df_port_disp)
+            st.download_button(
+                label="📥 Download Portfolio Data (CSV)",
+                data=csv_port,
+                file_name='portfolio_analysis.csv',
+                mime='text/csv',
+            )
+            
+            # 表を画面幅に合わせる
+            st.dataframe(df_port_disp.style.format({'Weight': '{:.1%}'}), hide_index=True, use_container_width=True)
 
     # ==========================================
     # Tab 2: Market Universe (全銘柄モニタリング)
@@ -387,4 +421,15 @@ if run_btn:
         df_bench_scored, _ = QuantEngine.compute_z_scores(df_bench_processed, market_stats)
         
         df_bench_disp = create_display_dataframe(df_bench_scored, sort_key, is_portfolio=False)
-        st.dataframe(df_bench_disp, hide_index=True)
+        
+        # CSVダウンロード機能の追加
+        csv_bench = convert_df_to_csv(df_bench_disp)
+        st.download_button(
+            label="📥 Download Universe Data (CSV)",
+            data=csv_bench,
+            file_name=f"{bench_mode.replace(' ', '_').lower()}_universe.csv",
+            mime='text/csv',
+        )
+        
+        # 表を画面幅に合わせる
+        st.dataframe(df_bench_disp, hide_index=True, use_container_width=True)
