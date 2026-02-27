@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import re  # 【追加】正規表現モジュール（4桁数字の判定用）
 
 # カスタムモジュールの読み込み
 try:
@@ -71,6 +72,15 @@ TOPIX_CORE_30 = [
 # ---------------------------------------------------------
 # 2. ヘルパー関数
 # ---------------------------------------------------------
+
+# 【追加】ティッカーを自動補正する関数 (例: "7203" -> "7203.T")
+def format_ticker(t):
+    t_str = str(t).strip().upper()
+    # 4桁の数字のみで構成されている場合は '.T' を付与
+    if re.fullmatch(r'\d{4}', t_str):
+        return f"{t_str}.T"
+    return t_str
+
 def parse_portfolio_input(input_text):
     weights = {}
     raw_items = [x.strip() for x in input_text.replace('\n', ',').split(',') if x.strip()]
@@ -81,16 +91,18 @@ def parse_portfolio_input(input_text):
         for item in raw_items:
             if ':' in item:
                 parts = item.split(':')
-                ticker = parts[0].strip()
+                # 【修正】ティッカーを補正関数に通す
+                ticker = format_ticker(parts[0])
                 try: w = float(parts[1])
                 except ValueError: w = 0.0
                 weights[ticker] = w
             else:
-                weights[item] = 0.0
+                weights[format_ticker(item)] = 0.0
     else:
         count = len(raw_items)
         for item in raw_items:
-            weights[item] = 1.0 / count
+            # 【修正】ティッカーを補正関数に通す
+            weights[format_ticker(item)] = 1.0 / count
             
     total_w = sum(weights.values())
     if total_w > 0:
@@ -106,20 +118,26 @@ def parse_uploaded_file(uploaded_file):
         st.error(f"ファイル読み込みエラー: {e}")
         return {}
     
-    df.columns = [c.strip().lower() for c in df.columns]
+    # 列名をすべて文字列にし、空白を消し、小文字化（揺らぎ吸収）
+    df.columns = [str(c).strip().lower() for c in df.columns]
     
-    ticker_col = next((c for c in ['ticker', 'code', 'symbol', 'stock', '銘柄コード', 'コード'] if c in df.columns), None)
+    # 【修正】認識できる列名のバリエーションを大幅増加
+    possible_ticker_cols = ['ticker', 'code', 'symbol', 'stock', '銘柄コード', 'コード', '銘柄']
+    possible_weight_cols = ['weight', 'ratio', 'share', 'portfolio%', '比率', 'ウェイト', '割合', '%']
+
+    ticker_col = next((c for c in possible_ticker_cols if c in df.columns), None)
     if not ticker_col:
-        st.error("CSV/Excelに「Ticker」または「Code」列が見つかりません。")
+        st.error(f"CSV/Excelに銘柄を特定する列が見つかりません。以下のいずれかの列名を使用してください:\n{', '.join(possible_ticker_cols)}")
         return {}
     
-    weight_col = next((c for c in ['weight', 'ratio', 'share', 'portfolio%', '比率', 'ウェイト'] if c in df.columns), None)
+    weight_col = next((c for c in possible_weight_cols if c in df.columns), None)
     
     weights = {}
     count = len(df)
     
     for _, row in df.iterrows():
-        t = str(row[ticker_col]).strip()
+        # 【修正】ティッカーを補正関数に通す
+        t = format_ticker(row[ticker_col])
         try: w = float(row[weight_col]) if weight_col else 1.0 / count
         except: w = 0.0
         weights[t] = w
@@ -135,6 +153,53 @@ def get_cached_market_data(tickers, bench_etf):
     df_fund = DataProvider.fetch_fundamentals(tickers)
     df_hist = DataProvider.fetch_historical_prices(tickers + [bench_etf])
     return df_fund, df_hist
+
+# --- 表示用データフレーム整形ヘルパー ---
+def create_display_dataframe(df_to_format, sort_val, is_portfolio=True):
+    df_disp = df_to_format.copy()
+
+    # ソート処理
+    if "Value" in sort_val and 'Value_Z' in df_disp.columns: df_disp = df_disp.sort_values('Value_Z', ascending=False)
+    elif "Quality" in sort_val and 'Quality_Z' in df_disp.columns: df_disp = df_disp.sort_values('Quality_Z', ascending=False)
+    elif "Investment" in sort_val and 'Investment_Z' in df_disp.columns: df_disp = df_disp.sort_values('Investment_Z', ascending=False)
+    elif "Size" in sort_val and 'Size_Z' in df_disp.columns: df_disp = df_disp.sort_values('Size_Z', ascending=False)
+    elif "Weight" in sort_val and 'Weight' in df_disp.columns: df_disp = df_disp.sort_values('Weight', ascending=False)
+    else: df_disp = df_disp.sort_values('Ticker', ascending=True)
+
+    # フォーマット関数
+    def fmt(row, raw_col, z_col, unit="", is_percent=False):
+        raw_val = row.get(raw_col, np.nan)
+        z_val = row.get(z_col, np.nan)
+        if pd.isna(raw_val): return "N/A"
+        z_str = f"{z_val:.2f}" if pd.notna(z_val) else "N/A"
+        if is_percent: val_str = f"{raw_val*100:.1f}%"
+        else: val_str = f"{raw_val:.2f}{unit}"
+        return f"{val_str} (Z: {z_str})"
+
+    if 'PBR' in df_disp.columns and 'Value_Z' in df_disp.columns:
+        df_disp['Value (PBR)'] = df_disp.apply(lambda x: fmt(x, 'PBR', 'Value_Z', unit="x"), axis=1)
+    if 'Quality_Raw' in df_disp.columns and 'Quality_Z' in df_disp.columns:
+        df_disp['Quality (ROE)'] = df_disp.apply(lambda x: fmt(x, 'Quality_Raw', 'Quality_Z', is_percent=True), axis=1)
+    if 'Investment_Raw' in df_disp.columns and 'Investment_Z' in df_disp.columns:
+        df_disp['Investment (Asset Growth)'] = df_disp.apply(lambda x: fmt(x, 'Investment_Raw', 'Investment_Z', is_percent=True), axis=1)
+
+    if 'MarketCap' in df_disp.columns:
+        def format_size(x):
+            mcap = x.get('MarketCap', np.nan)
+            z_val = x.get('Size_Z', np.nan)
+            if pd.isna(mcap): return "N/A"
+            z_str = f"{z_val:.2f}" if pd.notna(z_val) else "N/A"
+            return f"{mcap/1e9:.0f}B (Z: {z_str})"
+        df_disp['Size (MktCap)'] = df_disp.apply(format_size, axis=1)
+    elif 'Size_Log' in df_disp.columns:
+        df_disp['Size (Log)'] = df_disp.apply(lambda x: fmt(x, 'Size_Log', 'Size_Z'), axis=1)
+
+    base_cols = ['Ticker']
+    if 'Name' in df_disp.columns: base_cols.append('Name')
+    if is_portfolio and 'Weight' in df_disp.columns: base_cols.append('Weight')
+    
+    custom_cols = [c for c in ['Value (PBR)', 'Quality (ROE)', 'Investment (Asset Growth)', 'Size (MktCap)', 'Size (Log)'] if c in df_disp.columns]
+    return df_disp[base_cols + custom_cols]
 
 # ---------------------------------------------------------
 # 3. UI レイアウト & 入力
@@ -163,12 +228,13 @@ st.sidebar.subheader("My Portfolio")
 input_mode = st.sidebar.radio("Input Mode", ["Manual Input", "File Upload"], horizontal=True)
 
 if input_mode == "Manual Input":
-    st.sidebar.caption("Format: `Ticker` or `Ticker:Weight`")
-    default_input = "7203.T: 40, 6758.T: 30, 9984.T: 30"
+    # 【修正】数字だけの入力を許容する旨をキャプションに追加
+    st.sidebar.caption("Format: `7203` or `7203:40` (.T is auto-added)")
+    default_input = "7203: 40, 6758: 30, 9984: 30"
     input_text = st.sidebar.text_area("Input", default_input, height=120)
     uploaded_file = None
 else:
-    st.sidebar.caption("Support: CSV, Excel (Columns: Ticker, Weight)")
+    st.sidebar.caption("Support: CSV, Excel (Columns: 銘柄コード, 比率等)")
     uploaded_file = st.sidebar.file_uploader("Upload Portfolio", type=['csv', 'xlsx'])
     input_text = ""
 
@@ -192,7 +258,7 @@ if run_btn:
     user_tickers = list(portfolio_dict.keys())
     
     if not user_tickers:
-        st.warning("有効な銘柄が見つかりませんでした。入力形式を確認してください。")
+        st.warning("有効な銘柄が見つかりませんでした。入力形式またはファイルの中身を確認してください。")
         st.stop()
         
     with st.status("Running Analysis...", expanded=True) as status:
@@ -216,156 +282,109 @@ if run_btn:
         status.update(label="Analysis Complete!", state="complete", expanded=False)
 
     # -----------------------------------------------------
-    # 結果表示 (Phase 4: Safety & Polish)
+    # 結果表示 (Tabsによる拡張)
     # -----------------------------------------------------
     if df_scored.empty:
         st.error("❌ データの取得に完全に失敗しました。")
-        st.info("💡 ヒント: Yahoo Financeのアクセス制限（429 Error）に到達している可能性があります。しばらく時間を置くか、入力する銘柄数を減らして再試行してください。")
+        st.info("💡 ヒント: API制限（429 Error）の可能性があります。少し待ってから再試行してください。")
         st.stop()
 
     missing_tickers = [t for t in user_tickers if t not in df_scored['Ticker'].values]
     if missing_tickers:
-        st.warning(f"⚠️ 以下の銘柄はデータが取得できなかったためスキップされました（上場廃止やティッカーミス、またはAPI制限の可能性があります）:\n`{', '.join(missing_tickers)}`")
+        st.warning(f"⚠️ データ取得スキップ銘柄:\n`{', '.join(missing_tickers)}`")
 
-    valid_cols = [c for c in df_scored.columns if c.endswith('_Z')]
-    valid_count = df_scored.dropna(subset=valid_cols).shape[0]
-    total_count = len(df_scored)
-    
-    if valid_count < total_count:
-        st.info(f"ℹ️ 一部のデータが取得できなかった銘柄があります (完全なデータ: {valid_count}/{total_count} 銘柄)。API制限（429 Error）の影響で N/A が含まれる場合があります。")
+    tab_port, tab_bench = st.tabs(["💼 My Portfolio", "🌐 Market Universe (All Stocks)"])
 
-    z_cols = [c for c in df_scored.columns if c.endswith('_Z')]
-    portfolio_exposure = {}
-    
-    for col in z_cols:
-        valid_rows = df_scored.dropna(subset=[col, 'Weight'])
-        if not valid_rows.empty:
-            w_avg = np.average(valid_rows[col], weights=valid_rows['Weight'])
-            portfolio_exposure[col.replace('_Z', '')] = w_avg
-        else:
-            portfolio_exposure[col.replace('_Z', '')] = 0.0
-
-    # --- KPI Cards ---
-    st.subheader(f"📊 Portfolio Diagnostic (vs {bench_mode})")
-    col1, col2, col3 = st.columns(3)
-    
-    valid_beta = df_user_fund.dropna(subset=['Beta_Raw']).copy()
-    valid_beta['Weight'] = valid_beta['Ticker'].map(portfolio_dict)
-    avg_beta = np.average(valid_beta['Beta_Raw'], weights=valid_beta['Weight']) if not valid_beta.empty else 0.0
-
-    col1.markdown(f"""
-    <div class="metric-card">
-        <div class="metric-label">Weighted Beta</div>
-        <div class="metric-value">{avg_beta:.2f}</div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    valid_roe = df_scored.dropna(subset=['Quality_Raw', 'Weight']).copy()
-    roe_display = f"{np.average(valid_roe['Quality_Raw'], weights=valid_roe['Weight']):.1f}%" if not valid_roe.empty else "N/A"
+    # ==========================================
+    # Tab 1: My Portfolio
+    # ==========================================
+    with tab_port:
+        z_cols = [c for c in df_scored.columns if c.endswith('_Z')]
+        portfolio_exposure = {}
         
-    col2.markdown(f"""
-    <div class="metric-card">
-        <div class="metric-label">Avg ROE (Profitability)</div>
-        <div class="metric-value" style="color: #007bff;">{roe_display}</div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    col3.markdown(f"""
-    <div class="metric-card">
-        <div class="metric-label">Holdings</div>
-        <div class="metric-value">{len(user_tickers) - len(missing_tickers)} / {len(user_tickers)}</div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown("---")
-
-    # --- Charts ---
-    c_chart, c_insight = st.columns([2, 1])
-    
-    with c_chart:
-        st.subheader("Factor Exposure (Weighted)")
-        factors = list(portfolio_exposure.keys())
-        scores = list(portfolio_exposure.values())
-        y_labels = [f"{f}" for f in factors]
-        
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            x=scores, y=y_labels, orientation='h',
-            marker=dict(color=scores, colorscale='RdBu', cmin=-2, cmax=2),
-            text=[f"{s:.2f}" for s in scores], textposition='auto'
-        ))
-        fig.update_layout(
-            title=f"Weighted Z-Scores (0 = {bench_mode})",
-            xaxis_title="Standard Deviation (σ)",
-            yaxis=dict(autorange="reversed"),
-            height=400, margin=dict(l=20, r=20, t=40, b=20)
-        )
-        fig.add_vline(x=0, line_width=2, line_dash="dash", line_color="black")
-        
-        # 【修正】Streamlitの警告ログ解消のため、パラメータをスッキリ修正
-        st.plotly_chart(fig)
-
-    with c_insight:
-        st.subheader("AI Insight")
-        insights = QuantEngine.generate_insights(portfolio_exposure)
-        for msg in insights:
-            st.markdown(f'<div class="insight-box">{msg}</div>', unsafe_allow_html=True)
-        st.info("※ SizeとInvestmentは反転しています（＋方向 = 小型株 / 保守的経営）")
-
-    # --- Data Table ---
-    with st.expander("Show Detailed Factor Data", expanded=True):
-        
-        df_display = df_scored.copy()
-
-        if "Value" in sort_key and 'Value_Z' in df_display.columns: df_display = df_display.sort_values('Value_Z', ascending=False)
-        elif "Quality" in sort_key and 'Quality_Z' in df_display.columns: df_display = df_display.sort_values('Quality_Z', ascending=False)
-        elif "Investment" in sort_key and 'Investment_Z' in df_display.columns: df_display = df_display.sort_values('Investment_Z', ascending=False)
-        elif "Size" in sort_key and 'Size_Z' in df_display.columns: df_display = df_display.sort_values('Size_Z', ascending=False)
-        elif "Weight" in sort_key: df_display = df_display.sort_values('Weight', ascending=False)
-        else: df_display = df_display.sort_values('Ticker', ascending=True)
-
-        def format_col(row, raw_col, z_col, unit="", is_percent=False):
-            raw_val = row.get(raw_col, np.nan)
-            z_val = row.get(z_col, np.nan)
-            
-            if pd.isna(raw_val): return "N/A"
-            z_str = f"{z_val:.2f}" if pd.notna(z_val) else "N/A"
-            
-            if is_percent: val_str = f"{raw_val*100:.1f}%"
-            else: val_str = f"{raw_val:.2f}{unit}"
-                
-            return f"{val_str} (Z: {z_str})"
-
-        if 'PBR' in df_display.columns and 'Value_Z' in df_display.columns:
-            df_display['Value (PBR)'] = df_display.apply(lambda x: format_col(x, 'PBR', 'Value_Z', unit="x"), axis=1)
-        
-        if 'Quality_Raw' in df_display.columns and 'Quality_Z' in df_display.columns:
-             df_display['Quality (ROE)'] = df_display.apply(lambda x: format_col(x, 'Quality_Raw', 'Quality_Z', is_percent=True), axis=1)
-             
-        if 'Investment_Raw' in df_display.columns and 'Investment_Z' in df_display.columns:
-             df_display['Investment (Asset Growth)'] = df_display.apply(lambda x: format_col(x, 'Investment_Raw', 'Investment_Z', is_percent=True), axis=1)
-
-        if 'Size_Z' in df_display.columns or 'MarketCap' in df_display.columns:
-            if 'MarketCap' in df_display.columns:
-                 def format_size(x):
-                     mcap = x.get('MarketCap', np.nan)
-                     z_val = x.get('Size_Z', np.nan)
-                     if pd.isna(mcap): return "N/A"
-                     z_str = f"{z_val:.2f}" if pd.notna(z_val) else "N/A"
-                     return f"{mcap/1e9:.0f}B (Z: {z_str})"
-                 df_display['Size (MktCap)'] = df_display.apply(format_size, axis=1)
+        for col in z_cols:
+            valid_rows = df_scored.dropna(subset=[col, 'Weight'])
+            if not valid_rows.empty:
+                w_avg = np.average(valid_rows[col], weights=valid_rows['Weight'])
+                portfolio_exposure[col.replace('_Z', '')] = w_avg
             else:
-                 df_display['Size (Log)'] = df_display.apply(lambda x: format_col(x, 'Size_Log', 'Size_Z'), axis=1)
+                portfolio_exposure[col.replace('_Z', '')] = 0.0
 
-        base_cols = ['Ticker']
-        if 'Name' in df_display.columns: base_cols.append('Name')
-        base_cols.append('Weight')
+        st.subheader(f"📊 Portfolio Diagnostic (vs {bench_mode})")
+        col1, col2, col3 = st.columns(3)
         
-        custom_cols = [c for c in ['Value (PBR)', 'Quality (ROE)', 'Investment (Asset Growth)', 'Size (MktCap)', 'Size (Log)'] if c in df_display.columns]
-        final_cols = base_cols + custom_cols
+        valid_beta = df_user_fund.dropna(subset=['Beta_Raw']).copy()
+        valid_beta['Weight'] = valid_beta['Ticker'].map(portfolio_dict)
+        avg_beta = np.average(valid_beta['Beta_Raw'], weights=valid_beta['Weight']) if not valid_beta.empty else 0.0
+
+        col1.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">Weighted Beta</div>
+            <div class="metric-value">{avg_beta:.2f}</div>
+        </div>
+        """, unsafe_allow_html=True)
         
-        # 【修正】Streamlitの警告を解消するため use_container_width の指定を削除し、最新の書き方に準拠
-        st.dataframe(
-            df_display[final_cols].style.format({'Weight': '{:.1%}'}),
-            hide_index=True
-        )
+        valid_roe = df_scored.dropna(subset=['Quality_Raw', 'Weight']).copy()
+        roe_display = f"{np.average(valid_roe['Quality_Raw'], weights=valid_roe['Weight']):.1f}%" if not valid_roe.empty else "N/A"
+            
+        col2.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">Avg ROE (Profitability)</div>
+            <div class="metric-value" style="color: #007bff;">{roe_display}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        col3.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">Holdings</div>
+            <div class="metric-value">{len(user_tickers) - len(missing_tickers)} / {len(user_tickers)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+
+        c_chart, c_insight = st.columns([2, 1])
+        
+        with c_chart:
+            st.subheader("Factor Exposure (Weighted)")
+            factors = list(portfolio_exposure.keys())
+            scores = list(portfolio_exposure.values())
+            y_labels = [f"{f}" for f in factors]
+            
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=scores, y=y_labels, orientation='h',
+                marker=dict(color=scores, colorscale='RdBu', cmin=-2, cmax=2),
+                text=[f"{s:.2f}" for s in scores], textposition='auto'
+            ))
+            fig.update_layout(
+                title=f"Weighted Z-Scores (0 = {bench_mode})",
+                xaxis_title="Standard Deviation (σ)",
+                yaxis=dict(autorange="reversed"),
+                height=400, margin=dict(l=20, r=20, t=40, b=20)
+            )
+            fig.add_vline(x=0, line_width=2, line_dash="dash", line_color="black")
+            st.plotly_chart(fig)
+
+        with c_insight:
+            st.subheader("AI Insight")
+            insights = QuantEngine.generate_insights(portfolio_exposure)
+            for msg in insights:
+                st.markdown(f'<div class="insight-box">{msg}</div>', unsafe_allow_html=True)
+            st.info("※ SizeとInvestmentは反転しています（＋方向 = 小型株 / 保守的経営）")
+
+        with st.expander("Show Detailed Factor Data", expanded=True):
+            df_port_disp = create_display_dataframe(df_scored, sort_key, is_portfolio=True)
+            st.dataframe(df_port_disp.style.format({'Weight': '{:.1%}'}), hide_index=True)
+
+    # ==========================================
+    # Tab 2: Market Universe (全銘柄モニタリング)
+    # ==========================================
+    with tab_bench:
+        st.subheader(f"🌐 {bench_mode} - Constituent Factors")
+        st.markdown("ベンチマークを構成する全銘柄の現在のファクター状態（Zスコア）です。サイドバーの「Sort Table By」でランキング形式で確認できます。")
+        
+        df_bench_scored, _ = QuantEngine.compute_z_scores(df_bench_processed, market_stats)
+        
+        df_bench_disp = create_display_dataframe(df_bench_scored, sort_key, is_portfolio=False)
+        st.dataframe(df_bench_disp, hide_index=True)
