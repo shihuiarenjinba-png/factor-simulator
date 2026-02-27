@@ -11,7 +11,7 @@ class QuantEngine:
     
     @staticmethod
     def calculate_beta(df_fund, df_hist, benchmark_ticker="1321.T"):
-        """時系列データからBetaのみを計算（モメンタム削除・異常値はNaN化）"""
+        """時系列データからBetaのみを計算（異常値はNaN化）"""
         # 1. df_fund救済
         if not isinstance(df_fund, pd.DataFrame):
             try:
@@ -155,7 +155,7 @@ class QuantEngine:
             df['Quality_Raw_Orthogonal'] = df.apply(apply_ortho, axis=1)
             df['Quality_Orthogonal'] = df['Quality_Raw_Orthogonal']
 
-        # モメンタムを削除
+        # 評価対象の5ファクターを定義
         factors = ['Beta', 'Value', 'Size', 'Quality', 'Investment']
 
         # 【フォールバック用辞書】 カラム名が多少ズレても、関連する生データを使って計算を完遂させる
@@ -211,7 +211,7 @@ class QuantEngine:
 
     @staticmethod
     def generate_insights(z_scores):
-        """インサイト生成 (モメンタム削除版)"""
+        """インサイト生成 (5ファクター対応版)"""
         insights = []
         
         z_size = z_scores.get('Size', 0)
