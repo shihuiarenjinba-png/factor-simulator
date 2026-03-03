@@ -5,13 +5,15 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import streamlit as st
+import re
 from concurrent.futures import ThreadPoolExecutor
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 3.2: MarketMonitor対応・完全安定化版)
+    【Module 1】データ取得プロバイダー (Ver. 3.3: データ・サニタイゼーション強化版)
+    - Tickerの自動正規化（Excelの数値変換エラー防止）
     - yf.Tickersによるバルク取得とセッション管理の強化
     - FMP financial-growth エンドポイントからの直接取得
     - 取得失敗時のETF(ベンチマーク)による時系列補完ロジック搭載
@@ -54,6 +56,16 @@ class DataProvider:
         return session
 
     @staticmethod
+    def _normalize_ticker(t):
+        """Excel等で発生する 7203.0 や 7203 等を 7203.T に強制正規化"""
+        if pd.isna(t) or not str(t).strip():
+            return ""
+        t_str = str(t).split('.')[0].strip().upper()
+        if re.fullmatch(r'\d{4}', t_str):
+            return f"{t_str}.T"
+        return str(t).strip().upper()
+
+    @staticmethod
     def _map_sector(raw_sector):
         if not raw_sector or pd.isna(raw_sector): return 'Other'
         for key, val in DataProvider.SECTOR_TRANSLATION.items():
@@ -62,9 +74,7 @@ class DataProvider:
 
     @staticmethod
     def _fetch_fmp_ratios(ticker_list):
-        """
-        FMP APIから財務指標を取得 (Rescue用)
-        """
+        """FMP APIから財務指標を取得 (Rescue用)"""
         api_key = DataProvider.FMP_API_KEY
         if not api_key or not ticker_list: return {}
 
@@ -148,7 +158,9 @@ class DataProvider:
         ファンダメンタルズ情報を取得
         - yf.Tickersによるバルク取得
         """
-        unique_tickers = list(set(tickers))
+        # 入力Tickerの正規化処理を挟む
+        unique_tickers = list(set([DataProvider._normalize_ticker(t) for t in tickers if pd.notna(t)]))
+        unique_tickers = [t for t in unique_tickers if t]
         if not unique_tickers: return pd.DataFrame()
 
         session = DataProvider._create_session()
@@ -166,17 +178,18 @@ class DataProvider:
                 if not tk: return None
                 
                 info = tk.info
-                if info is None or 'currentPrice' not in info: return None
+                if info is None: return None
                 
                 res = {
                     'Ticker': ticker,
-                    'Name': info.get('shortName', ticker),
-                    'Price': info.get('currentPrice', np.nan),
+                    'Name': info.get('shortName', info.get('longName', ticker)),
+                    'Price': info.get('currentPrice', info.get('previousClose', np.nan)),
                     'Size_Raw': info.get('marketCap', np.nan),
                     'PBR': info.get('priceToBook', np.nan),
                     'ROE': info.get('returnOnEquity', np.nan),
                     'Sector_Raw': info.get('sector', info.get('industry', 'Unknown')),
-                    'Growth': info.get('revenueGrowth', np.nan)
+                    # revenueGrowthがなければearningsGrowthで代替
+                    'Growth': info.get('revenueGrowth', info.get('earningsGrowth', np.nan))
                 }
                 return res
             except Exception:
@@ -227,25 +240,31 @@ class DataProvider:
         【修正】取得失敗時にベンチマーク(ETF)の動きで補完する安全装置を追加
         """
         if not tickers: return pd.DataFrame()
+        
+        # 入力Tickerの正規化
+        unique_tickers = list(set([DataProvider._normalize_ticker(t) for t in tickers if pd.notna(t)]))
+        unique_tickers = [t for t in unique_tickers if t]
+        if not unique_tickers: return pd.DataFrame()
+
         session = DataProvider._create_session()
         
-        # 補完用のベンチマークETFを特定 (tickersリストの最後に入っていることが多い)
-        bench_etf = next((t for t in tickers if t in ["1321.T", "1306.T"]), None)
+        # 補完用のベンチマークETFを特定
+        bench_etf = next((t for t in unique_tickers if t in ["1321.T", "1306.T"]), None)
         
         try:
             end_d = datetime.date.today()
             start_d = end_d - datetime.timedelta(days=days)
             
             df = yf.download(
-                tickers, start=start_d, end=end_d,
+                unique_tickers, start=start_d, end=end_d,
                 progress=False, group_by='ticker', auto_adjust=True,
                 session=session
             )
             
             if df.empty: raise ValueError("yfinance returned empty")
 
-            if len(tickers) == 1:
-                t = tickers[0]
+            if len(unique_tickers) == 1:
+                t = unique_tickers[0]
                 if 'Close' in df.columns: result_df = pd.DataFrame({t: df['Close']})
                 else: result_df = pd.DataFrame()
             else:
@@ -257,7 +276,7 @@ class DataProvider:
             
             # 欠損補完 (FMP)
             current_cols = result_df.columns.tolist() if not result_df.empty else []
-            missing = list(set(tickers) - set(current_cols))
+            missing = list(set(unique_tickers) - set(current_cols))
             
             if missing and DataProvider.FMP_API_KEY:
                 fmp_df = DataProvider._fetch_fmp_history(missing, days)
@@ -266,7 +285,7 @@ class DataProvider:
                     
             # 【追加】最終的な安全装置: それでも取れなかった銘柄をETFの動きで補完
             final_cols = result_df.columns.tolist() if not result_df.empty else []
-            still_missing = list(set(tickers) - set(final_cols))
+            still_missing = list(set(unique_tickers) - set(final_cols))
             
             if still_missing and bench_etf and bench_etf in result_df.columns:
                 for t in still_missing:
@@ -277,7 +296,7 @@ class DataProvider:
 
         except Exception:
             if DataProvider.FMP_API_KEY:
-                fmp_fallback = DataProvider._fetch_fmp_history(tickers, days)
+                fmp_fallback = DataProvider._fetch_fmp_history(unique_tickers, days)
                 if not fmp_fallback.empty: return fmp_fallback
                 
             return pd.DataFrame()
