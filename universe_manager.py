@@ -2,9 +2,10 @@ import pandas as pd
 import numpy as np
 import datetime
 import streamlit as st
+from scipy.stats import linregress
 from quant_engine import QuantEngine
 
-# --- フォールバック用リスト (スクレイピング失敗時・サイト仕様変更時の保険) ---
+# --- フォールバック用リスト (スクレイピング失敗時・サイト仕様変更時の保険・確定版) ---
 FALLBACK_NIKKEI_225 = [
     "7203.T", "6758.T", "8035.T", "9984.T", "9983.T", "6098.T", "4063.T", "6367.T", "9432.T", "4502.T",
     "4503.T", "6501.T", "7267.T", "8058.T", "8001.T", "6954.T", "6981.T", "9020.T", "9022.T", "7741.T",
@@ -21,17 +22,56 @@ FALLBACK_TOPIX_CORE30 = [
 
 class MarketMonitor:
     """
-    【新規追加 Module】市場監視・自動オーケストレーションモジュール
-    市場の「今」を監視し、構成銘柄の最新リスト自動取得と、
-    データの一括（バルク）取得・キャッシュ管理を一手に行う心臓部。
+    【Module】市場監視・自動オーケストレーションモジュール
+    市場の「今」を監視し、構成銘柄の最新リスト自動取得とキャッシュ管理を行う。
+    Wikipediaなどの不確実なソースを排除し、公式ファイル(CSV/Excel)の読み込みに対応。
     """
     
     @staticmethod
-    @st.cache_data(ttl=86400) # 銘柄の入れ替えは頻繁ではないため、リスト取得は1日1回更新
-    def get_latest_tickers(bench_mode):
+    def load_tickers_from_file(uploaded_file):
+        """
+        ユーザーがアップロードした公式の構成銘柄リスト(CSV/Excel)を読み込む
+        """
+        try:
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+            elif uploaded_file.name.endswith(('.xls', '.xlsx')):
+                df = pd.read_excel(uploaded_file)
+            else:
+                return None
+            
+            # 想定されるカラム名のバリエーション
+            target_cols = ['コード', '証券コード', 'Ticker', 'Code', 'code', '銘柄コード']
+            for col in target_cols:
+                if col in df.columns:
+                    tickers = []
+                    for c in df[col].dropna():
+                        try:
+                            # 4桁の数字を抽出して .T を付与
+                            code_str = str(c).replace('.0', '').strip()
+                            if code_str.isdigit():
+                                tickers.append(f"{int(code_str)}.T")
+                        except ValueError:
+                            pass
+                    if tickers:
+                        return list(set(tickers))
+        except Exception as e:
+            pass
+        return None
+
+    @staticmethod
+    @st.cache_data(ttl=86400)
+    def get_latest_tickers(bench_mode, custom_list=None):
+        """
+        対象ベンチマークのティッカーリストを取得する。
+        カスタムリストが渡された場合はそれを最優先する。
+        """
+        if custom_list is not None and len(custom_list) > 0:
+            return custom_list
+
         if bench_mode == "Nikkei 225":
             try:
-                # 日経平均プロファイル公式サイトから構成銘柄を直接抽出
+                # 日経平均プロファイル公式サイトから構成銘柄を直接抽出（信頼性高）
                 url = "https://indexes.nikkei.co.jp/nkave/index/component?idx=nk225"
                 dfs = pd.read_html(url)
                 for df in dfs:
@@ -49,18 +89,90 @@ class MarketMonitor:
             return FALLBACK_NIKKEI_225
             
         else: # TOPIX Core 30
-            try:
-                # TOPIX Core 30はWikipediaのリストがパースしやすく安定しているため利用
-                url = "https://ja.wikipedia.org/wiki/TOPIX_Core30"
-                dfs = pd.read_html(url)
-                for df in dfs:
-                    if '証券コード' in df.columns:
-                        tickers = []
-                        for code in df['証券コード'].dropna():
-                            try:
-                                tickers.append(f"{int(code)}.T")
-                            except ValueError:
-                                pass
+            # Wikipediaへの依存を排除。
+            # 外部ファイル読み込みがない場合は、安全なマネージド・リストを返す。
+            return FALLBACK_TOPIX_CORE30
+
+
+class UniverseManager:
+    """
+    市場全体（ユニバース）の統計量を算出し、基準値を管理するモジュール。
+    ここで算出された統計量(stats)を用いて、対象ポートフォリオのZスコアが決定される。
+    """
+
+    @staticmethod
+    def generate_market_stats(df_bench_fund):
+        """
+        ベンチマーク集団のファンダメンタルズから、各ファクターの中央値とMADを算出。
+        同時に、QualityとInvestmentの直交化用パラメータ（回帰係数）もここで決定する。
+        """
+        if not isinstance(df_bench_fund, pd.DataFrame) or df_bench_fund.empty:
+            return {}, pd.DataFrame()
+
+        df_proc = QuantEngine.process_raw_factors(df_bench_fund.copy())
+        stats = {}
+
+        # ---------------------------------------------------------
+        # 1. Qualityの直交化パラメータ（回帰係数）の算出
+        # ---------------------------------------------------------
+        if 'Quality_Raw' in df_proc.columns and 'Investment_Raw' in df_proc.columns:
+            valid_ortho = df_proc.replace([np.inf, -np.inf], np.nan).dropna(subset=['Quality_Raw', 'Investment_Raw'])
+            if len(valid_ortho) > 5:
+                slope, intercept, r_value, p_value, std_err = linregress(
+                    valid_ortho['Investment_Raw'], 
+                    valid_ortho['Quality_Raw']
+                )
+                stats['ortho_slope'] = slope
+                stats['ortho_intercept'] = intercept
+            else:
+                stats['ortho_slope'] = 0.0
+                stats['ortho_intercept'] = 0.0
+        else:
+            stats['ortho_slope'] = 0.0
+            stats['ortho_intercept'] = 0.0
+
+        # ---------------------------------------------------------
+        # 2. 市場の統計量（中央値、MAD）算出のため、一時的に直交化を適用
+        # ---------------------------------------------------------
+        if 'Quality_Raw' in df_proc.columns:
+            def temp_ortho(row):
+                q = row.get('Quality_Raw', np.nan)
+                i = row.get('Investment_Raw', np.nan)
+                if pd.isna(q): return np.nan
+                if pd.isna(i): return q
+                return q - (stats['ortho_slope'] * i + stats['ortho_intercept'])
+            
+            df_proc['Quality_Raw_Orthogonal'] = df_proc.apply(temp_ortho, axis=1)
+
+        # ---------------------------------------------------------
+        # 3. 5ファクターの統計量算出 (外れ値に強いMedianとMADを採用)
+        # ---------------------------------------------------------
+        mapping = {
+            'Beta': 'Beta_Raw',
+            'Value': 'Value_Raw',
+            'Size': 'Size_Log',
+            'Quality': 'Quality_Raw_Orthogonal',
+            'Investment': 'Investment_Raw'
+        }
+
+        for factor_name, col_name in mapping.items():
+            if col_name in df_proc.columns:
+                valid_data = df_proc[col_name].replace([np.inf, -np.inf], np.nan).dropna()
+                
+                if len(valid_data) > 0:
+                    med = valid_data.median()
+                    mad = (valid_data - med).abs().median()
+                    
+                    stats[factor_name] = {
+                        'median': med, 
+                        'mad': mad if mad > 1e-6 else 1.0
+                    }
+                else:
+                    stats[factor_name] = {'median': 0.0, 'mad': 1.0}
+            else:
+                stats[factor_name] = {'median': 0.0, 'mad': 1.0}
+
+        return stats, df_proc                                pass
                         if len(tickers) >= 25:
                             return tickers
             except Exception:
