@@ -109,9 +109,8 @@ if run_button:
         # -----------------------------------------------------
         # Step B: ファンダメンタルズの取得と市場統計量の算出
         # -----------------------------------------------------
-        # DataProviderから一括取得（モック/実際の関数に合わせて呼び出してください）
-        # ※ここでは DataProvider.get_bulk_fundamentals が DataFrame を返すと想定
-        df_all_fund = DataProvider.get_bulk_fundamentals(all_target_tickers)
+        # DataProviderから一括取得 (正しいメソッド名 fetch_fundamentals に修正)
+        df_all_fund = DataProvider.fetch_fundamentals(all_target_tickers)
         
         if df_all_fund.empty:
             st.error("データの取得に失敗しました。ネットワーク接続を確認してください。")
@@ -126,8 +125,9 @@ if run_button:
         # -----------------------------------------------------
         df_port = df_all_fund[df_all_fund['Ticker'].isin(port_tickers)].copy()
         
-        # QuantEngineを使用してZスコアを算出
-        df_port_scored = QuantEngine.calculate_z_scores(df_port, market_stats)
+        # QuantEngineを使用してZスコアを算出 (エンジン側の正しいメソッド名と戻り値に同期)
+        df_port_proc = QuantEngine.process_raw_factors(df_port)
+        df_port_scored, _ = QuantEngine.compute_z_scores(df_port_proc, market_stats)
         
         # 簡易的に均等ウェイトを設定
         df_port_scored['Weight'] = 1.0 / len(df_port_scored)
