@@ -218,4 +218,188 @@ class UniverseManager:
                 if factor == 'Quality':
                     stats[factor]['r_squared'] = ortho_params.get('r_squared', 0.0)
 
+        return stats, df_ortho                df = pd.read_csv(uploaded_file)
+            elif uploaded_file.name.endswith(('.xls', '.xlsx')):
+                df = pd.read_excel(uploaded_file)
+            else:
+                return None
+            
+            # 想定されるカラム名のバリエーション
+            target_cols = ['コード', '証券コード', 'Ticker', 'Code', 'code', '銘柄コード']
+            for col in target_cols:
+                if col in df.columns:
+                    tickers = []
+                    for c in df[col].dropna():
+                        try:
+                            # 4桁の数字を抽出して .T を付与
+                            code_str = str(c).replace('.0', '').strip()
+                            if code_str.isdigit():
+                                tickers.append(f"{int(code_str)}.T")
+                        except ValueError:
+                            pass
+                    if tickers:
+                        return list(set(tickers))
+        except Exception as e:
+            pass
+        return None
+
+    @staticmethod
+    @st.cache_data(ttl=86400)
+    def get_latest_tickers(bench_mode, custom_list=None):
+        """
+        対象ベンチマークのティッカーリストを取得する。
+        カスタムリストが渡された場合はそれを最優先する。
+        """
+        if custom_list is not None and len(custom_list) > 0:
+            return custom_list
+
+        if bench_mode == "Nikkei 225":
+            try:
+                # 日経平均プロファイル公式サイトから構成銘柄を直接抽出（信頼性高）
+                url = "https://indexes.nikkei.co.jp/nkave/index/component?idx=nk225"
+                dfs = pd.read_html(url)
+                for df in dfs:
+                    if 'コード' in df.columns:
+                        tickers = []
+                        for code in df['コード'].dropna():
+                            try:
+                                tickers.append(f"{int(code)}.T")
+                            except ValueError:
+                                pass
+                        if len(tickers) >= 200:
+                            return tickers
+            except Exception:
+                pass
+            return FALLBACK_NIKKEI_225
+            
+        else: # TOPIX Core 30
+            # Wikipediaへの依存を排除。
+            # 外部ファイル読み込みがない場合は、安全なマネージド・リストを返す。
+            return FALLBACK_TOPIX_CORE30
+
+    @staticmethod
+    @st.cache_data(ttl=1800) # 市場データは30分間隔でリフレッシュし、時差を最小化
+    def get_market_intelligence(bench_mode, benchmark_etf):
+        """
+        最新の銘柄リストでバルク取得を行い、市場の「ものさし」を計算してメモリに保持する
+        """
+        # 循環参照を防ぐためにメソッド内でインポート
+        from data_provider import DataProvider  
+        
+        # 1. 公式サイトから最新銘柄リストを取得
+        tickers = MarketMonitor.get_latest_tickers(bench_mode)
+        
+        # 2. バルクデータ取得 (DataProviderがyf.Tickersで一括処理するため速い)
+        df_fund = DataProvider.fetch_fundamentals(tickers)
+        df_hist = DataProvider.fetch_historical_prices(tickers + [benchmark_etf])
+        
+        # 3. エンジンでBetaなどを計算
+        df_fund = QuantEngine.calculate_beta(df_fund, df_hist, benchmark_etf)
+        
+        # 4. UniverseManagerで市場全体の平均・標準偏差（ものさし）を算出
+        stats, processed_data = UniverseManager.generate_market_stats(df_fund)
+        
+        return {
+            'stats': stats,
+            'processed_data': processed_data,
+            'last_updated': datetime.datetime.now().strftime("%H:%M:%S")
+        }
+
+
+class UniverseManager:
+    """
+    【Module 3】 市場統計管理 (Pro Version)
+    【完了版 Step 5】直交化パラメータの永続化と、市場の「ものさし」の完全固定
+    """
+
+    @staticmethod
+    def generate_market_stats(df_universe_raw):
+        """
+        市場全体の生データを受け取り、統計情報(Stats)と処理済みデータを返す
+        """
+        # 1. 生データを計算可能な指標に変換 
+        # (ここで Investment_Raw 等が生成される)
+        df_proc = QuantEngine.process_raw_factors(df_universe_raw)
+
+        # 2. 統計作成用の外れ値処理 (Winsorization)
+        # Zスコア計算の基となるカラムを指定 (モメンタムを除外した5ファクター)
+        numeric_cols = [
+            'Size_Log', 
+            'Value_Raw',
+            'Quality_Raw',
+            'Investment_Raw',
+            'Beta_Raw'
+        ]
+        
+        df_for_stats = df_proc.copy()
+        
+        for col in numeric_cols:
+            if col in df_for_stats.columns:
+                # データ型を確実に数値にする
+                df_for_stats[col] = pd.to_numeric(df_for_stats[col], errors='coerce')
+                
+                # 上下1%をクリップして異常値（極端な資産変動など）を除外
+                lower = df_for_stats[col].quantile(0.01)
+                upper = df_for_stats[col].quantile(0.99)
+                df_for_stats[col] = df_for_stats[col].clip(lower, upper)
+
+        # 3. 直交化パラメータ & R² の算出 (Investmentに対してQualityを直交化)
+        # Investment(資産拡大)の影響をQuality(ROE)から取り除く
+        df_ortho, ortho_params = QuantEngine.calculate_orthogonalization(
+            df_for_stats, 
+            x_col='Investment_Raw', 
+            y_col='Quality_Raw'
+        )
+
+        # 4. 各ファクターの統計量(Median, MAD)を算出
+        # 【修正】市場の「ものさし（傾き・切片）」を固定。KeyErrorを防ぐため get() で安全に取得
+        stats = {
+            'ortho_slope': ortho_params.get('slope', 0.0),
+            'ortho_intercept': ortho_params.get('intercept', 0.0),
+            'ortho_r_squared': ortho_params.get('r_squared', 0.0)
+        }
+
+        # 統計を抽出する対象と、参照するカラム名のマッピング (5ファクターに完全同期)
+        target_factors = {
+            'Beta': 'Beta_Raw',          
+            'Size': 'Size_Log',
+            'Value': 'Value_Raw',
+            'Quality': 'Quality_Raw_Orthogonal', # 直交化後のクオリティ
+            'Investment': 'Investment_Raw'       # 総資産増加率
+        }
+
+        for factor, col in target_factors.items():
+            # カラムが存在しない場合の救済措置
+            if col not in df_ortho.columns:
+                if factor == 'Quality' and 'Quality_Raw' in df_ortho.columns:
+                    col = 'Quality_Raw'
+                else:
+                    stats[factor] = {'median': 0.0, 'mad': 1.0, 'col': col}
+                    continue
+
+            series = df_ortho[col].dropna()
+
+            if series.empty:
+                stats[factor] = {'median': 0.0, 'mad': 1.0, 'col': col}
+            else:
+                # 中央値 (Median)
+                median_val = series.median()
+                
+                # MAD (Median Absolute Deviation)
+                abs_deviation = np.abs(series - median_val)
+                mad_val = abs_deviation.median()
+                
+                # 安全策: MADが0の場合は標準偏差で代用
+                if mad_val == 0:
+                    mad_val = series.std() if series.std() > 0 else 1.0
+
+                stats[factor] = {
+                    'median': median_val,
+                    'mad': mad_val,
+                    'col': col
+                }
+                
+                if factor == 'Quality':
+                    stats[factor]['r_squared'] = ortho_params.get('r_squared', 0.0)
+
         return stats, df_ortho
