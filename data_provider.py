@@ -300,3 +300,14 @@ class DataProvider:
                 if not fmp_fallback.empty: return fmp_fallback
                 
             return pd.DataFrame()
+
+    # =========================================================================
+    # 【新規追加】 app.py とのメソッド名不一致を吸収するためのラッパー関数
+    # =========================================================================
+    @staticmethod
+    def get_bulk_fundamentals(tickers):
+        """
+        app.py から呼び出される 'get_bulk_fundamentals' という名前を、
+        実際の処理関数である 'fetch_fundamentals' に中継します。
+        """
+        return DataProvider.fetch_fundamentals(tickers)
