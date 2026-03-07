@@ -10,7 +10,7 @@ try:
     from quant_engine import QuantEngine
     from universe_manager import MarketMonitor, UniverseManager
     from visualizer import Visualizer  # 新規追加モジュールの読み込み
-except ImportError as e:
+except ModuleNotFoundError as e: # 【修正箇所1】ImportErrorから変更し、文法エラーを隠さないように改善
     st.error(f"起動エラー: モジュールが見つかりません ({e})")
     st.info("app.py と同じフォルダに data_provider.py, quant_engine.py, universe_manager.py, visualizer.py があるか確認してください。")
     st.stop()
@@ -109,7 +109,7 @@ if run_button:
         # -----------------------------------------------------
         # Step B: ファンダメンタルズの取得と市場統計量の算出
         # -----------------------------------------------------
-        # DataProviderから一括取得 (正しいメソッド名 fetch_fundamentals に修正)
+        # DataProviderから一括取得
         df_all_fund = DataProvider.fetch_fundamentals(all_target_tickers)
         
         if df_all_fund.empty:
@@ -125,7 +125,7 @@ if run_button:
         # -----------------------------------------------------
         df_port = df_all_fund[df_all_fund['Ticker'].isin(port_tickers)].copy()
         
-        # QuantEngineを使用してZスコアを算出 (エンジン側の正しいメソッド名と戻り値に同期)
+        # 【修正箇所2】堅牢なエンジン仕様に合わせてデータ加工とメソッド呼び出しを同期
         df_port_proc = QuantEngine.process_raw_factors(df_port)
         df_port_scored, _ = QuantEngine.compute_z_scores(df_port_proc, market_stats)
         
