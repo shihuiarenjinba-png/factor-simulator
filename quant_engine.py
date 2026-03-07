@@ -7,6 +7,7 @@ class QuantEngine:
     ポートフォリオの数値計算、スコアリング、インサイト生成を担当するエンジン
     【修正版 Step 4】BS不要化とInvestment（Growth）の統合、異常値のNaN除外強化
     【工程3】引き渡しミスの徹底排除と診断スピードの極限化
+    【完了版 Step 6】ZスコアのNone撲滅と5ファクター完全保証ロジックの追加
     """
     
     @staticmethod
@@ -168,7 +169,12 @@ class QuantEngine:
         }
 
         for f in factors:
-            if f not in stats: continue
+            z_col = f"{f}_Z"
+            
+            # stats（基準）が存在しない場合は 0.0 で初期化してスキップ
+            if f not in stats: 
+                df[z_col] = 0.0
+                continue
             
             target_col = stats[f].get('col', None)
             
@@ -181,17 +187,18 @@ class QuantEngine:
                         break
                 
                 if not found_col:
-                    continue # フォールバックも見つからなければスキップ
+                    # データが全くない場合は、市場平均(0.0)として扱いエラーを防ぐ
+                    df[z_col] = 0.0
+                    continue 
                 target_col = found_col
 
             mu = stats[f].get('median', 0)
             sigma = stats[f].get('mad', 1)
             if sigma == 0: sigma = 1e-6
 
-            z_col = f"{f}_Z"
-            
             def calc_z(val):
-                if pd.isna(val): return np.nan # 欠損値は0にせずNaNとして扱う
+                # 【重要】欠損値や無限大は「市場平均（ゼロ）」として扱い、Noneを根絶する
+                if pd.isna(val) or np.isinf(val): return 0.0 
                 z = (val - mu) / sigma
                 
                 # サイズとInvestmentの反転ロジック
@@ -200,12 +207,23 @@ class QuantEngine:
                 if f == 'Size' or f == 'Investment': 
                     z = -z 
                 
-                # クリップ処理
+                # クリップ処理 (異常値のWinsorization)
                 if z > 3.0: z = 3.0
                 if z < -3.0: z = -3.0
                 return z
             
-            df[z_col] = df[target_col].apply(calc_z)
+            # 安全に計算するため、強制的に数値型へ変換してから適用
+            numeric_series = pd.to_numeric(df[target_col], errors='coerce')
+            df[z_col] = numeric_series.apply(calc_z)
+            
+        # 【最終防衛線】 5ファクターの列が確実に存在することを保証する
+        for f in factors:
+            z_col = f"{f}_Z"
+            if z_col not in df.columns:
+                df[z_col] = 0.0
+            else:
+                # 最終的に NaN が残ってしまった場合も 0.0 で埋める
+                df[z_col] = df[z_col].fillna(0.0)
             
         return df, r_squared_map
 
