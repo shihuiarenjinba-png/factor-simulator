@@ -7,7 +7,7 @@ class QuantEngine:
     ポートフォリオの数値計算、スコアリング、インサイト生成を担当するエンジン
     【修正版 Step 4】BS不要化とInvestment（Growth）の統合、異常値のNaN除外強化
     【工程3】引き渡しミスの徹底排除と診断スピードの極限化
-    【完了版 Step 6】ZスコアのNone撲滅と5ファクター完全保証ロジックの追加
+    【完了版 Step 6】ZスコアのNone撲滅、自己補完フォールバックによる0.00病の根絶
     """
     
     @staticmethod
@@ -31,7 +31,6 @@ class QuantEngine:
 
         # 計算ロジック
         try:
-            # Pandasのバージョンによるエラーを回避するため、引数をシンプル化
             rets = df_hist.pct_change().dropna()
         except Exception:
             df['Beta_Raw'] = np.nan
@@ -78,11 +77,9 @@ class QuantEngine:
         
         # Quality (ROE)
         if 'ROE' in df.columns:
-            df['Quality_Raw'] = df['ROE']
+            df['Quality_Raw'] = pd.to_numeric(df['ROE'], errors='coerce')
         
         # Investment (資産成長率)
-        # 【修正】BSの読み込みを廃止したため、DataProviderで取得した 'Growth' 
-        # (FMPのAsset Growth または infoのRevenue Growth) を直接代入して計算負荷をゼロにする
         try:
             if 'Growth' in df.columns:
                 df['Investment_Raw'] = pd.to_numeric(df['Growth'], errors='coerce')
@@ -132,14 +129,14 @@ class QuantEngine:
     @staticmethod
     def compute_z_scores(df_target, stats):
         """
-        Zスコア計算 (市場全体の直交化パラメータを適用し、引き渡しミスを根絶)
+        Zスコア計算 (市場基準がない場合はポートフォリオ内で自己完結させるフォールバックを追加)
         """
         df = df_target.copy()
         r_squared_map = {} 
         
-        # 市場全体（ベンチマーク）で算出した回帰係数を取得
-        slope = stats.get('ortho_slope', 0)
-        intercept = stats.get('ortho_intercept', 0)
+        # 市場全体（ベンチマーク）で算出した回帰係数を取得 (無い場合は0)
+        slope = stats.get('ortho_slope', 0) if isinstance(stats, dict) else 0
+        intercept = stats.get('ortho_intercept', 0) if isinstance(stats, dict) else 0
         
         def apply_ortho(row):
             try:
@@ -147,7 +144,6 @@ class QuantEngine:
                 i = row.get('Investment_Raw', np.nan)
                 if pd.isna(q): return np.nan
                 if pd.isna(i): return q
-                # 市場全体の「基準」を使って、ユーザーの銘柄のQualityからInvestmentの影響を除く
                 return q - (slope * i + intercept)
             except Exception:
                 return np.nan
@@ -159,7 +155,7 @@ class QuantEngine:
         # 評価対象の5ファクターを定義
         factors = ['Beta', 'Value', 'Size', 'Quality', 'Investment']
 
-        # 【フォールバック用辞書】 カラム名が多少ズレても、関連する生データを使って計算を完遂させる
+        # カラム名が多少ズレても、関連する生データを使って計算を完遂させる
         fallback_cols = {
             'Quality': ['Quality_Raw_Orthogonal', 'Quality_Orthogonal', 'Quality_Raw', 'ROE'],
             'Value': ['Value_Raw', 'PBR'],
@@ -171,15 +167,11 @@ class QuantEngine:
         for f in factors:
             z_col = f"{f}_Z"
             
-            # stats（基準）が存在しない場合は 0.0 で初期化してスキップ
-            if f not in stats: 
-                df[z_col] = 0.0
-                continue
-            
-            target_col = stats[f].get('col', None)
+            # 1. ターゲットとなる生データのカラムを特定
+            target_col = stats[f].get('col') if isinstance(stats, dict) and f in stats else None
             
             # 引き渡しミス防止：target_colがユーザーDFにない場合の救済措置
-            if target_col not in df.columns:
+            if not target_col or target_col not in df.columns:
                 found_col = None
                 for candidate in fallback_cols.get(f, []):
                     if candidate in df.columns:
@@ -187,23 +179,38 @@ class QuantEngine:
                         break
                 
                 if not found_col:
-                    # データが全くない場合は、市場平均(0.0)として扱いエラーを防ぐ
+                    # 生データ自体が存在しない場合は計算不可のため 0.0 を代入
                     df[z_col] = 0.0
                     continue 
                 target_col = found_col
 
-            mu = stats[f].get('median', 0)
-            sigma = stats[f].get('mad', 1)
+            # 強制的に数値型へ変換
+            numeric_series = pd.to_numeric(df[target_col], errors='coerce')
+
+            # 2. 中央値(mu)と分散(sigma)の取得（市場データがなければポートフォリオ内で自己計算）
+            if isinstance(stats, dict) and f in stats and 'median' in stats[f]:
+                mu = stats[f]['median']
+                sigma = stats[f].get('mad', 1e-6)
+            else:
+                # 【極めて重要】市場基準がない場合の自己補完ロジック
+                mu = numeric_series.median()
+                mad = (numeric_series - mu).abs().median()
+                sigma = mad if pd.notna(mad) and mad > 0 else 1e-6
+                
+                # ポートフォリオ内のデータが全てNaNの場合は計算不可
+                if pd.isna(mu):
+                    df[z_col] = 0.0
+                    continue
+
             if sigma == 0: sigma = 1e-6
 
             def calc_z(val):
-                # 【重要】欠損値や無限大は「市場平均（ゼロ）」として扱い、Noneを根絶する
-                if pd.isna(val) or np.isinf(val): return 0.0 
+                # 欠損値や無限大は「計算不可（NaN）」として扱い、安易に0にしない
+                if pd.isna(val) or np.isinf(val): return np.nan 
+                
                 z = (val - mu) / sigma
                 
                 # サイズとInvestmentの反転ロジック
-                # Size: 小さいほどプラス (小型株効果)
-                # Investment: 資産拡大が小さい(Conservative)ほどプラス
                 if f == 'Size' or f == 'Investment': 
                     z = -z 
                 
@@ -212,17 +219,14 @@ class QuantEngine:
                 if z < -3.0: z = -3.0
                 return z
             
-            # 安全に計算するため、強制的に数値型へ変換してから適用
-            numeric_series = pd.to_numeric(df[target_col], errors='coerce')
             df[z_col] = numeric_series.apply(calc_z)
             
-        # 【最終防衛線】 5ファクターの列が確実に存在することを保証する
+        # 【最終防衛線】 チャート描画エラーを防ぐため、最終的に残ったNaNのみ0.0で埋める
         for f in factors:
             z_col = f"{f}_Z"
             if z_col not in df.columns:
                 df[z_col] = 0.0
             else:
-                # 最終的に NaN が残ってしまった場合も 0.0 で埋める
                 df[z_col] = df[z_col].fillna(0.0)
             
         return df, r_squared_map
