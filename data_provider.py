@@ -12,8 +12,8 @@ from urllib3.util.retry import Retry
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 3.4: 接続安定化・フォールバック強化版)
-    - Tickerの自動正規化（Excelの数値変換エラー防止）
+    【Module 1】データ取得プロバイダー (Ver. 3.5: 表記揺れ根絶・バルク強化版)
+    - Tickerの自動正規化（Excelの数値変換エラー、.JP等の表記揺れを.Tに統一）
     - yf.Tickersによるバルク取得とセッション管理の強化
     - FMP APIへの強力な自動フォールバック（None撲滅）
     - 取得失敗時のETF(ベンチマーク)による時系列補完ロジック搭載
@@ -58,13 +58,24 @@ class DataProvider:
 
     @staticmethod
     def _normalize_ticker(t):
-        """Excel等で発生する 7203.0 や 7203 等を 7203.T に強制正規化"""
+        """
+        【重要】あらゆる入力パターンを強制的に 'XXXX.T' の形式に統一する
+        例: '7203', '7203.0', '7203.JP', ' 7203 ' -> すべて '7203.T'
+        """
         if pd.isna(t) or not str(t).strip():
             return ""
-        t_str = str(t).split('.')[0].strip().upper()
-        if re.fullmatch(r'\d{4}', t_str):
-            return f"{t_str}.T"
-        return str(t).strip().upper()
+        
+        # 不要な空白を削除し、大文字に統一
+        t_str = str(t).strip().upper()
+        
+        # 4桁の数字が含まれているか検索
+        match = re.search(r'\b(\d{4})\b', t_str)
+        if match:
+            # 4桁の数字が見つかった場合は、それに強制的に '.T' を付与して返す
+            return f"{match.group(1)}.T"
+            
+        # それ以外（ETFなどの特殊コード）の場合は、元の文字をそのまま返す
+        return t_str
 
     @staticmethod
     def _map_sector(raw_sector):
@@ -82,6 +93,7 @@ class DataProvider:
         rescued_data = {}
         
         def fetch_one(t_orig):
+            # FMP用には '.T' を '.JP' に変換して渡す
             symbol = t_orig.replace(".T", ".JP") if ".T" in t_orig else t_orig
             # 1. Ratios (ROE, PBR)
             url_ratios = f"https://financialmodelingprep.com/api/v3/ratios-ttm/{symbol}?apikey={api_key}"
@@ -158,12 +170,14 @@ class DataProvider:
         ファンダメンタルズ情報を取得
         - yf.Tickersによるバルク取得と、失敗時のFMP強力補完
         """
+        # 1. 確実な正規化を実施
         unique_tickers = list(set([DataProvider._normalize_ticker(t) for t in tickers if pd.notna(t)]))
         unique_tickers = [t for t in unique_tickers if t]
         if not unique_tickers: return pd.DataFrame()
 
         session = DataProvider._create_session()
         
+        # yf.Tickersへの入力を文字列として結合
         tickers_str = " ".join(unique_tickers)
         try:
             tks = yf.Tickers(tickers_str, session=session)
@@ -173,14 +187,15 @@ class DataProvider:
         def get_yf_stock(ticker):
             try:
                 if not tks: return None
-                tk = tks.tickers.get(ticker)
+                # Yahoo側のキー（銘柄名）の揺れに対応するため、大文字で取得
+                tk = tks.tickers.get(ticker.upper())
                 if not tk: return None
                 
                 info = tk.info
                 if info is None: return None
                 
                 res = {
-                    'Ticker': ticker,
+                    'Ticker': ticker, # 返却時は必ず要求された正規化Tickerを使う
                     'Name': info.get('shortName', info.get('longName', ticker)),
                     'Price': info.get('currentPrice', info.get('previousClose', np.nan)),
                     'Size_Raw': info.get('marketCap', np.nan),
@@ -200,6 +215,7 @@ class DataProvider:
         valid_data = [d for d in results if d is not None]
         df = pd.DataFrame(valid_data)
         
+        # 取得できたデータが0件の場合の防波堤
         if df.empty:
             df = pd.DataFrame({'Ticker': unique_tickers})
             
@@ -243,6 +259,7 @@ class DataProvider:
         """
         if not tickers: return pd.DataFrame()
         
+        # 1. 確実な正規化を実施
         unique_tickers = list(set([DataProvider._normalize_ticker(t) for t in tickers if pd.notna(t)]))
         unique_tickers = [t for t in unique_tickers if t]
         if not unique_tickers: return pd.DataFrame()
