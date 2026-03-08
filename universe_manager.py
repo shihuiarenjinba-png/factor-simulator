@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import datetime
 import streamlit as st
+import re  # 4桁の証券コード抽出用に追加
 from scipy.stats import linregress
 from quant_engine import QuantEngine
 
@@ -30,7 +31,8 @@ class MarketMonitor:
     @staticmethod
     def load_tickers_from_file(uploaded_file):
         """
-        ユーザーがアップロードした公式の構成銘柄リスト(CSV/Excel)を読み込む
+        ユーザーがアップロードした構成銘柄リスト(CSV/Excel)を読み込む。
+        特定の列名に依存せず、全データから「4桁の数字」を自動スキャンして抽出する。
         """
         try:
             if uploaded_file.name.endswith('.csv'):
@@ -40,23 +42,32 @@ class MarketMonitor:
             else:
                 return None
             
-            # 想定されるカラム名のバリエーション
-            target_cols = ['コード', '証券コード', 'Ticker', 'Code', 'code', '銘柄コード']
-            for col in target_cols:
-                if col in df.columns:
-                    tickers = []
-                    for c in df[col].dropna():
-                        try:
-                            # 4桁の数字を抽出して .T を付与
-                            code_str = str(c).replace('.0', '').strip()
-                            if code_str.isdigit():
-                                tickers.append(f"{int(code_str)}.T")
-                        except ValueError:
-                            pass
-                    if tickers:
-                        return list(set(tickers))
-        except Exception:
-            pass
+            best_tickers = []
+            max_matches = 0
+            
+            # 全ての列をスキャンし、4桁の数字が最も多く含まれる列を特定する
+            for col in df.columns:
+                col_strs = df[col].astype(str).fillna('')
+                tickers_in_col = []
+                
+                for val in col_strs:
+                    # 単独の4桁の数字を抽出（例: "7203", " 7203 ", "7203.0" の一部など）
+                    matches = re.findall(r'\b\d{4}\b', val)
+                    for match in matches:
+                        tickers_in_col.append(f"{match}.T")
+                
+                # 年号(2023など)の列を誤検知しないよう、ユニーク数も加味して最も多くマッチした列を採用
+                unique_tickers = list(set(tickers_in_col))
+                if len(unique_tickers) > max_matches:
+                    max_matches = len(unique_tickers)
+                    best_tickers = unique_tickers
+                    
+            if best_tickers:
+                return best_tickers
+                
+        except Exception as e:
+            st.warning(f"ファイルのパース中にエラーが発生しました: {e}")
+            
         return None
 
     @staticmethod
@@ -133,9 +144,16 @@ class UniverseManager:
         """
         市場全体の生データを受け取り、統計情報(Stats)と処理済みデータを返す
         """
+        # --- 0.00病の防止: 入力データの空チェックを追加 ---
+        if df_universe_raw is None or df_universe_raw.empty:
+            raise ValueError("ユニバース（市場基準）データが空です。データの取得に失敗した可能性があります。")
+
         # 1. 生データを計算可能な指標に変換 
         # (ここで Investment_Raw 等が生成される)
         df_proc = QuantEngine.process_raw_factors(df_universe_raw)
+        
+        if df_proc is None or df_proc.empty:
+            raise ValueError("ファクター算出後のデータが空になりました。入力データを確認してください。")
 
         # 2. 統計作成用の外れ値処理 (Winsorization)
         # Zスコア計算の基となるカラムを指定 (モメンタムを除外した5ファクター)
@@ -155,9 +173,11 @@ class UniverseManager:
                 df_for_stats[col] = pd.to_numeric(df_for_stats[col], errors='coerce')
                 
                 # 上下1%をクリップして異常値（極端な資産変動など）を除外
-                lower = df_for_stats[col].quantile(0.01)
-                upper = df_for_stats[col].quantile(0.99)
-                df_for_stats[col] = df_for_stats[col].clip(lower, upper)
+                # データが少ない場合はクリップしないよう制御
+                if len(df_for_stats[col].dropna()) > 10:
+                    lower = df_for_stats[col].quantile(0.01)
+                    upper = df_for_stats[col].quantile(0.99)
+                    df_for_stats[col] = df_for_stats[col].clip(lower, upper)
 
         # 3. 直交化パラメータ & R² の算出 (Investmentに対してQualityを直交化)
         # Investment(資産拡大)の影響をQuality(ROE)から取り除く
@@ -205,9 +225,11 @@ class UniverseManager:
                 abs_deviation = np.abs(series - median_val)
                 mad_val = abs_deviation.median()
                 
-                # 安全策: MADが0の場合は標準偏差で代用
+                # 安全策: MADが0の場合は標準偏差で代用し、それでも0なら1.0にする
                 if mad_val == 0:
-                    mad_val = series.std() if series.std() > 0 else 1.0
+                    mad_val = series.std()
+                    if pd.isna(mad_val) or mad_val == 0:
+                        mad_val = 1.0
 
                 stats[factor] = {
                     'median': median_val,
