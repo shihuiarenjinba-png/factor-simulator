@@ -8,11 +8,15 @@ class QuantEngine:
     【修正版 Step 4】BS不要化とInvestment（Growth）の統合、異常値のNaN除外強化
     【工程3】引き渡しミスの徹底排除と診断スピードの極限化
     【完了版 Step 6】ZスコアのNone撲滅、自己補完フォールバックによる0.00病の根絶
+    【NEW版 Step 7】Rm-RfベースのBeta計算、時価総額加重(MCW)ロジック、ファクター相関行列の追加
     """
     
     @staticmethod
-    def calculate_beta(df_fund, df_hist, benchmark_ticker="1321.T"):
-        """時系列データからBetaのみを計算（異常値はNaN化）"""
+    def calculate_beta(df_fund, df_hist, df_market=None, benchmark_ticker="1321.T"):
+        """
+        時系列データからBetaを計算（Rm-Rfの市場プレミアム対応版）
+        df_market: data_provider.fetch_market_rates() から取得した Rm, Rf を含むDataFrame
+        """
         # 1. df_fund救済
         if not isinstance(df_fund, pd.DataFrame):
             try:
@@ -36,28 +40,115 @@ class QuantEngine:
             df['Beta_Raw'] = np.nan
             return df
         
-        if benchmark_ticker not in rets.columns:
-            df['Beta_Raw'] = np.nan
-            return df
-
-        bench_ret = rets[benchmark_ticker]
-        bench_var = bench_ret.var()
-
         betas = {}
 
-        for t in df['Ticker']:
-            if t in rets.columns:
-                try:
-                    cov = rets[t].cov(bench_ret)
-                    # エラー値や極端な分散の場合はNaNとして除外
-                    betas[t] = cov / bench_var if bench_var > 1e-8 else np.nan
-                except:
+        # 【追加実装】 Rm と Rf を使った理論的Betaの計算ルート
+        if df_market is not None and not df_market.empty and 'Rm' in df_market.columns and 'Rf' in df_market.columns:
+            try:
+                # Rmは日経平均などの日次リターン、Rfは日次換算済みの無リスク利子率
+                rm_ret = df_market['Rm'].pct_change().dropna()
+                rf_daily = df_market['Rf'].reindex(rm_ret.index).ffill()
+                
+                # 市場プレミアム (Rm - Rf)
+                market_premium = rm_ret - rf_daily
+                bench_var = market_premium.var()
+
+                for t in df['Ticker']:
+                    if t in rets.columns:
+                        try:
+                            asset_ret = rets[t]
+                            # インデックスを揃えて欠損値を排除
+                            aligned_data = pd.concat([asset_ret, market_premium, rf_daily], axis=1, join='inner').dropna()
+                            aligned_data.columns = ['Asset', 'MarketPremium', 'Rf']
+                            
+                            # 個別銘柄の超過リターン (Ri - Rf)
+                            asset_premium = aligned_data['Asset'] - aligned_data['Rf']
+                            
+                            # 共分散 / 分散
+                            cov = asset_premium.cov(aligned_data['MarketPremium'])
+                            betas[t] = cov / bench_var if bench_var > 1e-8 else np.nan
+                        except:
+                            betas[t] = np.nan
+                    else:
+                        betas[t] = np.nan
+            except Exception:
+                # 失敗時は通常のベンチマーク計算へフォールバック
+                df_market = None 
+
+        # 【既存ロジック】 df_marketがない場合のフォールバック（通常のベンチマークリターン）
+        if df_market is None or df_market.empty:
+            if benchmark_ticker not in rets.columns:
+                df['Beta_Raw'] = np.nan
+                return df
+
+            bench_ret = rets[benchmark_ticker]
+            bench_var = bench_ret.var()
+
+            for t in df['Ticker']:
+                if t in rets.columns:
+                    try:
+                        cov = rets[t].cov(bench_ret)
+                        betas[t] = cov / bench_var if bench_var > 1e-8 else np.nan
+                    except:
+                        betas[t] = np.nan
+                else:
                     betas[t] = np.nan
-            else:
-                betas[t] = np.nan
         
         df['Beta_Raw'] = df['Ticker'].map(betas)
         return df
+
+    # =========================================================================
+    # 【追加実装】 重みの決定ロジック (MCW vs ユーザー指定)
+    # =========================================================================
+    @staticmethod
+    def calculate_portfolio_weights(df, user_weights_provided=False):
+        """
+        ポートフォリオの重み（Weight）を算出・正規化する。
+        user_weights_provided が True かつ 'Weight' 列が存在すればそれを採用。
+        それ以外は時価総額（MarketCap）に基づく加重平均（MCW）とする。
+        """
+        df_out = df.copy()
+        
+        # 1. ユーザー指定ルート
+        if user_weights_provided and 'Weight' in df_out.columns:
+            # 文字列等が混ざっている場合の対策
+            df_out['Weight'] = pd.to_numeric(df_out['Weight'], errors='coerce').fillna(0)
+            total_weight = df_out['Weight'].sum()
+            if total_weight > 0:
+                df_out['Weight'] = df_out['Weight'] / total_weight
+                return df_out
+        
+        # 2. 自動計算ルート (時価総額加重)
+        if 'MarketCap' in df_out.columns:
+            valid_mc = pd.to_numeric(df_out['MarketCap'], errors='coerce').fillna(0)
+            mc_sum = valid_mc.sum()
+            if mc_sum > 0:
+                df_out['Weight'] = valid_mc / mc_sum
+            else:
+                # 時価総額すら取れなかった場合の最終防衛線（等金額加重）
+                df_out['Weight'] = 1.0 / len(df_out)
+        else:
+            df_out['Weight'] = 1.0 / len(df_out)
+            
+        return df_out
+
+    # =========================================================================
+    # 【追加実装】 ファクター相関行列の算出
+    # =========================================================================
+    @staticmethod
+    def calculate_factor_correlation(df):
+        """
+        ポートフォリオ内銘柄のZスコアを用いて、5つのファクター間のPearson相関係数を算出する。
+        """
+        factors = ['Beta_Z', 'Value_Z', 'Size_Z', 'Quality_Z', 'Investment_Z']
+        # 実際にDataFrameに存在するカラムのみ抽出
+        existing_factors = [f for f in factors if f in df.columns]
+        
+        if len(existing_factors) > 1:
+            # 相関行列を計算し、欠損値は0で埋める（描画エラー防止）
+            corr_matrix = df[existing_factors].corr().fillna(0)
+            return corr_matrix
+        return pd.DataFrame()
 
     @staticmethod
     def process_raw_factors(df):
