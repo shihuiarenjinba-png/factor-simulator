@@ -12,11 +12,12 @@ from urllib3.util.retry import Retry
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 3.5: 表記揺れ根絶・バルク強化版)
+    【Module 1】データ取得プロバイダー (Ver. 4.0: ユニバース＆マーケットデータ拡張版)
     - Tickerの自動正規化（Excelの数値変換エラー、.JP等の表記揺れを.Tに統一）
     - yf.Tickersによるバルク取得とセッション管理の強化
     - FMP APIへの強力な自動フォールバック（None撲滅）
-    - 取得失敗時のETF(ベンチマーク)による時系列補完ロジック搭載
+    - 【NEW】JPX公式リストのローカルキャッシュによる高速なユニバース展開
+    - 【NEW】Beta計算用の市場プレミアム (Rm, Rf) 取得ロジック
     """
     
     FMP_API_KEY = st.secrets.get("FMP_API_KEY", os.environ.get("FMP_API_KEY"))
@@ -48,7 +49,6 @@ class DataProvider:
         session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         })
-        # yfinanceがハングするのを防ぐため、リトライ回数を下げて素早く諦め、FMP APIへ移譲させる
         retries = Retry(
             total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS"]
@@ -58,23 +58,12 @@ class DataProvider:
 
     @staticmethod
     def _normalize_ticker(t):
-        """
-        【重要】あらゆる入力パターンを強制的に 'XXXX.T' の形式に統一する
-        例: '7203', '7203.0', '7203.JP', ' 7203 ' -> すべて '7203.T'
-        """
         if pd.isna(t) or not str(t).strip():
             return ""
-        
-        # 不要な空白を削除し、大文字に統一
         t_str = str(t).strip().upper()
-        
-        # 4桁の数字が含まれているか検索
         match = re.search(r'\b(\d{4})\b', t_str)
         if match:
-            # 4桁の数字が見つかった場合は、それに強制的に '.T' を付与して返す
             return f"{match.group(1)}.T"
-            
-        # それ以外（ETFなどの特殊コード）の場合は、元の文字をそのまま返す
         return t_str
 
     @staticmethod
@@ -84,25 +73,90 @@ class DataProvider:
             if key in str(raw_sector): return val
         return 'Other'
 
+    # =========================================================================
+    # 【追加実装 1】 JPXユニバースの静的リスト保持（ローカルキャッシュ）
+    # =========================================================================
+    @staticmethod
+    @st.cache_data(ttl=86400 * 7, show_spinner=False) # 1週間キャッシュ
+    def get_jpx_universe():
+        """
+        JPXの公式リストを読み込み、辞書として保持します。
+        ローカルに 'jpx_list.csv' があればそれを正解とし、なければ安全のため日経225の代表銘柄群を返します。
+        """
+        # 理想はローカルに配置したJPX公式のCSVを読み込む
+        file_path = "jpx_list.csv"
+        if os.path.exists(file_path):
+            try:
+                df = pd.read_csv(file_path, dtype={'コード': str})
+                df['Ticker'] = df['コード'].apply(DataProvider._normalize_ticker)
+                # Tickerをキー、企業名を値とする辞書を作成
+                return dict(zip(df['Ticker'], df['銘柄名']))
+            except Exception as e:
+                st.warning(f"JPXリストの読み込みに失敗しました: {e}")
+        
+        # CSVがない場合のフォールバック（分析が止まらないための最低限の日経225代表ティッカー）
+        fallback_tickers = [
+            "7203.T", "8306.T", "9984.T", "6861.T", "8035.T", 
+            "9432.T", "6758.T", "8316.T", "4063.T", "8058.T"
+        ]
+        return {t: "JPX Data Missing" for t in fallback_tickers}
+
+    # =========================================================================
+    # 【追加実装 2】 マーケットデータ (Rm, Rf) の取得
+    # =========================================================================
+    @staticmethod
+    @st.cache_data(ttl=86400, show_spinner=False)
+    def fetch_market_rates(days=365):
+        """
+        Fama-French型Beta計算に必要な、市場リターン(Rm)と無リスク利子率(Rf)を取得します。
+        Rm: ^N225 (日経平均)
+        Rf: 日本国債10年利回り (データ取得が不安定な場合は固定値 0.5%=0.005 でフォールバック)
+        """
+        session = DataProvider._create_session()
+        end_d = datetime.date.today()
+        start_d = end_d - datetime.timedelta(days=days)
+
+        market_data = {}
+
+        # 1. Rm (市場ベンチマーク: 日経225) の取得
+        try:
+            rm_df = yf.download("^N225", start=start_d, end=end_d, session=session, progress=False)
+            if not rm_df.empty and 'Close' in rm_df.columns:
+                # yfinanceのマルチインデックス対応
+                close_series = rm_df['Close'].squeeze() 
+                market_data['Rm'] = close_series
+            else:
+                market_data['Rm'] = pd.Series(dtype=float)
+        except Exception:
+            market_data['Rm'] = pd.Series(dtype=float)
+
+        # 2. Rf (無リスク利子率) の設定
+        # ※日本国債10年のyfinanceティッカー(^JB392など)は取得エラーが多発するため、
+        # 研究用として現状の実勢金利に近い「0.005 (0.5%)」の固定系列を安全装置として生成します。
+        if not market_data['Rm'].empty:
+            dates = market_data['Rm'].index
+            # 年利0.5%を日次換算したものを配列化
+            daily_rf = (1 + 0.005) ** (1/252) - 1
+            market_data['Rf'] = pd.Series(daily_rf, index=dates)
+        else:
+            market_data['Rf'] = pd.Series(dtype=float)
+
+        return pd.DataFrame(market_data)
+
     @staticmethod
     def _fetch_fmp_ratios(ticker_list):
-        """FMP APIから財務指標を取得 (Rescue用)"""
         api_key = DataProvider.FMP_API_KEY
         if not api_key or not ticker_list: return {}
 
         rescued_data = {}
         
         def fetch_one(t_orig):
-            # FMP用には '.T' を '.JP' に変換して渡す
             symbol = t_orig.replace(".T", ".JP") if ".T" in t_orig else t_orig
-            # 1. Ratios (ROE, PBR)
             url_ratios = f"https://financialmodelingprep.com/api/v3/ratios-ttm/{symbol}?apikey={api_key}"
-            # 2. Growth (Asset Growth)
             url_growth = f"https://financialmodelingprep.com/api/v3/financial-growth/{symbol}?limit=1&apikey={api_key}"
             
             data_res = {}
             try:
-                # タイムアウトを短く設定し、全体の「解析中」ハングを防ぐ
                 r = requests.get(url_ratios, timeout=3)
                 if r.status_code == 200:
                     items = r.json()
@@ -130,7 +184,6 @@ class DataProvider:
 
     @staticmethod
     def _fetch_fmp_history(ticker_list, days=365):
-        """FMP APIから株価を取得"""
         api_key = DataProvider.FMP_API_KEY
         if not api_key or not ticker_list: return pd.DataFrame()
 
@@ -166,18 +219,11 @@ class DataProvider:
     @staticmethod
     @st.cache_data(ttl=3600, show_spinner=False)
     def fetch_fundamentals(tickers):
-        """
-        ファンダメンタルズ情報を取得
-        - yf.Tickersによるバルク取得と、失敗時のFMP強力補完
-        """
-        # 1. 確実な正規化を実施
         unique_tickers = list(set([DataProvider._normalize_ticker(t) for t in tickers if pd.notna(t)]))
         unique_tickers = [t for t in unique_tickers if t]
         if not unique_tickers: return pd.DataFrame()
 
         session = DataProvider._create_session()
-        
-        # yf.Tickersへの入力を文字列として結合
         tickers_str = " ".join(unique_tickers)
         try:
             tks = yf.Tickers(tickers_str, session=session)
@@ -187,7 +233,6 @@ class DataProvider:
         def get_yf_stock(ticker):
             try:
                 if not tks: return None
-                # Yahoo側のキー（銘柄名）の揺れに対応するため、大文字で取得
                 tk = tks.tickers.get(ticker.upper())
                 if not tk: return None
                 
@@ -195,35 +240,33 @@ class DataProvider:
                 if info is None: return None
                 
                 res = {
-                    'Ticker': ticker, # 返却時は必ず要求された正規化Tickerを使う
+                    'Ticker': ticker,
                     'Name': info.get('shortName', info.get('longName', ticker)),
                     'Price': info.get('currentPrice', info.get('previousClose', np.nan)),
+                    # 【重要】時価総額（Market Cap）の常時取得。加重平均計算のコアとなります。
                     'Size_Raw': info.get('marketCap', np.nan),
                     'PBR': info.get('priceToBook', np.nan),
                     'ROE': info.get('returnOnEquity', np.nan),
                     'Sector_Raw': info.get('sector', info.get('industry', 'Unknown')),
-                    # revenueGrowthがなければearningsGrowthで代替
                     'Growth': info.get('revenueGrowth', info.get('earningsGrowth', np.nan))
                 }
                 return res
             except Exception:
                 return None
 
-        with ThreadPoolExecutor(max_workers=8) as executor: # yfinance取得のスレッドを増やして高速化
+        with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(get_yf_stock, unique_tickers))
         
         valid_data = [d for d in results if d is not None]
         df = pd.DataFrame(valid_data)
         
-        # 取得できたデータが0件の場合の防波堤
         if df.empty:
             df = pd.DataFrame({'Ticker': unique_tickers})
             
-        req_cols = ['ROE', 'PBR', 'Growth']
+        req_cols = ['ROE', 'PBR', 'Growth', 'Size_Raw']
         for c in req_cols:
             if c not in df.columns: df[c] = np.nan
 
-        # どれか一つでも欠損している場合はFMPから補完を試みる条件を厳密化
         missing_cond = df['ROE'].isna() | df['Growth'].isna() | df['PBR'].isna()
         missing_tickers = df[missing_cond]['Ticker'].tolist() if not df.empty else unique_tickers
         
@@ -232,12 +275,10 @@ class DataProvider:
             for i, row in df.iterrows():
                 t = row['Ticker']
                 if t in fmp_data:
-                    # 取得できた場合のみ、NaNの部分を上書きする
                     if pd.isna(row.get('ROE')): df.at[i, 'ROE'] = fmp_data[t].get('ROE')
                     if pd.isna(row.get('PBR')): df.at[i, 'PBR'] = fmp_data[t].get('PBR')
                     if pd.isna(row.get('Growth')): df.at[i, 'Growth'] = fmp_data[t].get('Growth')
 
-        # 数値型へ強制変換 (Noneや文字列を排除)
         num_cols = ['Price', 'Size_Raw', 'PBR', 'ROE', 'Growth']
         for c in num_cols:
             if c in df.columns:
@@ -253,19 +294,13 @@ class DataProvider:
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
     def fetch_historical_prices(tickers, days=365):
-        """
-        時系列株価データを取得
-        取得失敗時にベンチマーク(ETF)の動きで補完する安全装置
-        """
         if not tickers: return pd.DataFrame()
         
-        # 1. 確実な正規化を実施
         unique_tickers = list(set([DataProvider._normalize_ticker(t) for t in tickers if pd.notna(t)]))
         unique_tickers = [t for t in unique_tickers if t]
         if not unique_tickers: return pd.DataFrame()
 
         session = DataProvider._create_session()
-        
         bench_etf = next((t for t in unique_tickers if t in ["1321.T", "1306.T"]), None)
         
         try:
@@ -302,7 +337,6 @@ class DataProvider:
             final_cols = result_df.columns.tolist() if not result_df.empty else []
             still_missing = list(set(unique_tickers) - set(final_cols))
             
-            # 最終防衛線: 取れなかった銘柄はベンチマークETFの動きで補完
             if still_missing and bench_etf and bench_etf in result_df.columns:
                 for t in still_missing:
                     result_df[t] = result_df[bench_etf]
@@ -316,14 +350,6 @@ class DataProvider:
                 
             return pd.DataFrame()
 
-    # =========================================================================
-    # 【追加実装】 app.py の呼び出しエラー (AttributeError) を解消するラッパー
-    # =========================================================================
     @staticmethod
     def get_bulk_fundamentals(tickers):
-        """
-        app.py から呼び出される 'get_bulk_fundamentals' という名前を、
-        実際の処理関数である 'fetch_fundamentals' に中継します。
-        これにより、AttributeError を防ぎ、データの受け渡しを正常化します。
-        """
         return DataProvider.fetch_fundamentals(tickers)
