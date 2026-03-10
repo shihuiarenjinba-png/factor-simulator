@@ -12,12 +12,15 @@ from urllib3.util.retry import Retry
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 4.0: ユニバース＆マーケットデータ拡張版)
+    【Module 1】データ取得プロバイダー (Ver. 4.1: 堅牢化パッチ適用版)
     - Tickerの自動正規化（Excelの数値変換エラー、.JP等の表記揺れを.Tに統一）
     - yf.Tickersによるバルク取得とセッション管理の強化
     - FMP APIへの強力な自動フォールバック（None撲滅）
-    - 【NEW】JPX公式リストのローカルキャッシュによる高速なユニバース展開
-    - 【NEW】Beta計算用の市場プレミアム (Rm, Rf) 取得ロジック
+    - JPX公式リストのローカルキャッシュによる高速なユニバース展開
+    - Beta計算用の市場プレミアム (Rm, Rf) 取得ロジック
+    - 【NEW】yfinanceマルチインデックスの安全な解体抽出
+    - 【NEW】ユニバースの最低ライン確保（50銘柄フォールバック）
+    - 【NEW】NoneTypeイテラブル・エラーの完全ガード
     """
     
     FMP_API_KEY = st.secrets.get("FMP_API_KEY", os.environ.get("FMP_API_KEY"))
@@ -74,55 +77,50 @@ class DataProvider:
         return 'Other'
 
     # =========================================================================
-    # 【追加実装 1】 JPXユニバースの静的リスト保持（ローカルキャッシュ）
+    # JPXユニバースの静的リスト保持（ローカルキャッシュとフォールバック拡充）
     # =========================================================================
     @staticmethod
-    @st.cache_data(ttl=86400 * 7, show_spinner=False) # 1週間キャッシュ
+    @st.cache_data(ttl=86400 * 7, show_spinner=False)
     def get_jpx_universe():
         """
-        JPXの公式リストを読み込み、辞書として保持します。
-        ローカルに 'jpx_list.csv' があればそれを正解とし、なければ安全のため日経225の代表銘柄群を返します。
+        JPXの公式リストを読み込みます。
+        【修正】ローカルのCSVがない場合、統計の安定性を担保するため
+        日経225の主要50銘柄をフォールバックとして返します（旧:11銘柄）。
         """
-        # 理想はローカルに配置したJPX公式のCSVを読み込む
         file_path = "jpx_list.csv"
         if os.path.exists(file_path):
             try:
                 df = pd.read_csv(file_path, dtype={'コード': str})
                 df['Ticker'] = df['コード'].apply(DataProvider._normalize_ticker)
-                # Tickerをキー、企業名を値とする辞書を作成
                 return dict(zip(df['Ticker'], df['銘柄名']))
             except Exception as e:
                 st.warning(f"JPXリストの読み込みに失敗しました: {e}")
         
-        # CSVがない場合のフォールバック（分析が止まらないための最低限の日経225代表ティッカー）
+        # CSVがない場合のフォールバック（日経225の主要50銘柄。これ以下だとZスコアが爆発しやすくなる）
         fallback_tickers = [
-            "7203.T", "8306.T", "9984.T", "6861.T", "8035.T", 
-            "9432.T", "6758.T", "8316.T", "4063.T", "8058.T"
+            "7203.T", "8306.T", "9984.T", "6861.T", "8035.T", "9432.T", "6758.T", "8316.T", "4063.T", "8058.T",
+            "6098.T", "4502.T", "6902.T", "8001.T", "8766.T", "7974.T", "4568.T", "8031.T", "6501.T", "7741.T",
+            "8411.T", "3382.T", "6367.T", "4519.T", "4543.T", "6954.T", "8053.T", "8002.T", "6594.T", "6981.T",
+            "4661.T", "4901.T", "2914.T", "6146.T", "7267.T", "8725.T", "4523.T", "7733.T", "4503.T", "6702.T",
+            "9022.T", "8591.T", "6503.T", "9020.T", "5108.T", "7269.T", "8802.T", "8801.T", "1925.T", "7011.T"
         ]
         return {t: "JPX Data Missing" for t in fallback_tickers}
 
     # =========================================================================
-    # 【追加実装 2】 マーケットデータ (Rm, Rf) の取得
+    # マーケットデータ (Rm, Rf) の取得
     # =========================================================================
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
     def fetch_market_rates(days=365):
-        """
-        Fama-French型Beta計算に必要な、市場リターン(Rm)と無リスク利子率(Rf)を取得します。
-        Rm: ^N225 (日経平均)
-        Rf: 日本国債10年利回り (データ取得が不安定な場合は固定値 0.5%=0.005 でフォールバック)
-        """
         session = DataProvider._create_session()
         end_d = datetime.date.today()
         start_d = end_d - datetime.timedelta(days=days)
 
         market_data = {}
 
-        # 1. Rm (市場ベンチマーク: 日経225) の取得
         try:
             rm_df = yf.download("^N225", start=start_d, end=end_d, session=session, progress=False)
             if not rm_df.empty and 'Close' in rm_df.columns:
-                # yfinanceのマルチインデックス対応
                 close_series = rm_df['Close'].squeeze() 
                 market_data['Rm'] = close_series
             else:
@@ -130,12 +128,8 @@ class DataProvider:
         except Exception:
             market_data['Rm'] = pd.Series(dtype=float)
 
-        # 2. Rf (無リスク利子率) の設定
-        # ※日本国債10年のyfinanceティッカー(^JB392など)は取得エラーが多発するため、
-        # 研究用として現状の実勢金利に近い「0.005 (0.5%)」の固定系列を安全装置として生成します。
         if not market_data['Rm'].empty:
             dates = market_data['Rm'].index
-            # 年利0.5%を日次換算したものを配列化
             daily_rf = (1 + 0.005) ** (1/252) - 1
             market_data['Rf'] = pd.Series(daily_rf, index=dates)
         else:
@@ -237,13 +231,14 @@ class DataProvider:
                 if not tk: return None
                 
                 info = tk.info
-                if info is None: return None
+                # 【修正】 info が None の場合、TypeError (is not iterable) を避けるため空の辞書を生成
+                if info is None:
+                    info = {}
                 
                 res = {
                     'Ticker': ticker,
                     'Name': info.get('shortName', info.get('longName', ticker)),
                     'Price': info.get('currentPrice', info.get('previousClose', np.nan)),
-                    # 【重要】時価総額（Market Cap）の常時取得。加重平均計算のコアとなります。
                     'Size_Raw': info.get('marketCap', np.nan),
                     'PBR': info.get('priceToBook', np.nan),
                     'ROE': info.get('returnOnEquity', np.nan),
@@ -252,7 +247,11 @@ class DataProvider:
                 }
                 return res
             except Exception:
-                return None
+                # 完全に失敗した場合は、Tickerだけを持つ空のレコードを返すことで後続の計算崩壊を防ぐ
+                return {
+                    'Ticker': ticker, 'Name': ticker, 'Price': np.nan, 'Size_Raw': np.nan,
+                    'PBR': np.nan, 'ROE': np.nan, 'Sector_Raw': 'Unknown', 'Growth': np.nan
+                }
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(get_yf_stock, unique_tickers))
@@ -291,6 +290,9 @@ class DataProvider:
 
         return df
 
+    # =========================================================================
+    # 履歴データ取得（yfinanceのマルチインデックス解体と抽出の堅牢化）
+    # =========================================================================
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
     def fetch_historical_prices(tickers, days=365):
@@ -315,15 +317,26 @@ class DataProvider:
             
             if df.empty: raise ValueError("yfinance returned empty")
 
+            result_df = pd.DataFrame()
+
+            # 【修正】yfinanceの返り値が単一銘柄か複数銘柄かで処理を厳密に分ける
             if len(unique_tickers) == 1:
                 t = unique_tickers[0]
-                if 'Close' in df.columns: result_df = pd.DataFrame({t: df['Close']})
-                else: result_df = pd.DataFrame()
+                # 単一銘柄の場合、マルチインデックスにならないケースがある
+                if 'Close' in df.columns: 
+                    result_df = pd.DataFrame({t: df['Close']})
+                else:
+                    result_df = pd.DataFrame()
             else:
+                # 複数銘柄の場合 (マルチインデックスの解体)
                 try:
-                    result_df = df.iloc[:, df.columns.get_level_values(1) == 'Close']
-                    result_df.columns = result_df.columns.get_level_values(0)
-                except Exception:
+                    # 'Close' レベルを持つすべての列を抽出
+                    close_cols = df.iloc[:, df.columns.get_level_values(1) == 'Close']
+                    # カラム名をティッカーシンボルのみに変更
+                    close_cols.columns = close_cols.columns.get_level_values(0)
+                    result_df = close_cols.copy()
+                except Exception as e:
+                    # 形式が予期しないもので解体失敗した場合
                     result_df = pd.DataFrame()
             
             current_cols = result_df.columns.tolist() if not result_df.empty else []
