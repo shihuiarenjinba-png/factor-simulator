@@ -10,12 +10,14 @@ class QuantEngine:
     【完了版 Step 6】ZスコアのNone撲滅、自己補完フォールバックによる0.00病の根絶
     【NEW版 Step 7】Rm-RfベースのBeta計算、時価総額加重(MCW)ロジック、ファクター相関行列の追加
     【最新修正版】Zスコア上限撤廃、Value/Sizeの厳密な対数化、ウェイト入力のガードレール強化
+    【V17.1追加】特性ベータ(Sensitivity Beta)の逆算ロジック、スマートウェイトの完全化、極性正常化
     """
     
     @staticmethod
     def calculate_beta(df_fund, df_hist, df_market=None, benchmark_ticker="1321.T"):
         """
         時系列データからBetaを計算（Rm-Rfの市場プレミアム対応版）
+        ※この値は五角形レーダーチャート用の「回帰ベータ(Regression Beta)」として使用されます。
         """
         # 1. df_fund救済
         if not isinstance(df_fund, pd.DataFrame):
@@ -98,18 +100,17 @@ class QuantEngine:
         return df
 
     # =========================================================================
-    # 【修正】 重みの決定ロジック ガードレール設置
+    # 【修正】 スマート・ウェイト・エンジン
     # =========================================================================
     @staticmethod
     def calculate_portfolio_weights(df, user_weights_provided=False):
         """
         ポートフォリオの重みを算出。
-        手入力ウェイトの不整合（数が合わない、文字が混ざっている等）による
-        計算のショート（全値0化）を防ぐ強力なガードレールを追加。
+        手入力ウェイトがない場合、自動的に時価総額（Market Cap）加重計算へ移行します。
         """
         df_out = df.copy()
         
-        # 1. ユーザー指定ルート
+        # 1. ユーザー指定ルート (ウェイト入力がある場合)
         if user_weights_provided and 'Weight' in df_out.columns:
             # 強制的に数値化、変換できない文字は0に
             df_out['Weight'] = pd.to_numeric(df_out['Weight'], errors='coerce').fillna(0)
@@ -123,20 +124,20 @@ class QuantEngine:
                 df_out['Weight'] = df_out['Weight'] / total_weight
                 return df_out
             else:
-                # 数が合わない、あるいは不正な値により0になってしまった場合は「等金額加重」に強制フォールバック
-                df_out['Weight'] = 1.0 / len(df_out)
-                return df_out
+                # 数が合わない場合は自動的に下の時価総額加重（または等金額）へ流すため pass する
+                pass
         
-        # 2. 自動計算ルート (時価総額加重)
+        # 2. 自動計算ルート (時価総額加重へ完全移行)
         if 'MarketCap' in df_out.columns:
             valid_mc = pd.to_numeric(df_out['MarketCap'], errors='coerce').fillna(0)
             mc_sum = valid_mc.sum()
             if mc_sum > 0:
                 df_out['Weight'] = valid_mc / mc_sum
             else:
-                # 時価総額が取れなかった場合
+                # 時価総額の合計が0になってしまった場合の最終手段
                 df_out['Weight'] = 1.0 / len(df_out)
         else:
+            # MarketCap カラム自体が存在しない場合の最終手段
             df_out['Weight'] = 1.0 / len(df_out)
             
         return df_out
@@ -158,11 +159,11 @@ class QuantEngine:
     def process_raw_factors(df):
         """
         生データをファクター分析用の形式に加工
-        【修正】ValueとSizeに確実な対数(Log)処理を適用し、数値の爆発を抑制
+        【修正】極性の事前準備。ValueとSizeに確実な対数(Log)処理を適用。
         """
         # Value (PBR逆数の対数化)
         if 'PBR' in df.columns:
-            # PBRが0以下などの異常値はNaNにし、正常値のみ np.log(1/PBR) を適用
+            # 1/PBR にすることで、「PBRが低い（割安）ほど数値が大きくなる」ように事前反転
             df['Value_Raw'] = df['PBR'].apply(
                 lambda x: np.log(1/x) if (pd.notnull(x) and x > 0) else np.nan
             )
@@ -232,8 +233,7 @@ class QuantEngine:
     def compute_z_scores(df_target, stats):
         """
         Zスコア計算 
-        【修正】3.0のクリップ（リミッター）を解除し、順位を視覚化できるように変更。
-        また、0.00病を防ぐため、MAD(中央値絶対偏差)を標準偏差に近似させるスケーリングを追加。
+        【修正】極性の正常化（小型株・バリュー株ほどプラスに出るよう調整）
         """
         df = df_target.copy()
         r_squared_map = {} 
@@ -282,18 +282,15 @@ class QuantEngine:
                     continue 
                 target_col = found_col
 
-            # 強制的に数値型へ変換、無限大はNaNにして0.00病を防止
             numeric_series = pd.to_numeric(df[target_col], errors='coerce').replace([np.inf, -np.inf], np.nan)
 
             if isinstance(stats, dict) and f in stats and 'median' in stats[f]:
                 mu = stats[f]['median']
-                # 市場MADに1.4826を掛けて標準偏差(SD)相当にスケールアップし、Zスコアの異常な肥大化を防ぐ
                 raw_sigma = stats[f].get('mad', 1e-6)
                 sigma = (raw_sigma * 1.4826) if pd.notna(raw_sigma) and raw_sigma > 1e-6 else 1e-6
             else:
                 mu = numeric_series.median()
                 mad = (numeric_series - mu).abs().median()
-                # 自己計算MADにも同様に1.4826を掛ける
                 sigma = (mad * 1.4826) if pd.notna(mad) and mad > 0 else 1e-6
                 
                 if pd.isna(mu):
@@ -307,13 +304,15 @@ class QuantEngine:
                 
                 z = (val - mu) / sigma
                 
-                if f == 'Size' or f == 'Investment': 
+                # 【修正: 極性の正常化】
+                if f == 'Size':
+                    # 時価総額が小さいほどプラス（小型株効果）
                     z = -z 
-                
-                # 【修正: リミッター解除】
-                # if z > 3.0: z = 3.0
-                # if z < -3.0: z = -3.0
-                # 上記を完全に削除しました。これにより突出したスコアもそのまま出力されます。
+                elif f == 'Investment':
+                    # 資産成長率が低い（保守的）ほどプラス
+                    z = -z 
+                # ※ Valueは process_raw_factors で np.log(1/PBR) に変換済みのため、
+                # そのまま計算することで「割安（低PBR）ほどプラス」になります。
                 
                 return z
             
@@ -327,6 +326,43 @@ class QuantEngine:
                 df[z_col] = df[z_col].fillna(0.0)
             
         return df, r_squared_map
+
+    # =========================================================================
+    # 【新規追加】特性ベータ（Sensitivity Beta）の逆算ロジック
+    # =========================================================================
+    @staticmethod
+    def calculate_sensitivity_beta(df, market_sensitivities=None):
+        """
+        Zスコアからファクター感応度を加重平均し、特性ベータ（Sensitivity Beta）を算出する。
+        下部の寄与度グラフ用に使用されます。
+        """
+        if market_sensitivities is None:
+            # デフォルトの市場感応度係数（マジックナンバー）
+            # 一般的なファクター特性：小型(+)はハイベータ、バリュー(+)や高クオリティ(+)はローベータ傾向
+            market_sensitivities = {
+                'Size_Z': 0.25,       # 小型株ほど市場変動の影響を受けやすい
+                'Value_Z': -0.15,     # 割安株は下値が固く、連動性が低い
+                'Quality_Z': -0.20,   # 高収益企業は独自の値動きをしやすく連動性が低い
+                'Investment_Z': -0.10 # 保守的な企業は変動がマイルド
+            }
+
+        df_out = df.copy()
+        sensitivity_sum = pd.Series(0.0, index=df_out.index)
+        
+        # 係数の絶対値合計で割ることで、Zスコアのスケール感（±3.0程度）を維持する
+        total_weight = sum(abs(v) for v in market_sensitivities.values())
+        
+        for factor_col, weight in market_sensitivities.items():
+            if factor_col in df_out.columns:
+                # \sum (Z_i * Weight_i)
+                sensitivity_sum += df_out[factor_col].fillna(0.0) * weight
+        
+        if total_weight > 0:
+            df_out['Sensitivity_Beta_Z'] = sensitivity_sum / total_weight
+        else:
+            df_out['Sensitivity_Beta_Z'] = 0.0
+            
+        return df_out
 
     @staticmethod
     def generate_insights(z_scores):
