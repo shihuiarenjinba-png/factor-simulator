@@ -140,18 +140,24 @@ if run_button:
     progress_bar.progress(30, text="ファンダメンタルズ（財務データ）を取得中...")
     df_all_fund = DataProvider.fetch_fundamentals(all_target_tickers)
     
+    # 【修正】完全に空の場合の全体エラーハンドリング
     if df_all_fund.empty:
-        st.error("データの取得に失敗しました。ネットワーク接続を確認してください。")
+        st.error("❌ データの取得に完全に失敗しました。")
+        st.info("💡 **ヒント**: 現在、Yahoo Finance側で一時的なアクセス制限（Too Many Requests）がかかっている可能性が高いです。数分〜数十分ほど待ってから再度お試しください。")
         st.stop()
 
-    # --- 【新規】データクオリティ・チェック（欠損警告） ---
+    # --- データクオリティ・チェック（欠損警告と全滅ハンドリング） ---
     fetched_tickers = df_all_fund['Ticker'].tolist()
     missing_port = [t for t in port_tickers if t not in fetched_tickers]
+    
     if missing_port:
         st.warning(f"⚠️ 以下の銘柄のデータ取得に失敗しました（計算から除外します）: {', '.join(missing_port)}")
         port_tickers = [t for t in port_tickers if t not in missing_port]
+        
+        # 【修正】ポートフォリオ銘柄が全滅した場合の丁寧なエラーハンドリング
         if not port_tickers:
-            st.error("計算可能なポートフォリオ銘柄がありません。分析を中止します。")
+            st.error("❌ 計算可能なポートフォリオ銘柄がなくなりました。分析を中止します。")
+            st.info("💡 **ヒント**: ネットワークエラー、またはYahoo Finance側の一時的なアクセス制限（Bot判定によるブロック）が発生している可能性があります。数分待ってから再度実行してください。")
             st.stop()
 
     progress_bar.progress(50, text="価格履歴データと市場プレミアムを取得中...")
