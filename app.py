@@ -46,8 +46,19 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Factor Simulator V17.1 - Portfolio Analysis")
+st.title("Factor Simulator V17.2 - Portfolio Analysis")
 st.markdown("5ファクター（Beta, Value, Size, Quality, Investment）に基づくポートフォリオの直交化解析と可視化を行います。")
+
+# ---------------------------------------------------------
+# 【追加】一括データ取得＆強力キャッシュラッパー
+# app.py側で一括してキャッシュすることで、ボタン連打時の429エラーを完全に防ぐ
+# ---------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_cached_market_data(tickers):
+    df_fund = DataProvider.fetch_fundamentals(tickers)
+    df_hist = DataProvider.fetch_historical_prices(tickers)
+    df_market = DataProvider.fetch_market_rates()
+    return df_fund, df_hist, df_market
 
 # ---------------------------------------------------------
 # 1. サイドバー: 入力インターフェース
@@ -135,40 +146,48 @@ if run_button:
     all_target_tickers = list(set(bench_tickers + port_tickers))
 
     # -----------------------------------------------------
-    # Step B: データの取得（ファンダメンタルズとヒストリカル）
+    # Step B: データの取得（キャッシュラッパーを使用）
     # -----------------------------------------------------
-    progress_bar.progress(30, text="ファンダメンタルズ（財務データ）を取得中...")
-    df_all_fund = DataProvider.fetch_fundamentals(all_target_tickers)
+    progress_bar.progress(30, text="市場データ（財務・価格）を取得/キャッシュから読み込み中...")
     
-    # 【修正】完全に空の場合の全体エラーハンドリング
+    df_all_fund, df_hist, df_market = get_cached_market_data(all_target_tickers)
+    
+    # 完全に空の場合の全体エラーハンドリング
     if df_all_fund.empty:
         st.error("❌ データの取得に完全に失敗しました。")
         st.info("💡 **ヒント**: 現在、Yahoo Finance側で一時的なアクセス制限（Too Many Requests）がかかっている可能性が高いです。数分〜数十分ほど待ってから再度お試しください。")
         st.stop()
 
-    # --- データクオリティ・チェック（欠損警告と全滅ハンドリング） ---
+    # -----------------------------------------------------
+    # 【追加】データ品質の可視化（診断レポート）
+    # -----------------------------------------------------
     fetched_tickers = df_all_fund['Ticker'].tolist()
     missing_port = [t for t in port_tickers if t not in fetched_tickers]
     
-    if missing_port:
-        st.warning(f"⚠️ 以下の銘柄のデータ取得に失敗しました（計算から除外します）: {', '.join(missing_port)}")
-        port_tickers = [t for t in port_tickers if t not in missing_port]
+    with st.expander("📊 データ品質・取得レポート", expanded=bool(missing_port)):
+        st.markdown(f"**・リクエスト銘柄数**: {len(port_tickers)} 件")
+        st.markdown(f"**・取得成功**: {len(port_tickers) - len(missing_port)} 件")
         
-        # 【修正】ポートフォリオ銘柄が全滅した場合の丁寧なエラーハンドリング
-        if not port_tickers:
-            st.error("❌ 計算可能なポートフォリオ銘柄がなくなりました。分析を中止します。")
-            st.info("💡 **ヒント**: ネットワークエラー、またはYahoo Finance側の一時的なアクセス制限（Bot判定によるブロック）が発生している可能性があります。数分待ってから再度実行してください。")
-            st.stop()
+        if missing_port:
+            st.error(f"❌ 取得失敗（計算から除外）: {', '.join(missing_port)}")
+            st.markdown("※ 上記の銘柄は上場廃止、またはYahoo Financeからの応答がなかったため除外されました。0.00による計算のノイズを防ぐための安全措置です。")
+        else:
+            st.success("✅ 全ポートフォリオ銘柄の基本データ取得に成功しました。")
+            
+        # ユニバースの取得状況
+        fetched_bench = [t for t in bench_tickers if t in fetched_tickers]
+        st.markdown(f"**・ユニバース(比較対象)取得**: {len(fetched_bench)} / {len(bench_tickers)} 件")
 
-    progress_bar.progress(50, text="価格履歴データと市場プレミアムを取得中...")
-    df_hist = DataProvider.fetch_historical_prices(all_target_tickers)
-    df_market = DataProvider.fetch_market_rates()
+    port_tickers = [t for t in port_tickers if t not in missing_port]
+    
+    if not port_tickers:
+        st.error("❌ 計算可能なポートフォリオ銘柄がなくなりました。分析を中止します。")
+        st.stop()
 
     # -----------------------------------------------------
     # Step C: 回帰ベータの計算
     # -----------------------------------------------------
     progress_bar.progress(65, text="市場連動性（回帰ベータ）を計算中...")
-    # 母集団全体に対して一括でベータを計算（後のZスコア計算にBeta_Rawが必要なため）
     df_all_fund = QuantEngine.calculate_beta(df_all_fund, df_hist, df_market)
 
     # -----------------------------------------------------
@@ -187,17 +206,22 @@ if run_button:
     # -----------------------------------------------------
     progress_bar.progress(90, text="特性ベータ(Sensitivity Beta)と加重ウェイトの計算中...")
     
-    # Visualizer下部の寄与度グラフに必要な 'Sensitivity_Beta_Z' をエンジンから逆算
     df_port_scored = QuantEngine.calculate_sensitivity_beta(df_port_scored)
 
-    # ガードレール付きのウェイト適用（時価総額加重への自動フォールバック搭載）
-    if weight_list and len(weight_list) == len(port_tickers):
-        weight_map = dict(zip(port_tickers, weight_list))
-        df_port_scored['Weight'] = df_port_scored['Ticker'].map(weight_map)
-        df_port_scored = QuantEngine.calculate_portfolio_weights(df_port_scored, user_weights_provided=True)
+    # -----------------------------------------------------
+    # 【修正】ウェイト入力の厳格なフィードバック
+    # -----------------------------------------------------
+    if weight_list:
+        if len(weight_list) == len(port_tickers):
+            weight_map = dict(zip(port_tickers, weight_list))
+            df_port_scored['Weight'] = df_port_scored['Ticker'].map(weight_map)
+            df_port_scored = QuantEngine.calculate_portfolio_weights(df_port_scored, user_weights_provided=True)
+            st.success("✅ 指定されたウェイトを適用しました。")
+        else:
+            # 入力数と銘柄数の不一致を赤字で明示
+            st.error(f"❌ ウェイト入力エラー: 有効な銘柄数（{len(port_tickers)}件）に対し、入力されたウェイト数が（{len(weight_list)}件）です。時価総額加重（または等金額）で自動計算します。")
+            df_port_scored = QuantEngine.calculate_portfolio_weights(df_port_scored, user_weights_provided=False)
     else:
-        if weight_list:
-            st.warning("⚠️ 銘柄数とウェイトの数が一致しません。時価総額（または等金額）加重で自動計算します。")
         df_port_scored = QuantEngine.calculate_portfolio_weights(df_port_scored, user_weights_provided=False)
 
     # -----------------------------------------------------
@@ -206,7 +230,6 @@ if run_button:
     progress_bar.progress(95, text="ビジュアル・レンダリング準備中...")
     
     portfolio_z = {}
-    # 【重要】レーダーチャートは 'Regression Beta' (元の Beta_Z) を使用
     radar_factors = ['Beta_Z', 'Value_Z', 'Size_Z', 'Quality_Z', 'Investment_Z']
     radar_names = ['Beta', 'Value', 'Size', 'Quality', 'Investment']
     
@@ -223,14 +246,12 @@ if run_button:
     # ---------------------------------------------------------
     # 3. 分析結果の表示 (Visualizerの活用)
     # ---------------------------------------------------------
-    st.success("🎯 分析が完了しました。")
-    
     col1, col2 = st.columns([1, 1])
     
     with col1:
-        st.subheader("🎯 5ファクター・エクスポージャー")
+        # 【追加】Regression Betaの解釈を助けるツールチップ
+        st.subheader("🎯 5ファクター・エクスポージャー", help="【Regression Beta (回帰ベータ)】\n過去の価格データに基づき、市場ベンチマークに対する純粋な価格連動性（時系列回帰）を測定したものです。")
         
-        # 算出されたZスコアの絶対値の最大を探し、レーダーチャートの枠を動的に広げる
         max_z_val = 0
         available_factors = [f for f in radar_factors if f in df_port_scored.columns]
         if available_factors:
@@ -238,7 +259,6 @@ if run_button:
         
         dynamic_range = max(3.0, float(np.ceil(max_z_val * 1.1)))
         
-        # レーダーチャートの描画
         fig_radar = Visualizer.plot_radar_chart(portfolio_z)
         fig_radar.update_polars(
             radialaxis=dict(
@@ -249,8 +269,8 @@ if run_button:
         st.plotly_chart(fig_radar, use_container_width=True)
         
     with col2:
-        st.subheader("🧩 ファクター寄与度分解")
-        # 寄与度バーチャートの描画 (df_port_scored 内の Sensitivity_Beta_Z を自動認識します)
+        # 【追加】Sensitivity Betaの解釈を助けるツールチップ
+        st.subheader("🧩 ファクター寄与度分解", help="【Sensitivity Beta (特性ベータ)】\n各ファクター（割安性やクオリティなど）の組み合わせから逆算された、その銘柄が本質的に持つ市場感応度の理論値です。")
         fig_bar = Visualizer.plot_contribution_bar_chart(df_port_scored)
         st.plotly_chart(fig_bar, use_container_width=True)
 
@@ -258,13 +278,11 @@ if run_button:
     st.markdown("---")
     st.subheader("📋 銘柄別 Z-Score 詳細データ")
     
-    # ユーザー表示用には分かりやすく両方のベータを並べる
     display_cols = ['Ticker', 'Weight', 'Beta_Z', 'Sensitivity_Beta_Z', 'Value_Z', 'Size_Z', 'Quality_Z', 'Investment_Z']
     existing_cols = [col for col in display_cols if col in df_port_scored.columns]
     
     df_display = df_port_scored[existing_cols].copy()
     
-    # カラム名を見やすくリネーム
     rename_dict = {
         'Beta_Z': 'Regression Beta',
         'Sensitivity_Beta_Z': 'Sensitivity Beta',
@@ -275,5 +293,5 @@ if run_button:
     }
     df_display.rename(columns=rename_dict, inplace=True)
     
-    # 小数点以下2桁にフォーマット
+    # 小数点以下2桁にフォーマットして表示
     st.dataframe(df_display.style.format({col: "{:.2f}" for col in df_display.columns if col not in ['Ticker']}), use_container_width=True)
