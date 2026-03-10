@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import re  # 正規表現モジュール（4桁数字の判定用）
+import unicodedata  # 【追加】全角/半角の文字正規化サニタイズ用
 
 # カスタムモジュールの読み込み
 try:
@@ -59,6 +60,13 @@ port_input = st.sidebar.text_area(
     help="証券コード（4桁）を入力してください。"
 )
 
+# 【追加】ウェイトの入力インターフェース
+weight_input = st.sidebar.text_area(
+    "ウェイト入力 (カンマ区切り・空欄で等金額/時価総額加重)",
+    value="",
+    help="銘柄と同じ順番で数値を入力してください。例: 0.2, 0.3, 0.1..."
+)
+
 st.sidebar.markdown("---")
 st.sidebar.subheader("🌍 ユニバース（市場基準）設定")
 
@@ -82,13 +90,35 @@ run_button = st.sidebar.button("分析を実行", type="primary")
 if run_button:
     with st.spinner("市場データを解析中... (APIからデータを取得しています)"):
         
-        # 銘柄コードのパースと正規化 (4桁数字の抽出)
-        raw_codes = re.findall(r'\b\d{4}\b', port_input)
-        port_tickers = list(set([f"{code}.T" for code in raw_codes]))
+        # -----------------------------------------------------
+        # 【修正】入力データのサニタイズ（全角→半角、不要文字の除去）
+        # -----------------------------------------------------
+        # 銘柄コードのパースと正規化
+        sanitized_port = unicodedata.normalize('NFKC', port_input)
+        raw_codes = re.findall(r'\b\d{4}\b', sanitized_port)
+        
+        # 入力順序を保持しつつ重複を排除（ウェイトとの紐付けを正確にするため）
+        port_tickers = []
+        for code in raw_codes:
+            ticker = f"{code}.T"
+            if ticker not in port_tickers:
+                port_tickers.append(ticker)
         
         if not port_tickers:
             st.error("有効な銘柄コード（4桁の数字）が見つかりませんでした。")
             st.stop()
+
+        # ウェイト文字列のサニタイズとリスト化
+        clean_weight_str = unicodedata.normalize('NFKC', weight_input).replace(" ", "").replace("\n", "")
+        weight_list = []
+        if clean_weight_str:
+            # 数字、ドット、カンマ以外を除外して安全にリスト化
+            sanitized_w = re.sub(r'[^0-9.,]', '', clean_weight_str)
+            if sanitized_w:
+                try:
+                    weight_list = [float(w) for w in sanitized_w.split(',') if w]
+                except ValueError:
+                    pass # 変換失敗時は空リストのまま進行（エンジン側で自動フォールバック）
 
         # -----------------------------------------------------
         # Step A: ユニバース（母集団）データの準備
@@ -121,7 +151,7 @@ if run_button:
         market_stats, df_bench_proc = UniverseManager.generate_market_stats(df_bench)
 
         # -----------------------------------------------------
-        # Step C: ポートフォリオのZスコア算出
+        # Step C: ポートフォリオのZスコア算出とウェイト適用
         # -----------------------------------------------------
         df_port = df_all_fund[df_all_fund['Ticker'].isin(port_tickers)].copy()
         
@@ -129,9 +159,19 @@ if run_button:
         df_port_proc = QuantEngine.process_raw_factors(df_port)
         df_port_scored, _ = QuantEngine.compute_z_scores(df_port_proc, market_stats)
         
-        # 簡易的に均等ウェイトを設定
-        df_port_scored['Weight'] = 1.0 / len(df_port_scored)
-        
+        # -----------------------------------------------------
+        # 【追加】ウェイトの紐付けとQuantEngineによるガードレール計算
+        # -----------------------------------------------------
+        if weight_list and len(weight_list) == len(port_tickers):
+            # 銘柄とウェイトを辞書で紐付け、DataFrameに確実に追加
+            weight_map = dict(zip(port_tickers, weight_list))
+            df_port_scored['Weight'] = df_port_scored['Ticker'].map(weight_map)
+            df_port_scored = QuantEngine.calculate_portfolio_weights(df_port_scored, user_weights_provided=True)
+        else:
+            if weight_list:
+                st.warning("⚠️ 銘柄数とウェイトの数が一致しません。等金額（または時価総額）加重で自動計算します。")
+            df_port_scored = QuantEngine.calculate_portfolio_weights(df_port_scored, user_weights_provided=False)
+
         # ポートフォリオ全体のZスコア（ウェイト加重平均）
         portfolio_z = {}
         factors = ['Beta_Z', 'Value_Z', 'Size_Z', 'Quality_Z', 'Investment_Z']
@@ -154,6 +194,27 @@ if run_button:
             st.subheader("🎯 5ファクター・エクスポージャー")
             # レーダーチャートの描画
             fig_radar = Visualizer.plot_radar_chart(portfolio_z)
+            
+            # -----------------------------------------------------
+            # 【追加】レーダーチャートの動的スケーリング
+            # -----------------------------------------------------
+            # 算出されたZスコアの絶対値の最大を探す
+            max_z_val = 0
+            available_factors = [f for f in factors if f in df_port_scored.columns]
+            if available_factors:
+                max_z_val = df_port_scored[available_factors].abs().max().max()
+            
+            # 基本は±3.0を維持しつつ、飛び抜けた数値があればそれに合わせて枠を広げる（1.1倍の余白）
+            dynamic_range = max(3.0, float(np.ceil(max_z_val * 1.1)))
+            
+            # Plotlyの機能を使って、後からチャートの最大値を書き換える
+            fig_radar.update_polars(
+                radialaxis=dict(
+                    range=[-dynamic_range, dynamic_range],
+                    autorange=False
+                )
+            )
+            
             st.plotly_chart(fig_radar, use_container_width=True)
             
         with col2:
