@@ -12,13 +12,14 @@ class QuantEngine:
     【最新修正版】Zスコア上限撤廃、Value/Sizeの厳密な対数化、ウェイト入力のガードレール強化
     【V17.1追加】特性ベータ(Sensitivity Beta)の逆算ロジック、スマートウェイトの完全化、極性正常化
     【第2工程パッチ】分母ゼロ爆発の防止(Sigma Floor)、対数化前のClip処理、Betaフォールバック強化
+    【第3工程パッチ】Beta行列演算化、動的直交化、動的感応度、最小銘柄数バリデーション追加、Insight英語化
     """
     
     @staticmethod
     def calculate_beta(df_fund, df_hist, df_market=None, benchmark_ticker="1321.T"):
         """
         時系列データからBetaを計算（Rm-Rfの市場プレミアム対応版）
-        ※この値は五角形レーダーチャート用の「回帰ベータ(Regression Beta)」として使用されます。
+        ※行列演算（Vectorized）によりforループのボトルネックを解消
         """
         # 1. df_fund救済
         if not isinstance(df_fund, pd.DataFrame):
@@ -45,43 +46,34 @@ class QuantEngine:
         
         betas = {}
 
-        # 【追加実装】 Rm と Rf を使った理論的Betaの計算ルート
+        # 【修正】 Rm と Rf を使った理論的Betaの計算ルート（行列演算化）
         if df_market is not None and not df_market.empty and 'Rm' in df_market.columns and 'Rf' in df_market.columns:
             try:
-                # Rmは日経平均などの日次リターン、Rfは日次換算済みの無リスク利子率
                 rm_ret = df_market['Rm'].pct_change().dropna()
                 rf_daily = df_market['Rf'].reindex(rm_ret.index).ffill()
-                
-                # 市場プレミアム (Rm - Rf)
                 market_premium = rm_ret - rf_daily
-                bench_var = market_premium.var()
+                
+                # 全銘柄一括でインデックスを揃える
+                aligned_data = pd.concat([rets, market_premium.rename('MarketPremium'), rf_daily.rename('Rf')], axis=1, join='inner').dropna()
+                
+                if not aligned_data.empty:
+                    market_prem_aligned = aligned_data['MarketPremium']
+                    bench_var = market_prem_aligned.var()
 
-                for t in df['Ticker']:
-                    if t in rets.columns:
-                        try:
-                            asset_ret = rets[t]
-                            # インデックスを揃えて欠損値を排除
-                            aligned_data = pd.concat([asset_ret, market_premium, rf_daily], axis=1, join='inner').dropna()
-                            aligned_data.columns = ['Asset', 'MarketPremium', 'Rf']
-                            
-                            # 個別銘柄の超過リターン (Ri - Rf)
-                            asset_premium = aligned_data['Asset'] - aligned_data['Rf']
-                            
-                            # 共分散 / 分散
-                            cov = asset_premium.cov(aligned_data['MarketPremium'])
-                            # 【ガードレール】分散が極端に小さい場合はNaNにして0.00病を防ぐ
-                            betas[t] = cov / bench_var if bench_var > 1e-8 else np.nan
-                        except:
-                            betas[t] = np.nan
-                    else:
-                        betas[t] = np.nan
+                    if bench_var > 1e-8:
+                        # 全銘柄の超過リターンを一括計算
+                        rf_aligned = aligned_data['Rf']
+                        asset_premiums = aligned_data[rets.columns].sub(rf_aligned, axis=0)
+                        
+                        # 行列演算による共分散の一括計算
+                        covariances = asset_premiums.cov(market_prem_aligned)
+                        betas = (covariances / bench_var).to_dict()
             except Exception:
                 # 失敗時は通常のベンチマーク計算へフォールバック
                 df_market = None 
 
-        # 【既存ロジック・修正】 df_marketがない場合のフォールバック（通常のベンチマークリターン）
+        # 【既存ロジック・修正】 df_marketがない場合のフォールバック（行列演算化）
         if df_market is None or df_market.empty:
-            # 2重フォールバック：指定ETFがなければ代替を探す
             if benchmark_ticker not in rets.columns:
                 if "1306.T" in rets.columns:
                     benchmark_ticker = "1306.T"
@@ -94,64 +86,46 @@ class QuantEngine:
             bench_ret = rets[benchmark_ticker]
             bench_var = bench_ret.var()
 
-            for t in df['Ticker']:
-                if t in rets.columns:
-                    try:
-                        cov = rets[t].cov(bench_ret)
-                        betas[t] = cov / bench_var if bench_var > 1e-8 else np.nan
-                    except:
-                        betas[t] = np.nan
-                else:
-                    betas[t] = np.nan
+            if bench_var > 1e-8:
+                # 行列演算による共分散の一括計算
+                covariances = rets.cov(bench_ret)
+                betas = (covariances / bench_var).to_dict()
         
-        df['Beta_Raw'] = df['Ticker'].map(betas)
+        df['Beta_Raw'] = df['Ticker'].map(betas).astype(float)
         return df
 
     # =========================================================================
-    # スマート・ウェイト・エンジン
+    # スマート・ウェイト・エンジン (変更なし)
     # =========================================================================
     @staticmethod
     def calculate_portfolio_weights(df, user_weights_provided=False):
-        """
-        ポートフォリオの重みを算出。
-        手入力ウェイトがない場合、自動的に時価総額（Market Cap）加重計算へ移行します。
-        """
         df_out = df.copy()
         
-        # 1. ユーザー指定ルート (ウェイト入力がある場合)
         if user_weights_provided and 'Weight' in df_out.columns:
-            # 強制的に数値化、変換できない文字は0に
             df_out['Weight'] = pd.to_numeric(df_out['Weight'], errors='coerce').fillna(0)
-            
-            # 【ガードレール】有効な数値が入力されているかチェック
             valid_weights_count = (df_out['Weight'] > 0).sum()
             total_weight = df_out['Weight'].sum()
             
-            # 合計が0より大きく、かつ入力されたウェイトの数が銘柄数と一致しているか
             if total_weight > 0 and valid_weights_count == len(df_out):
                 df_out['Weight'] = df_out['Weight'] / total_weight
                 return df_out
             else:
-                # 数が合わない場合は自動的に下の時価総額加重（または等金額）へ流すため pass する
                 pass
         
-        # 2. 自動計算ルート (時価総額加重へ完全移行)
         if 'MarketCap' in df_out.columns:
             valid_mc = pd.to_numeric(df_out['MarketCap'], errors='coerce').fillna(0)
             mc_sum = valid_mc.sum()
             if mc_sum > 0:
                 df_out['Weight'] = valid_mc / mc_sum
             else:
-                # 時価総額の合計が0になってしまった場合の最終手段
                 df_out['Weight'] = 1.0 / len(df_out)
         else:
-            # MarketCap カラム自体が存在しない場合の最終手段
             df_out['Weight'] = 1.0 / len(df_out)
             
         return df_out
 
     # =========================================================================
-    # ファクター相関行列の算出
+    # ファクター相関行列の算出 (変更なし)
     # =========================================================================
     @staticmethod
     def calculate_factor_correlation(df):
@@ -165,33 +139,24 @@ class QuantEngine:
 
     @staticmethod
     def process_raw_factors(df):
-        """
-        生データをファクター分析用の形式に加工
-        【修正】入力値に対する clip（上限・下限設定）を適用し、対数化による外れ値の暴走を防ぐ
-        """
         # Value (PBR逆数の対数化)
         if 'PBR' in df.columns:
-            # PBRが極端に低い(0.01等)または高い場合をクリップ (0.1 ~ 100倍の範囲)
             clipped_pbr = pd.to_numeric(df['PBR'], errors='coerce').clip(lower=0.1, upper=100.0)
-            # 1/PBR にすることで、「PBRが低い（割安）ほど数値が大きくなる」ように事前反転
             df['Value_Raw'] = clipped_pbr.apply(
                 lambda x: np.log(1/x) if (pd.notnull(x) and x > 0) else np.nan
             )
         
         # Size (時価総額対数)
         if 'Size_Raw' in df.columns:
-            # エラー文字を除去し数値化、時価総額の最低ラインを1億円(1e8)にクリップしマイナス・ゼロを排除
             raw_size = pd.to_numeric(df['Size_Raw'], errors='coerce')
             clipped_size = raw_size.clip(lower=1e8)
-            
             df['Size_Log'] = clipped_size.apply(
                 lambda x: np.log(x) if (pd.notnull(x) and x > 0) else np.nan
             )
-            df['MarketCap'] = raw_size # MarketCap自体は生の数値を使用（加重平均用）
+            df['MarketCap'] = raw_size
         
         # Quality (ROE)
         if 'ROE' in df.columns:
-            # 異常なROE（数千%など）を排除するため上下限設定 (-200% ~ +200%程度に収める)
             df['Quality_Raw'] = pd.to_numeric(df['ROE'], errors='coerce').clip(lower=-2.0, upper=2.0)
         
         # Investment (資産成長率)
@@ -207,7 +172,7 @@ class QuantEngine:
 
     @staticmethod
     def calculate_orthogonalization(df, x_col, y_col):
-        """直交化メソッド"""
+        """直交化メソッド (変更なし)"""
         df_out = df.copy()
         params = {'slope': 0, 'intercept': 0, 'r_squared': 0}
         col_name = f"{y_col}_Orthogonal"
@@ -242,39 +207,69 @@ class QuantEngine:
             return df_out, params
 
     @staticmethod
-    def compute_z_scores(df_target, stats):
+    def compute_z_scores(df_target, stats, ortho_pairs=None):
         """
         Zスコア計算 
-        【修正】分母(Sigma)のゼロ爆発防止Floor実装、極性の正常化
+        【修正】最小銘柄数のバリデーション強化、動的な直交化処理の導入
+        ortho_pairs: 直交化したいペアのリスト。例: [('Quality', 'Investment'), ('Value', 'Size')]
+                     Noneの場合は後方互換性のため stats 内のパラメータから推論します。
         """
         df = df_target.copy()
         r_squared_map = {} 
         
-        slope = stats.get('ortho_slope', 0) if isinstance(stats, dict) else 0
-        intercept = stats.get('ortho_intercept', 0) if isinstance(stats, dict) else 0
-        
-        def apply_ortho(row):
-            try:
-                q = row.get('Quality_Raw', np.nan)
-                i = row.get('Investment_Raw', np.nan)
-                if pd.isna(q): return np.nan
-                if pd.isna(i): return q
-                return q - (slope * i + intercept)
-            except Exception:
-                return np.nan
+        # 動的直交化の適用
+        if ortho_pairs is None:
+            ortho_pairs = [('Quality', 'Investment')] if isinstance(stats, dict) and 'ortho_slope' in stats else []
+
+        for target_factor, predictor_factor in ortho_pairs:
+            target_col = f"{target_factor}_Raw"
+            predictor_col = f"{predictor_factor}_Raw"
+            pair_key = f"ortho_{target_factor}_{predictor_factor}"
             
-        if 'Quality_Raw' in df.columns:
-            df['Quality_Raw_Orthogonal'] = df.apply(apply_ortho, axis=1)
-            df['Quality_Orthogonal'] = df['Quality_Raw_Orthogonal']
+            # statsから傾き・切片を取得（存在しない場合はクロスセクションで簡易計算）
+            if isinstance(stats, dict) and pair_key in stats:
+                slope = stats[pair_key].get('slope', 0)
+                intercept = stats[pair_key].get('intercept', 0)
+            elif isinstance(stats, dict) and 'ortho_slope' in stats and target_factor == 'Quality':
+                slope = stats.get('ortho_slope', 0)
+                intercept = stats.get('ortho_intercept', 0)
+            else:
+                try:
+                    if target_col in df.columns and predictor_col in df.columns:
+                        valid_data = df[[predictor_col, target_col]].dropna()
+                        if len(valid_data) >= 3:
+                            slope, intercept, _, _, _ = linregress(valid_data[predictor_col], valid_data[target_col])
+                        else:
+                            slope, intercept = 0, 0
+                    else:
+                        slope, intercept = 0, 0
+                except:
+                    slope, intercept = 0, 0
+            
+            ortho_col_name = f"{target_factor}_Raw_Orthogonal"
+            
+            def apply_ortho(row):
+                try:
+                    y = row.get(target_col, np.nan)
+                    x = row.get(predictor_col, np.nan)
+                    if pd.isna(y): return np.nan
+                    if pd.isna(x): return y
+                    return y - (slope * x + intercept)
+                except Exception:
+                    return np.nan
+            
+            if target_col in df.columns:
+                df[ortho_col_name] = df.apply(apply_ortho, axis=1)
+                df[f"{target_factor}_Orthogonal"] = df[ortho_col_name]
 
         factors = ['Beta', 'Value', 'Size', 'Quality', 'Investment']
 
         fallback_cols = {
             'Quality': ['Quality_Raw_Orthogonal', 'Quality_Orthogonal', 'Quality_Raw', 'ROE'],
-            'Value': ['Value_Raw', 'PBR'],
-            'Size': ['Size_Log', 'Size_Raw', 'MarketCap'],
-            'Investment': ['Investment_Raw', 'Growth'],
-            'Beta': ['Beta_Raw']
+            'Value': ['Value_Raw_Orthogonal', 'Value_Orthogonal', 'Value_Raw', 'PBR'],
+            'Size': ['Size_Raw_Orthogonal', 'Size_Log', 'Size_Raw', 'MarketCap'],
+            'Investment': ['Investment_Raw_Orthogonal', 'Investment_Raw', 'Growth'],
+            'Beta': ['Beta_Raw_Orthogonal', 'Beta_Raw']
         }
 
         # 各ファクターについて処理
@@ -297,7 +292,12 @@ class QuantEngine:
 
             numeric_series = pd.to_numeric(df[target_col], errors='coerce').replace([np.inf, -np.inf], np.nan)
 
-            # ユニバース(stats)がある場合と、ローカル計算のみの場合で分岐
+            # 【追加バリデーション】ユニバースが極端に少ない場合のガードレール
+            valid_count = numeric_series.notna().sum()
+            if valid_count < 3:
+                df[z_col] = 0.0
+                continue
+
             if isinstance(stats, dict) and f in stats and 'median' in stats[f]:
                 mu = stats[f]['median']
                 raw_sigma = stats[f].get('mad', 1e-6)
@@ -319,25 +319,20 @@ class QuantEngine:
                 
                 z = (val - mu) / sigma
                 
-                # 【極性の正常化】
                 if f == 'Size':
-                    # 時価総額が小さいほどプラス（小型株効果）
                     z = -z 
                 elif f == 'Investment':
-                    # 資産成長率が低い（保守的）ほどプラス
                     z = -z 
-                # ※ Valueは process_raw_factors で np.log(1/PBR) に変換済みのためそのまま
                 
                 return z
             
             df[z_col] = numeric_series.apply(calc_z)
             
-        # 最終的にNaNがあれば0.0に置換して0.00病から脱却するが、計算自体は通す
         for f in factors:
             z_col = f"{f}_Z"
             if z_col not in df.columns:
                 df[z_col] = 0.0
-            else:
+                else:
                 df[z_col] = df[z_col].fillna(0.0)
             
         return df, r_squared_map
@@ -346,24 +341,39 @@ class QuantEngine:
     # 特性ベータ（Sensitivity Beta）の逆算ロジック
     # =========================================================================
     @staticmethod
-    def calculate_sensitivity_beta(df, market_sensitivities=None):
+    def calculate_sensitivity_beta(df, market_sensitivities='dynamic'):
         """
-        Zスコアからファクター感応度を加重平均し、特性ベータ（Sensitivity Beta）を算出する。
-        下部の寄与度グラフ用に使用されます。
+        Zスコアからファクター感応度を加重平均し、特性ベータ（Sensitivity Beta）を算出。
+        【修正】引数に'dynamic'を渡すことで、ユニバース内のBetaとの相関から動的に係数を算出。
         """
-        if market_sensitivities is None:
-            # デフォルトの市場感応度係数
+        df_out = df.copy()
+
+        if market_sensitivities == 'dynamic':
+            market_sensitivities = {}
+            factors_to_check = ['Size_Z', 'Value_Z', 'Quality_Z', 'Investment_Z']
+            
+            # Beta_Zが存在し、かつサンプルサイズが最低限ある場合のみ動的計算
+            if 'Beta_Z' in df_out.columns and df_out['Beta_Z'].notna().sum() >= 5:
+                for f in factors_to_check:
+                    if f in df_out.columns:
+                        corr = df_out['Beta_Z'].corr(df_out[f])
+                        market_sensitivities[f] = corr if pd.notna(corr) else 0.0
+            else:
+                # フォールバック (デフォルトの市場感応度係数)
+                market_sensitivities = {
+                    'Size_Z': 0.25, 
+                    'Value_Z': -0.15, 
+                    'Quality_Z': -0.20, 
+                    'Investment_Z': -0.10 
+                }
+        elif market_sensitivities is None:
             market_sensitivities = {
-                'Size_Z': 0.25,       # 小型株ほど市場変動の影響を受けやすい
-                'Value_Z': -0.15,     # 割安株は下値が固く、連動性が低い
-                'Quality_Z': -0.20,   # 高収益企業は独自の値動きをしやすく連動性が低い
-                'Investment_Z': -0.10 # 保守的な企業は変動がマイルド
+                'Size_Z': 0.25, 'Value_Z': -0.15, 'Quality_Z': -0.20, 'Investment_Z': -0.10
             }
 
-        df_out = df.copy()
         sensitivity_sum = pd.Series(0.0, index=df_out.index)
         
-        # 係数の絶対値合計で割ることで、Zスコアのスケール感（±3.0程度）を維持する
+        # 係数の絶対値合計で割ることで、Zスコアのスケール感を維持する
         total_weight = sum(abs(v) for v in market_sensitivities.values())
         
         for factor_col, weight in market_sensitivities.items():
@@ -379,7 +389,11 @@ class QuantEngine:
 
     @staticmethod
     def generate_insights(z_scores):
-        """インサイト生成 (5ファクター対応版)"""
+        """
+        インサイト生成 (5ファクター対応版)
+        【修正】PDFでのUnicode/フォントレンダリングエラーを完全に回避するため、
+        出力テキストを純粋な英語（絵文字・全角文字なし）に置き換えました。
+        """
         insights = []
         
         z_size = z_scores.get('Size', 0)
@@ -389,30 +403,30 @@ class QuantEngine:
 
         # 1. Size
         if z_size < -0.7:
-            insights.append("🐘 **大型株中心**: 財務基盤が安定した大型株への配分が高く、市場変動に対する耐久性が期待できます。")
+            insights.append("Large Cap Focus: High allocation to large-cap stocks with stable financial foundations, providing resilience against market volatility.")
         elif z_size > 0.7:
-            insights.append("🚀 **小型株効果**: 時価総額の小さい銘柄が多く、市場平均を上回る成長ポテンシャルを秘めています。")
+            insights.append("Small Cap Effect: Weighted towards smaller market capitalization stocks, offering potential to outperform the market average.")
         
         # 2. Value
         if z_val > 0.7:
-            insights.append("💰 **バリュー投資**: 純資産に対して割安な銘柄が多く、下値リスクが限定的である可能性があります。")
+            insights.append("Value Investing: Consists of stocks trading at a discount to their book value, potentially limiting downside risk.")
         elif z_val < -0.7:
-            insights.append("💎 **グロース寄り**: 将来の成長期待が高い銘柄が含まれており、割高でも買われている傾向があります。")
+            insights.append("Growth Tilt: Includes stocks with high future growth expectations, typically trading at premium valuations.")
 
         # 3. Quality
         if z_qual > 0.7:
-            insights.append("👑 **高クオリティ**: 収益性(ROE)が高く、経営効率の良い「質の高い」企業群です。")
+            insights.append("High Quality: Dominated by high-quality companies characterized by strong profitability (ROE) and operational efficiency.")
 
         # 4. Investment
         if z_inv > 0.7:
-            insights.append("🛡️ **保守的経営**: 資産拡大を抑え、筋肉質な経営を行っている企業群です（CMA効果）。")
+            insights.append("Conservative Management: Companies maintaining disciplined asset growth and lean operations (CMA effect).")
         elif z_inv < -0.7:
-            insights.append("🏗️ **積極投資**: 設備投資や資産拡大に積極的な企業が含まれています（過剰投資リスクに注意）。")
+            insights.append("Aggressive Investment: Includes companies aggressively expanding capital expenditures and assets (monitor for over-investment risks).")
 
         if z_qual > 0.5 and z_val > 0.5:
-            insights.append("✨ **クオリティ・バリュー**: 質が高いのに割安に放置されている、理想的な銘柄群が含まれています。")
+            insights.append("Quality Value: An ideal mix of high-quality companies that are currently undervalued by the market.")
 
         if not insights:
-            insights.append("⚖️ **市場中立 (バランス型)**: 特定のファクターへの偏りが少なく、インデックス（市場平均）に近い安定した構成です。")
+            insights.append("Market Neutral (Balanced): Minimal tilt towards specific factors, representing a stable composition closely mirroring the market average.")
             
         return insights
