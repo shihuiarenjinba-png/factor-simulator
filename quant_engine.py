@@ -9,13 +9,13 @@ class QuantEngine:
     【工程3】引き渡しミスの徹底排除と診断スピードの極限化
     【完了版 Step 6】ZスコアのNone撲滅、自己補完フォールバックによる0.00病の根絶
     【NEW版 Step 7】Rm-RfベースのBeta計算、時価総額加重(MCW)ロジック、ファクター相関行列の追加
+    【最新修正版】Zスコア上限撤廃、Value/Sizeの厳密な対数化、ウェイト入力のガードレール強化
     """
     
     @staticmethod
     def calculate_beta(df_fund, df_hist, df_market=None, benchmark_ticker="1321.T"):
         """
         時系列データからBetaを計算（Rm-Rfの市場プレミアム対応版）
-        df_market: data_provider.fetch_market_rates() から取得した Rm, Rf を含むDataFrame
         """
         # 1. df_fund救済
         if not isinstance(df_fund, pd.DataFrame):
@@ -98,24 +98,33 @@ class QuantEngine:
         return df
 
     # =========================================================================
-    # 【追加実装】 重みの決定ロジック (MCW vs ユーザー指定)
+    # 【修正】 重みの決定ロジック ガードレール設置
     # =========================================================================
     @staticmethod
     def calculate_portfolio_weights(df, user_weights_provided=False):
         """
-        ポートフォリオの重み（Weight）を算出・正規化する。
-        user_weights_provided が True かつ 'Weight' 列が存在すればそれを採用。
-        それ以外は時価総額（MarketCap）に基づく加重平均（MCW）とする。
+        ポートフォリオの重みを算出。
+        手入力ウェイトの不整合（数が合わない、文字が混ざっている等）による
+        計算のショート（全値0化）を防ぐ強力なガードレールを追加。
         """
         df_out = df.copy()
         
         # 1. ユーザー指定ルート
         if user_weights_provided and 'Weight' in df_out.columns:
-            # 文字列等が混ざっている場合の対策
+            # 強制的に数値化、変換できない文字は0に
             df_out['Weight'] = pd.to_numeric(df_out['Weight'], errors='coerce').fillna(0)
+            
+            # 【ガードレール】有効な数値が入力されているかチェック
+            valid_weights_count = (df_out['Weight'] > 0).sum()
             total_weight = df_out['Weight'].sum()
-            if total_weight > 0:
+            
+            # 合計が0より大きく、かつ入力されたウェイトの数が銘柄数と一致しているか
+            if total_weight > 0 and valid_weights_count == len(df_out):
                 df_out['Weight'] = df_out['Weight'] / total_weight
+                return df_out
+            else:
+                # 数が合わない、あるいは不正な値により0になってしまった場合は「等金額加重」に強制フォールバック
+                df_out['Weight'] = 1.0 / len(df_out)
                 return df_out
         
         # 2. 自動計算ルート (時価総額加重)
@@ -125,7 +134,7 @@ class QuantEngine:
             if mc_sum > 0:
                 df_out['Weight'] = valid_mc / mc_sum
             else:
-                # 時価総額すら取れなかった場合の最終防衛線（等金額加重）
+                # 時価総額が取れなかった場合
                 df_out['Weight'] = 1.0 / len(df_out)
         else:
             df_out['Weight'] = 1.0 / len(df_out)
@@ -133,19 +142,14 @@ class QuantEngine:
         return df_out
 
     # =========================================================================
-    # 【追加実装】 ファクター相関行列の算出
+    # ファクター相関行列の算出
     # =========================================================================
     @staticmethod
     def calculate_factor_correlation(df):
-        """
-        ポートフォリオ内銘柄のZスコアを用いて、5つのファクター間のPearson相関係数を算出する。
-        """
         factors = ['Beta_Z', 'Value_Z', 'Size_Z', 'Quality_Z', 'Investment_Z']
-        # 実際にDataFrameに存在するカラムのみ抽出
         existing_factors = [f for f in factors if f in df.columns]
         
         if len(existing_factors) > 1:
-            # 相関行列を計算し、欠損値は0で埋める（描画エラー防止）
             corr_matrix = df[existing_factors].corr().fillna(0)
             return corr_matrix
         return pd.DataFrame()
@@ -154,17 +158,24 @@ class QuantEngine:
     def process_raw_factors(df):
         """
         生データをファクター分析用の形式に加工
-        【修正】BS（Total_Assets）依存を完全廃止し、Growthカラムを採用
+        【修正】ValueとSizeに確実な対数(Log)処理を適用し、数値の爆発を抑制
         """
-        # Value (PBR逆数)
+        # Value (PBR逆数の対数化)
         if 'PBR' in df.columns:
-            df['Value_Raw'] = df['PBR'].apply(lambda x: 1/x if (pd.notnull(x) and x > 0) else np.nan)
+            # PBRが0以下などの異常値はNaNにし、正常値のみ np.log(1/PBR) を適用
+            df['Value_Raw'] = df['PBR'].apply(
+                lambda x: np.log(1/x) if (pd.notnull(x) and x > 0) else np.nan
+            )
         
         # Size (時価総額対数)
         if 'Size_Raw' in df.columns:
-            df['Size_Log'] = np.log(pd.to_numeric(df['Size_Raw'], errors='coerce').replace(0, np.nan))
-            # app.pyの表示ロジックに合わせて 'MarketCap' カラムを明示的に作成
-            df['MarketCap'] = pd.to_numeric(df['Size_Raw'], errors='coerce')
+            # エラー文字を除去し数値化
+            raw_size = pd.to_numeric(df['Size_Raw'], errors='coerce')
+            # 確実に対数化（マイナスやゼロはNaNにして0.00病を防ぐ）
+            df['Size_Log'] = raw_size.apply(
+                lambda x: np.log(x) if (pd.notnull(x) and x > 0) else np.nan
+            )
+            df['MarketCap'] = raw_size
         
         # Quality (ROE)
         if 'ROE' in df.columns:
@@ -220,12 +231,13 @@ class QuantEngine:
     @staticmethod
     def compute_z_scores(df_target, stats):
         """
-        Zスコア計算 (市場基準がない場合はポートフォリオ内で自己完結させるフォールバックを追加)
+        Zスコア計算 
+        【修正】3.0のクリップ（リミッター）を解除し、順位を視覚化できるように変更。
+        また、0.00病を防ぐため、MAD(中央値絶対偏差)を標準偏差に近似させるスケーリングを追加。
         """
         df = df_target.copy()
         r_squared_map = {} 
         
-        # 市場全体（ベンチマーク）で算出した回帰係数を取得 (無い場合は0)
         slope = stats.get('ortho_slope', 0) if isinstance(stats, dict) else 0
         intercept = stats.get('ortho_intercept', 0) if isinstance(stats, dict) else 0
         
@@ -243,10 +255,8 @@ class QuantEngine:
             df['Quality_Raw_Orthogonal'] = df.apply(apply_ortho, axis=1)
             df['Quality_Orthogonal'] = df['Quality_Raw_Orthogonal']
 
-        # 評価対象の5ファクターを定義
         factors = ['Beta', 'Value', 'Size', 'Quality', 'Investment']
 
-        # カラム名が多少ズレても、関連する生データを使って計算を完遂させる
         fallback_cols = {
             'Quality': ['Quality_Raw_Orthogonal', 'Quality_Orthogonal', 'Quality_Raw', 'ROE'],
             'Value': ['Value_Raw', 'PBR'],
@@ -258,10 +268,8 @@ class QuantEngine:
         for f in factors:
             z_col = f"{f}_Z"
             
-            # 1. ターゲットとなる生データのカラムを特定
             target_col = stats[f].get('col') if isinstance(stats, dict) and f in stats else None
             
-            # 引き渡しミス防止：target_colがユーザーDFにない場合の救済措置
             if not target_col or target_col not in df.columns:
                 found_col = None
                 for candidate in fallback_cols.get(f, []):
@@ -270,25 +278,24 @@ class QuantEngine:
                         break
                 
                 if not found_col:
-                    # 生データ自体が存在しない場合は計算不可のため 0.0 を代入
                     df[z_col] = 0.0
                     continue 
                 target_col = found_col
 
-            # 強制的に数値型へ変換
-            numeric_series = pd.to_numeric(df[target_col], errors='coerce')
+            # 強制的に数値型へ変換、無限大はNaNにして0.00病を防止
+            numeric_series = pd.to_numeric(df[target_col], errors='coerce').replace([np.inf, -np.inf], np.nan)
 
-            # 2. 中央値(mu)と分散(sigma)の取得（市場データがなければポートフォリオ内で自己計算）
             if isinstance(stats, dict) and f in stats and 'median' in stats[f]:
                 mu = stats[f]['median']
-                sigma = stats[f].get('mad', 1e-6)
+                # 市場MADに1.4826を掛けて標準偏差(SD)相当にスケールアップし、Zスコアの異常な肥大化を防ぐ
+                raw_sigma = stats[f].get('mad', 1e-6)
+                sigma = (raw_sigma * 1.4826) if pd.notna(raw_sigma) and raw_sigma > 1e-6 else 1e-6
             else:
-                # 【極めて重要】市場基準がない場合の自己補完ロジック
                 mu = numeric_series.median()
                 mad = (numeric_series - mu).abs().median()
-                sigma = mad if pd.notna(mad) and mad > 0 else 1e-6
+                # 自己計算MADにも同様に1.4826を掛ける
+                sigma = (mad * 1.4826) if pd.notna(mad) and mad > 0 else 1e-6
                 
-                # ポートフォリオ内のデータが全てNaNの場合は計算不可
                 if pd.isna(mu):
                     df[z_col] = 0.0
                     continue
@@ -296,23 +303,22 @@ class QuantEngine:
             if sigma == 0: sigma = 1e-6
 
             def calc_z(val):
-                # 欠損値や無限大は「計算不可（NaN）」として扱い、安易に0にしない
                 if pd.isna(val) or np.isinf(val): return np.nan 
                 
                 z = (val - mu) / sigma
                 
-                # サイズとInvestmentの反転ロジック
                 if f == 'Size' or f == 'Investment': 
                     z = -z 
                 
-                # クリップ処理 (異常値のWinsorization)
-                if z > 3.0: z = 3.0
-                if z < -3.0: z = -3.0
+                # 【修正: リミッター解除】
+                # if z > 3.0: z = 3.0
+                # if z < -3.0: z = -3.0
+                # 上記を完全に削除しました。これにより突出したスコアもそのまま出力されます。
+                
                 return z
             
             df[z_col] = numeric_series.apply(calc_z)
             
-        # 【最終防衛線】 チャート描画エラーを防ぐため、最終的に残ったNaNのみ0.0で埋める
         for f in factors:
             z_col = f"{f}_Z"
             if z_col not in df.columns:
@@ -354,7 +360,6 @@ class QuantEngine:
         elif z_inv < -0.7:
             insights.append("🏗️ **積極投資**: 設備投資や資産拡大に積極的な企業が含まれています（過剰投資リスクに注意）。")
 
-        # 複合条件
         if z_qual > 0.5 and z_val > 0.5:
             insights.append("✨ **クオリティ・バリュー**: 質が高いのに割安に放置されている、理想的な銘柄群が含まれています。")
 
