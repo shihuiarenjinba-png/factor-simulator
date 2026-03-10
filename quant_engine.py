@@ -11,6 +11,7 @@ class QuantEngine:
     【NEW版 Step 7】Rm-RfベースのBeta計算、時価総額加重(MCW)ロジック、ファクター相関行列の追加
     【最新修正版】Zスコア上限撤廃、Value/Sizeの厳密な対数化、ウェイト入力のガードレール強化
     【V17.1追加】特性ベータ(Sensitivity Beta)の逆算ロジック、スマートウェイトの完全化、極性正常化
+    【第2工程パッチ】分母ゼロ爆発の防止(Sigma Floor)、対数化前のClip処理、Betaフォールバック強化
     """
     
     @staticmethod
@@ -68,6 +69,7 @@ class QuantEngine:
                             
                             # 共分散 / 分散
                             cov = asset_premium.cov(aligned_data['MarketPremium'])
+                            # 【ガードレール】分散が極端に小さい場合はNaNにして0.00病を防ぐ
                             betas[t] = cov / bench_var if bench_var > 1e-8 else np.nan
                         except:
                             betas[t] = np.nan
@@ -77,11 +79,17 @@ class QuantEngine:
                 # 失敗時は通常のベンチマーク計算へフォールバック
                 df_market = None 
 
-        # 【既存ロジック】 df_marketがない場合のフォールバック（通常のベンチマークリターン）
+        # 【既存ロジック・修正】 df_marketがない場合のフォールバック（通常のベンチマークリターン）
         if df_market is None or df_market.empty:
+            # 2重フォールバック：指定ETFがなければ代替を探す
             if benchmark_ticker not in rets.columns:
-                df['Beta_Raw'] = np.nan
-                return df
+                if "1306.T" in rets.columns:
+                    benchmark_ticker = "1306.T"
+                elif "^N225" in rets.columns:
+                    benchmark_ticker = "^N225"
+                else:
+                    df['Beta_Raw'] = np.nan
+                    return df
 
             bench_ret = rets[benchmark_ticker]
             bench_var = bench_ret.var()
@@ -100,7 +108,7 @@ class QuantEngine:
         return df
 
     # =========================================================================
-    # 【修正】 スマート・ウェイト・エンジン
+    # スマート・ウェイト・エンジン
     # =========================================================================
     @staticmethod
     def calculate_portfolio_weights(df, user_weights_provided=False):
@@ -159,33 +167,37 @@ class QuantEngine:
     def process_raw_factors(df):
         """
         生データをファクター分析用の形式に加工
-        【修正】極性の事前準備。ValueとSizeに確実な対数(Log)処理を適用。
+        【修正】入力値に対する clip（上限・下限設定）を適用し、対数化による外れ値の暴走を防ぐ
         """
         # Value (PBR逆数の対数化)
         if 'PBR' in df.columns:
+            # PBRが極端に低い(0.01等)または高い場合をクリップ (0.1 ~ 100倍の範囲)
+            clipped_pbr = pd.to_numeric(df['PBR'], errors='coerce').clip(lower=0.1, upper=100.0)
             # 1/PBR にすることで、「PBRが低い（割安）ほど数値が大きくなる」ように事前反転
-            df['Value_Raw'] = df['PBR'].apply(
+            df['Value_Raw'] = clipped_pbr.apply(
                 lambda x: np.log(1/x) if (pd.notnull(x) and x > 0) else np.nan
             )
         
         # Size (時価総額対数)
         if 'Size_Raw' in df.columns:
-            # エラー文字を除去し数値化
+            # エラー文字を除去し数値化、時価総額の最低ラインを1億円(1e8)にクリップしマイナス・ゼロを排除
             raw_size = pd.to_numeric(df['Size_Raw'], errors='coerce')
-            # 確実に対数化（マイナスやゼロはNaNにして0.00病を防ぐ）
-            df['Size_Log'] = raw_size.apply(
+            clipped_size = raw_size.clip(lower=1e8)
+            
+            df['Size_Log'] = clipped_size.apply(
                 lambda x: np.log(x) if (pd.notnull(x) and x > 0) else np.nan
             )
-            df['MarketCap'] = raw_size
+            df['MarketCap'] = raw_size # MarketCap自体は生の数値を使用（加重平均用）
         
         # Quality (ROE)
         if 'ROE' in df.columns:
-            df['Quality_Raw'] = pd.to_numeric(df['ROE'], errors='coerce')
+            # 異常なROE（数千%など）を排除するため上下限設定 (-200% ~ +200%程度に収める)
+            df['Quality_Raw'] = pd.to_numeric(df['ROE'], errors='coerce').clip(lower=-2.0, upper=2.0)
         
         # Investment (資産成長率)
         try:
             if 'Growth' in df.columns:
-                df['Investment_Raw'] = pd.to_numeric(df['Growth'], errors='coerce')
+                df['Investment_Raw'] = pd.to_numeric(df['Growth'], errors='coerce').clip(lower=-1.0, upper=3.0)
             else:
                 df['Investment_Raw'] = np.nan
         except Exception:
@@ -233,7 +245,7 @@ class QuantEngine:
     def compute_z_scores(df_target, stats):
         """
         Zスコア計算 
-        【修正】極性の正常化（小型株・バリュー株ほどプラスに出るよう調整）
+        【修正】分母(Sigma)のゼロ爆発防止Floor実装、極性の正常化
         """
         df = df_target.copy()
         r_squared_map = {} 
@@ -265,6 +277,7 @@ class QuantEngine:
             'Beta': ['Beta_Raw']
         }
 
+        # 各ファクターについて処理
         for f in factors:
             z_col = f"{f}_Z"
             
@@ -284,6 +297,7 @@ class QuantEngine:
 
             numeric_series = pd.to_numeric(df[target_col], errors='coerce').replace([np.inf, -np.inf], np.nan)
 
+            # ユニバース(stats)がある場合と、ローカル計算のみの場合で分岐
             if isinstance(stats, dict) and f in stats and 'median' in stats[f]:
                 mu = stats[f]['median']
                 raw_sigma = stats[f].get('mad', 1e-6)
@@ -293,31 +307,32 @@ class QuantEngine:
                 mad = (numeric_series - mu).abs().median()
                 sigma = (mad * 1.4826) if pd.notna(mad) and mad > 0 else 1e-6
                 
-                if pd.isna(mu):
-                    df[z_col] = 0.0
-                    continue
+            if pd.isna(mu):
+                df[z_col] = 0.0
+                continue
 
-            if sigma == 0: sigma = 1e-6
+            # 【ガードレール】分母（sigma）に最小閾値（0.01）を設け、Zスコアの異常な爆発を防ぐ
+            sigma = max(sigma, 0.01)
 
             def calc_z(val):
                 if pd.isna(val) or np.isinf(val): return np.nan 
                 
                 z = (val - mu) / sigma
                 
-                # 【修正: 極性の正常化】
+                # 【極性の正常化】
                 if f == 'Size':
                     # 時価総額が小さいほどプラス（小型株効果）
                     z = -z 
                 elif f == 'Investment':
                     # 資産成長率が低い（保守的）ほどプラス
                     z = -z 
-                # ※ Valueは process_raw_factors で np.log(1/PBR) に変換済みのため、
-                # そのまま計算することで「割安（低PBR）ほどプラス」になります。
+                # ※ Valueは process_raw_factors で np.log(1/PBR) に変換済みのためそのまま
                 
                 return z
             
             df[z_col] = numeric_series.apply(calc_z)
             
+        # 最終的にNaNがあれば0.0に置換して0.00病から脱却するが、計算自体は通す
         for f in factors:
             z_col = f"{f}_Z"
             if z_col not in df.columns:
@@ -328,7 +343,7 @@ class QuantEngine:
         return df, r_squared_map
 
     # =========================================================================
-    # 【新規追加】特性ベータ（Sensitivity Beta）の逆算ロジック
+    # 特性ベータ（Sensitivity Beta）の逆算ロジック
     # =========================================================================
     @staticmethod
     def calculate_sensitivity_beta(df, market_sensitivities=None):
@@ -337,8 +352,7 @@ class QuantEngine:
         下部の寄与度グラフ用に使用されます。
         """
         if market_sensitivities is None:
-            # デフォルトの市場感応度係数（マジックナンバー）
-            # 一般的なファクター特性：小型(+)はハイベータ、バリュー(+)や高クオリティ(+)はローベータ傾向
+            # デフォルトの市場感応度係数
             market_sensitivities = {
                 'Size_Z': 0.25,       # 小型株ほど市場変動の影響を受けやすい
                 'Value_Z': -0.15,     # 割安株は下値が固く、連動性が低い
@@ -354,7 +368,6 @@ class QuantEngine:
         
         for factor_col, weight in market_sensitivities.items():
             if factor_col in df_out.columns:
-                # \sum (Z_i * Weight_i)
                 sensitivity_sum += df_out[factor_col].fillna(0.0) * weight
         
         if total_weight > 0:
