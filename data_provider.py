@@ -1,5 +1,6 @@
 import os
 import datetime
+import time # 【追加】スリープ用
 import requests
 import pandas as pd
 import numpy as np
@@ -12,15 +13,17 @@ from urllib3.util.retry import Retry
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 4.1: 堅牢化パッチ適用版)
+    【Module 1】データ取得プロバイダー (Ver. 4.2: アクセス制限・429エラー対策強化版)
     - Tickerの自動正規化（Excelの数値変換エラー、.JP等の表記揺れを.Tに統一）
     - yf.Tickersによるバルク取得とセッション管理の強化
     - FMP APIへの強力な自動フォールバック（None撲滅）
     - JPX公式リストのローカルキャッシュによる高速なユニバース展開
     - Beta計算用の市場プレミアム (Rm, Rf) 取得ロジック
-    - 【NEW】yfinanceマルチインデックスの安全な解体抽出
-    - 【NEW】ユニバースの最低ライン確保（50銘柄フォールバック）
-    - 【NEW】NoneTypeイテラブル・エラーの完全ガード
+    - yfinanceマルチインデックスの安全な解体抽出
+    - ユニバースの最低ライン確保（50銘柄フォールバック）
+    - NoneTypeイテラブル・エラーの完全ガード
+    - 【NEW】セッションヘッダーのブラウザ偽装強化 (User-Agent等)
+    - 【NEW】APIフォールバック時のレートリミット回避 (time.sleep)
     """
     
     FMP_API_KEY = st.secrets.get("FMP_API_KEY", os.environ.get("FMP_API_KEY"))
@@ -48,12 +51,29 @@ class DataProvider:
 
     @staticmethod
     def _create_session():
+        """
+        【修正】HTTPセッションの作成とヘッダーの偽装強化
+        Yahoo Financeのブロック（429 Too Many Requests 等）を回避するため、
+        一般的なブラウザと同じヘッダー情報を追加します。
+        """
         session = requests.Session()
         session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0"
         })
         retries = Retry(
-            total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504],
+            total=3, # リトライ回数を少し増やす
+            backoff_factor=1.0, # リトライ間隔を長めにとる
+            status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS"]
         )
         session.mount("https://", HTTPAdapter(max_retries=retries))
@@ -84,8 +104,8 @@ class DataProvider:
     def get_jpx_universe():
         """
         JPXの公式リストを読み込みます。
-        【修正】ローカルのCSVがない場合、統計の安定性を担保するため
-        日経225の主要50銘柄をフォールバックとして返します（旧:11銘柄）。
+        ローカルのCSVがない場合、統計の安定性を担保するため
+        日経225の主要50銘柄をフォールバックとして返します。
         """
         file_path = "jpx_list.csv"
         if os.path.exists(file_path):
@@ -96,7 +116,6 @@ class DataProvider:
             except Exception as e:
                 st.warning(f"JPXリストの読み込みに失敗しました: {e}")
         
-        # CSVがない場合のフォールバック（日経225の主要50銘柄。これ以下だとZスコアが爆発しやすくなる）
         fallback_tickers = [
             "7203.T", "8306.T", "9984.T", "6861.T", "8035.T", "9432.T", "6758.T", "8316.T", "4063.T", "8058.T",
             "6098.T", "4502.T", "6902.T", "8001.T", "8766.T", "7974.T", "4568.T", "8031.T", "6501.T", "7741.T",
@@ -145,20 +164,22 @@ class DataProvider:
         rescued_data = {}
         
         def fetch_one(t_orig):
+            # 【修正】APIリクエスト間に微小なスリープを入れ、レートリミットを回避
+            time.sleep(0.5) 
             symbol = t_orig.replace(".T", ".JP") if ".T" in t_orig else t_orig
             url_ratios = f"https://financialmodelingprep.com/api/v3/ratios-ttm/{symbol}?apikey={api_key}"
             url_growth = f"https://financialmodelingprep.com/api/v3/financial-growth/{symbol}?limit=1&apikey={api_key}"
             
             data_res = {}
             try:
-                r = requests.get(url_ratios, timeout=3)
+                r = requests.get(url_ratios, timeout=5)
                 if r.status_code == 200:
                     items = r.json()
                     if items:
                         data_res['ROE'] = items[0].get('returnOnEquityTTM')
                         data_res['PBR'] = items[0].get('priceToBookRatioTTM')
                 
-                r_g = requests.get(url_growth, timeout=3)
+                r_g = requests.get(url_growth, timeout=5)
                 if r_g.status_code == 200:
                     g_items = r_g.json()
                     if g_items:
@@ -168,7 +189,8 @@ class DataProvider:
             except Exception:
                 return t_orig, None
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        # サーバーへの負荷を下げるため、スレッド数を少し減らす (5 -> 3)
+        with ThreadPoolExecutor(max_workers=3) as executor:
             results = list(executor.map(fetch_one, ticker_list))
         
         for t, data in results:
@@ -186,10 +208,12 @@ class DataProvider:
         start_date = end_date - datetime.timedelta(days=days)
         
         def fetch_hist_one(t_orig):
+            # 【修正】APIリクエスト間に微小なスリープを入れ、レートリミットを回避
+            time.sleep(0.5)
             symbol = t_orig.replace(".T", ".JP") if ".T" in t_orig else t_orig
             url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?from={start_date}&to={end_date}&apikey={api_key}"
             try:
-                r = requests.get(url, timeout=3)
+                r = requests.get(url, timeout=5)
                 if r.status_code == 200:
                     data = r.json()
                     if 'historical' in data:
@@ -202,7 +226,8 @@ class DataProvider:
                 pass
             return t_orig, None
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        # サーバーへの負荷を下げるため、スレッド数を少し減らす (5 -> 3)
+        with ThreadPoolExecutor(max_workers=3) as executor:
             results = list(executor.map(fetch_hist_one, ticker_list))
 
         for t, series in results:
@@ -231,7 +256,7 @@ class DataProvider:
                 if not tk: return None
                 
                 info = tk.info
-                # 【修正】 info が None の場合、TypeError (is not iterable) を避けるため空の辞書を生成
+                # info が None の場合、TypeError (is not iterable) を避けるため空の辞書を生成
                 if info is None:
                     info = {}
                 
@@ -253,7 +278,8 @@ class DataProvider:
                     'PBR': np.nan, 'ROE': np.nan, 'Sector_Raw': 'Unknown', 'Growth': np.nan
                 }
 
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        # Yahoo Finance側の制限を回避するため、スレッド数を少し絞る (8 -> 4)
+        with ThreadPoolExecutor(max_workers=4) as executor:
             results = list(executor.map(get_yf_stock, unique_tickers))
         
         valid_data = [d for d in results if d is not None]
@@ -319,7 +345,7 @@ class DataProvider:
 
             result_df = pd.DataFrame()
 
-            # 【修正】yfinanceの返り値が単一銘柄か複数銘柄かで処理を厳密に分ける
+            # yfinanceの返り値が単一銘柄か複数銘柄かで処理を厳密に分ける
             if len(unique_tickers) == 1:
                 t = unique_tickers[0]
                 # 単一銘柄の場合、マルチインデックスにならないケースがある
