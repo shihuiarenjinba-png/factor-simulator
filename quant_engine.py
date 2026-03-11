@@ -13,7 +13,7 @@ class QuantEngine:
     【V17.1追加】特性ベータ(Sensitivity Beta)の逆算ロジック、スマートウェイトの完全化、極性正常化
     【第2工程パッチ】分母ゼロ爆発の防止(Sigma Floor)、対数化前のClip処理、Betaフォールバック強化
     【第3工程パッチ】Beta行列演算化、動的直交化、動的感応度、最小銘柄数バリデーション追加、Insight英語化
-    【SyntaxError修正パッチ】Zスコア計算時のインデントエラーを修正
+    【SyntaxError修正パッチ】Zスコア計算時のインデントエラーと不可視文字を完全排除
     """
     
     @staticmethod
@@ -333,7 +333,7 @@ class QuantEngine:
             z_col = f"{f}_Z"
             if z_col not in df.columns:
                 df[z_col] = 0.0
-            # 【修正箇所】以前のコードでSyntaxError(invalid syntax)になっていたインデントを修正
+            # 【重要】以前インデントがずれてSyntaxErrorになっていた箇所を厳密に修正
             else:
                 df[z_col] = df[z_col].fillna(0.0)
             
