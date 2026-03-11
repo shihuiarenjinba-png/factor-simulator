@@ -13,6 +13,7 @@ class QuantEngine:
     【V17.1追加】特性ベータ(Sensitivity Beta)の逆算ロジック、スマートウェイトの完全化、極性正常化
     【第2工程パッチ】分母ゼロ爆発の防止(Sigma Floor)、対数化前のClip処理、Betaフォールバック強化
     【第3工程パッチ】Beta行列演算化、動的直交化、動的感応度、最小銘柄数バリデーション追加、Insight英語化
+    【SyntaxError修正パッチ】Zスコア計算時のインデントエラーを修正
     """
     
     @staticmethod
@@ -210,7 +211,7 @@ class QuantEngine:
     def compute_z_scores(df_target, stats, ortho_pairs=None):
         """
         Zスコア計算 
-        【修正】最小銘柄数のバリデーション強化、動的な直交化処理の導入
+        【修正】最小銘柄数のバリデーション強化、動的な直交化処理の導入、SyntaxError修正
         ortho_pairs: 直交化したいペアのリスト。例: [('Quality', 'Investment'), ('Value', 'Size')]
                      Noneの場合は後方互換性のため stats 内のパラメータから推論します。
         """
@@ -332,7 +333,8 @@ class QuantEngine:
             z_col = f"{f}_Z"
             if z_col not in df.columns:
                 df[z_col] = 0.0
-                else:
+            # 【修正箇所】以前のコードでSyntaxError(invalid syntax)になっていたインデントを修正
+            else:
                 df[z_col] = df[z_col].fillna(0.0)
             
         return df, r_squared_map
