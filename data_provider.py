@@ -1,6 +1,6 @@
 import os
 import datetime
-import time # 【追加】スリープ用
+import time
 import requests
 import pandas as pd
 import numpy as np
@@ -13,17 +13,15 @@ from urllib3.util.retry import Retry
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 4.2: アクセス制限・429エラー対策強化版)
+    【Module 1】データ取得プロバイダー (Ver. 4.3: アクセス制限・429エラー対策＆構造安定化版)
     - Tickerの自動正規化（Excelの数値変換エラー、.JP等の表記揺れを.Tに統一）
     - yf.Tickersによるバルク取得とセッション管理の強化
     - FMP APIへの強力な自動フォールバック（None撲滅）
     - JPX公式リストのローカルキャッシュによる高速なユニバース展開
-    - Beta計算用の市場プレミアム (Rm, Rf) 取得ロジック
-    - yfinanceマルチインデックスの安全な解体抽出
-    - ユニバースの最低ライン確保（50銘柄フォールバック）
-    - NoneTypeイテラブル・エラーの完全ガード
-    - 【NEW】セッションヘッダーのブラウザ偽装強化 (User-Agent等)
-    - 【NEW】APIフォールバック時のレートリミット回避 (time.sleep)
+    - Beta計算用の市場プレミアム (Rm, Rf) 取得ロジックの安定化
+    - 【重要】yfinanceマルチインデックスの堅牢な解体 (xsメソッド)
+    - 【重要】タイムゾーンの剥奪(tz_localize(None))による結合エラーの完全防止
+    - 【重要】yf.downloadのマルチスレッド無効化(threads=False)による429エラー回避
     """
     
     FMP_API_KEY = st.secrets.get("FMP_API_KEY", os.environ.get("FMP_API_KEY"))
@@ -51,11 +49,6 @@ class DataProvider:
 
     @staticmethod
     def _create_session():
-        """
-        【修正】HTTPセッションの作成とヘッダーの偽装強化
-        Yahoo Financeのブロック（429 Too Many Requests 等）を回避するため、
-        一般的なブラウザと同じヘッダー情報を追加します。
-        """
         session = requests.Session()
         session.headers.update({
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -71,8 +64,8 @@ class DataProvider:
             "Cache-Control": "max-age=0"
         })
         retries = Retry(
-            total=3, # リトライ回数を少し増やす
-            backoff_factor=1.0, # リトライ間隔を長めにとる
+            total=3,
+            backoff_factor=1.0,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS"]
         )
@@ -96,17 +89,9 @@ class DataProvider:
             if key in str(raw_sector): return val
         return 'Other'
 
-    # =========================================================================
-    # JPXユニバースの静的リスト保持（ローカルキャッシュとフォールバック拡充）
-    # =========================================================================
     @staticmethod
     @st.cache_data(ttl=86400 * 7, show_spinner=False)
     def get_jpx_universe():
-        """
-        JPXの公式リストを読み込みます。
-        ローカルのCSVがない場合、統計の安定性を担保するため
-        日経225の主要50銘柄をフォールバックとして返します。
-        """
         file_path = "jpx_list.csv"
         if os.path.exists(file_path):
             try:
@@ -138,16 +123,35 @@ class DataProvider:
         market_data = {}
 
         try:
-            rm_df = yf.download("^N225", start=start_d, end=end_d, session=session, progress=False)
-            if not rm_df.empty and 'Close' in rm_df.columns:
-                close_series = rm_df['Close'].squeeze() 
-                market_data['Rm'] = close_series
+            # 429回避のため threads=False
+            rm_df = yf.download("^N225", start=start_d, end=end_d, session=session, progress=False, threads=False)
+            close_series = pd.Series(dtype=float)
+            
+            if not rm_df.empty:
+                # yfinanceの出力構造に対応 (MultiIndexか否か)
+                if isinstance(rm_df.columns, pd.MultiIndex):
+                    if 'Close' in rm_df.columns.get_level_values(1):
+                        close_series = rm_df.xs('Close', level=1, axis=1).squeeze()
+                    elif 'Close' in rm_df.columns.get_level_values(0):
+                        close_series = rm_df.xs('Close', level=0, axis=1).squeeze()
+                else:
+                    if 'Close' in rm_df.columns:
+                        close_series = rm_df['Close'].squeeze()
+                
+                if not close_series.empty:
+                    # 【重要】タイムゾーンの除去と日付の正規化
+                    if close_series.index.tz is not None:
+                        close_series.index = close_series.index.tz_localize(None)
+                    close_series.index = pd.to_datetime(close_series.index).normalize()
+                    market_data['Rm'] = close_series
+                else:
+                    market_data['Rm'] = pd.Series(dtype=float)
             else:
                 market_data['Rm'] = pd.Series(dtype=float)
         except Exception:
             market_data['Rm'] = pd.Series(dtype=float)
 
-        if not market_data['Rm'].empty:
+        if 'Rm' in market_data and not market_data['Rm'].empty:
             dates = market_data['Rm'].index
             daily_rf = (1 + 0.005) ** (1/252) - 1
             market_data['Rf'] = pd.Series(daily_rf, index=dates)
@@ -164,7 +168,6 @@ class DataProvider:
         rescued_data = {}
         
         def fetch_one(t_orig):
-            # 【修正】APIリクエスト間に微小なスリープを入れ、レートリミットを回避
             time.sleep(0.5) 
             symbol = t_orig.replace(".T", ".JP") if ".T" in t_orig else t_orig
             url_ratios = f"https://financialmodelingprep.com/api/v3/ratios-ttm/{symbol}?apikey={api_key}"
@@ -189,7 +192,6 @@ class DataProvider:
             except Exception:
                 return t_orig, None
 
-        # サーバーへの負荷を下げるため、スレッド数を少し減らす (5 -> 3)
         with ThreadPoolExecutor(max_workers=3) as executor:
             results = list(executor.map(fetch_one, ticker_list))
         
@@ -208,7 +210,6 @@ class DataProvider:
         start_date = end_date - datetime.timedelta(days=days)
         
         def fetch_hist_one(t_orig):
-            # 【修正】APIリクエスト間に微小なスリープを入れ、レートリミットを回避
             time.sleep(0.5)
             symbol = t_orig.replace(".T", ".JP") if ".T" in t_orig else t_orig
             url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?from={start_date}&to={end_date}&apikey={api_key}"
@@ -218,7 +219,8 @@ class DataProvider:
                     data = r.json()
                     if 'historical' in data:
                         df = pd.DataFrame(data['historical'])
-                        df['date'] = pd.to_datetime(df['date'])
+                        # 【重要】タイムゾーンの除去と日付の正規化
+                        df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None).dt.normalize()
                         df.set_index('date', inplace=True)
                         df.sort_index(inplace=True)
                         return t_orig, df['close']
@@ -226,7 +228,6 @@ class DataProvider:
                 pass
             return t_orig, None
 
-        # サーバーへの負荷を下げるため、スレッド数を少し減らす (5 -> 3)
         with ThreadPoolExecutor(max_workers=3) as executor:
             results = list(executor.map(fetch_hist_one, ticker_list))
 
@@ -256,7 +257,6 @@ class DataProvider:
                 if not tk: return None
                 
                 info = tk.info
-                # info が None の場合、TypeError (is not iterable) を避けるため空の辞書を生成
                 if info is None:
                     info = {}
                 
@@ -272,13 +272,11 @@ class DataProvider:
                 }
                 return res
             except Exception:
-                # 完全に失敗した場合は、Tickerだけを持つ空のレコードを返すことで後続の計算崩壊を防ぐ
                 return {
                     'Ticker': ticker, 'Name': ticker, 'Price': np.nan, 'Size_Raw': np.nan,
                     'PBR': np.nan, 'ROE': np.nan, 'Sector_Raw': 'Unknown', 'Growth': np.nan
                 }
 
-        # Yahoo Finance側の制限を回避するため、スレッド数を少し絞る (8 -> 4)
         with ThreadPoolExecutor(max_workers=4) as executor:
             results = list(executor.map(get_yf_stock, unique_tickers))
         
@@ -292,7 +290,7 @@ class DataProvider:
         for c in req_cols:
             if c not in df.columns: df[c] = np.nan
 
-        missing_cond = df['ROE'].isna() | df['Growth'].isna() | df['PBR'].isna()
+        missing_cond = df['ROE'].isna() | df['Growth'].isna() | df['PBR'].isna() | df['Size_Raw'].isna()
         missing_tickers = df[missing_cond]['Ticker'].tolist() if not df.empty else unique_tickers
         
         if missing_tickers and DataProvider.FMP_API_KEY:
@@ -335,42 +333,45 @@ class DataProvider:
             end_d = datetime.date.today()
             start_d = end_d - datetime.timedelta(days=days)
             
+            # threads=False で429エラー(Too Many Requests)を回避
             df = yf.download(
                 unique_tickers, start=start_d, end=end_d,
                 progress=False, group_by='ticker', auto_adjust=True,
-                session=session
+                session=session, threads=False
             )
             
             if df.empty: raise ValueError("yfinance returned empty")
 
             result_df = pd.DataFrame()
 
-            # yfinanceの返り値が単一銘柄か複数銘柄かで処理を厳密に分ける
-            if len(unique_tickers) == 1:
-                t = unique_tickers[0]
-                # 単一銘柄の場合、マルチインデックスにならないケースがある
-                if 'Close' in df.columns: 
-                    result_df = pd.DataFrame({t: df['Close']})
-                else:
-                    result_df = pd.DataFrame()
-            else:
-                # 複数銘柄の場合 (マルチインデックスの解体)
+            # 【重要】マルチインデックスの安全な解体 (xsメソッド)
+            if isinstance(df.columns, pd.MultiIndex):
                 try:
-                    # 'Close' レベルを持つすべての列を抽出
-                    close_cols = df.iloc[:, df.columns.get_level_values(1) == 'Close']
-                    # カラム名をティッカーシンボルのみに変更
-                    close_cols.columns = close_cols.columns.get_level_values(0)
-                    result_df = close_cols.copy()
-                except Exception as e:
-                    # 形式が予期しないもので解体失敗した場合
-                    result_df = pd.DataFrame()
-            
+                    if 'Close' in df.columns.get_level_values(1):
+                        result_df = df.xs('Close', level=1, axis=1).copy()
+                    elif 'Close' in df.columns.get_level_values(0):
+                        result_df = df.xs('Close', level=0, axis=1).copy()
+                except Exception:
+                    pass
+            else:
+                if 'Close' in df.columns: 
+                    result_df = pd.DataFrame({unique_tickers[0]: df['Close']})
+
+            if not result_df.empty:
+                # 【重要】タイムゾーンの除去と日付の正規化
+                if result_df.index.tz is not None:
+                    result_df.index = result_df.index.tz_localize(None)
+                result_df.index = pd.to_datetime(result_df.index).normalize()
+
             current_cols = result_df.columns.tolist() if not result_df.empty else []
             missing = list(set(unique_tickers) - set(current_cols))
             
             if missing and DataProvider.FMP_API_KEY:
                 fmp_df = DataProvider._fetch_fmp_history(missing, days)
                 if not fmp_df.empty:
+                    if fmp_df.index.tz is not None:
+                        fmp_df.index = fmp_df.index.tz_localize(None)
+                    fmp_df.index = pd.to_datetime(fmp_df.index).normalize()
                     result_df = pd.concat([result_df, fmp_df], axis=1)
                     
             final_cols = result_df.columns.tolist() if not result_df.empty else []
@@ -385,7 +386,11 @@ class DataProvider:
         except Exception:
             if DataProvider.FMP_API_KEY:
                 fmp_fallback = DataProvider._fetch_fmp_history(unique_tickers, days)
-                if not fmp_fallback.empty: return fmp_fallback
+                if not fmp_fallback.empty: 
+                    if fmp_fallback.index.tz is not None:
+                        fmp_fallback.index = fmp_fallback.index.tz_localize(None)
+                    fmp_fallback.index = pd.to_datetime(fmp_fallback.index).normalize()
+                    return fmp_fallback
                 
             return pd.DataFrame()
 
