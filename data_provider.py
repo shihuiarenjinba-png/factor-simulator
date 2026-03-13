@@ -14,7 +14,7 @@ from urllib3.util.retry import Retry
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 5.0: SQLiteデータベース搭載版)
+    【Module 1】データ取得プロバイダー (Ver. 5.1: SQLite + API完全安定化版)
     - Tickerの自動正規化（Excelの数値変換エラー、.JP等の表記揺れを.Tに統一）
     - yf.Tickersによるバルク取得とセッション管理の強化
     - FMP APIへの強力な自動フォールバック（None撲滅）
@@ -22,7 +22,8 @@ class DataProvider:
     - Beta計算用の市場プレミアム (Rm, Rf) 取得ロジックの安定化
     - yfinanceマルチインデックスの堅牢な解体 (xsメソッド)
     - タイムゾーンの剥奪(tz_localize(None))による結合エラーの完全防止
-    - 【NEW】SQLiteを用いたローカルDBへの直接コンタクトによる429エラーの根本的解決
+    - SQLiteを用いたローカルDBへの直接コンタクトによる429エラーの根本的解決
+    - 【NEW】APIリクエストに対する明示的なスリープとthreads=Falseの徹底
     """
     
     # ローカルデータベースのパス
@@ -215,7 +216,7 @@ class DataProvider:
 
         if use_api:
             try:
-                # 429回避のため threads=False
+                # 【修正のメス1】429回避のため threads=False を徹底
                 rm_df = yf.download("^N225", start=start_d, end=end_d, session=session, progress=False, threads=False)
                 
                 if not rm_df.empty:
@@ -230,7 +231,7 @@ class DataProvider:
                             close_series = rm_df['Close'].squeeze()
                     
                     if not close_series.empty:
-                        # タイムゾーンの除去と日付の正規化
+                        # 【修正のメス2】タイムゾーンの除去と日付の正規化
                         if close_series.index.tz is not None:
                             close_series.index = close_series.index.tz_localize(None)
                         close_series.index = pd.to_datetime(close_series.index).normalize()
@@ -263,6 +264,7 @@ class DataProvider:
         rescued_data = {}
         
         def fetch_one(t_orig):
+            # API制限回避のためのスリープ
             time.sleep(0.5) 
             symbol = t_orig.replace(".T", ".JP") if ".T" in t_orig else t_orig
             url_ratios = f"https://financialmodelingprep.com/api/v3/ratios-ttm/{symbol}?apikey={api_key}"
@@ -305,6 +307,7 @@ class DataProvider:
         start_date = end_date - datetime.timedelta(days=days)
         
         def fetch_hist_one(t_orig):
+            # API制限回避のためのスリープ
             time.sleep(0.5)
             symbol = t_orig.replace(".T", ".JP") if ".T" in t_orig else t_orig
             url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?from={start_date}&to={end_date}&apikey={api_key}"
@@ -314,6 +317,7 @@ class DataProvider:
                     data = r.json()
                     if 'historical' in data:
                         df = pd.DataFrame(data['historical'])
+                        # 【修正のメス2】タイムゾーンの除去と日付の正規化をここでも徹底
                         df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None).dt.normalize()
                         df.set_index('date', inplace=True)
                         df.sort_index(inplace=True)
@@ -345,6 +349,8 @@ class DataProvider:
             tks = None
 
         def get_yf_stock(ticker):
+            # 【修正のメス3】ファンダメンタルズ取得時にも微小なスリープを入れ、一斉リクエストによる遮断を防ぐ
+            time.sleep(0.3)
             try:
                 if not tks: return None
                 tk = tks.tickers.get(ticker.upper())
@@ -371,7 +377,8 @@ class DataProvider:
                     'PBR': np.nan, 'ROE': np.nan, 'Sector_Raw': 'Unknown', 'Growth': np.nan
                 }
 
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        # ワーカー数をあえて落として安全に取得する（4 -> 3）
+        with ThreadPoolExecutor(max_workers=3) as executor:
             results = list(executor.map(get_yf_stock, unique_tickers))
         
         valid_data = [d for d in results if d is not None]
@@ -450,7 +457,7 @@ class DataProvider:
         # 3. 不足している銘柄のみAPIで取得
         if missing_tickers_for_api:
             try:
-                # threads=False で429エラー(Too Many Requests)を回避
+                # 【修正のメス1】threads=False で429エラー(Too Many Requests)を回避
                 df = yf.download(
                     missing_tickers_for_api, start=start_d, end=end_d,
                     progress=False, group_by='ticker', auto_adjust=True,
@@ -472,7 +479,7 @@ class DataProvider:
                             result_df = pd.DataFrame({missing_tickers_for_api[0]: df['Close']})
 
                     if not result_df.empty:
-                        # タイムゾーンの除去と日付の正規化
+                        # 【修正のメス2】タイムゾーンの除去と日付の正規化
                         if result_df.index.tz is not None:
                             result_df.index = result_df.index.tz_localize(None)
                         result_df.index = pd.to_datetime(result_df.index).normalize()
@@ -487,6 +494,7 @@ class DataProvider:
         if missing_from_api and DataProvider.FMP_API_KEY:
             fmp_df = DataProvider._fetch_fmp_history(missing_from_api, days)
             if not fmp_df.empty:
+                # 【修正のメス2】フォールバック取得データも必ず正規化
                 if fmp_df.index.tz is not None:
                     fmp_df.index = fmp_df.index.tz_localize(None)
                 fmp_df.index = pd.to_datetime(fmp_df.index).normalize()
