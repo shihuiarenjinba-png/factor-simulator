@@ -14,16 +14,16 @@ from urllib3.util.retry import Retry
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 5.1: SQLite + API完全安定化版)
+    【Module 1】データ取得プロバイダー (Ver. 6.0: 信頼性完全担保・429徹底回避版)
     - Tickerの自動正規化（Excelの数値変換エラー、.JP等の表記揺れを.Tに統一）
-    - yf.Tickersによるバルク取得とセッション管理の強化
     - FMP APIへの強力な自動フォールバック（None撲滅）
     - JPX公式リストのローカルキャッシュによる高速なユニバース展開
     - Beta計算用の市場プレミアム (Rm, Rf) 取得ロジックの安定化
     - yfinanceマルチインデックスの堅牢な解体 (xsメソッド)
-    - タイムゾーンの剥奪(tz_localize(None))による結合エラーの完全防止
-    - SQLiteを用いたローカルDBへの直接コンタクトによる429エラーの根本的解決
-    - 【NEW】APIリクエストに対する明示的なスリープとthreads=Falseの徹底
+    - SQLiteを用いたローカルDBへの直接コンタクト
+    - 【重要修正1】yf.downloadの小分けチャンク処理とスリープによる429エラー徹底回避
+    - 【重要修正2】タイムゾーンの剥奪と正規化の徹底による日付ズレの完全防止
+    - 【重要修正3】ベンチマーク流用による「偽装データ補完」の完全削除
     """
     
     # ローカルデータベースのパス
@@ -216,7 +216,7 @@ class DataProvider:
 
         if use_api:
             try:
-                # 【修正のメス1】429回避のため threads=False を徹底
+                # 429回避のため threads=False を徹底
                 rm_df = yf.download("^N225", start=start_d, end=end_d, session=session, progress=False, threads=False)
                 
                 if not rm_df.empty:
@@ -231,7 +231,7 @@ class DataProvider:
                             close_series = rm_df['Close'].squeeze()
                     
                     if not close_series.empty:
-                        # 【修正のメス2】タイムゾーンの除去と日付の正規化
+                        # タイムゾーンの除去と日付の正規化
                         if close_series.index.tz is not None:
                             close_series.index = close_series.index.tz_localize(None)
                         close_series.index = pd.to_datetime(close_series.index).normalize()
@@ -317,8 +317,11 @@ class DataProvider:
                     data = r.json()
                     if 'historical' in data:
                         df = pd.DataFrame(data['historical'])
-                        # 【修正のメス2】タイムゾーンの除去と日付の正規化をここでも徹底
-                        df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None).dt.normalize()
+                        # タイムゾーンの確実な除去と日付の正規化
+                        df['date'] = pd.to_datetime(df['date'])
+                        if isinstance(df['date'].dtype, pd.DatetimeTZDtype) or hasattr(df['date'].dtype, 'tz'):
+                            df['date'] = df['date'].dt.tz_localize(None)
+                        df['date'] = df['date'].dt.normalize()
                         df.set_index('date', inplace=True)
                         df.sort_index(inplace=True)
                         return t_orig, df['close']
@@ -349,8 +352,8 @@ class DataProvider:
             tks = None
 
         def get_yf_stock(ticker):
-            # 【修正のメス3】ファンダメンタルズ取得時にも微小なスリープを入れ、一斉リクエストによる遮断を防ぐ
-            time.sleep(0.3)
+            # API制限回避のためのスリープを少し長めに設定
+            time.sleep(0.5)
             try:
                 if not tks: return None
                 tk = tks.tickers.get(ticker.upper())
@@ -416,7 +419,7 @@ class DataProvider:
         return df
 
     # =========================================================================
-    # 履歴データ取得（SQLite対応・APIリクエスト最小化）
+    # 履歴データ取得（SQLite対応・APIリクエスト最小化・チャンク処理）
     # =========================================================================
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
@@ -428,6 +431,7 @@ class DataProvider:
         if not unique_tickers: return pd.DataFrame()
 
         session = DataProvider._create_session()
+        # ベンチマークを特定するが、後で強制フォールバックには使用しない
         bench_etf = next((t for t in unique_tickers if t in ["1321.T", "1306.T"]), None)
         
         end_d = datetime.date.today()
@@ -454,38 +458,47 @@ class DataProvider:
 
         result_df = pd.DataFrame()
 
-        # 3. 不足している銘柄のみAPIで取得
+        # 3. 不足している銘柄のみAPIで取得 (429対策として小分けチャンク処理)
         if missing_tickers_for_api:
-            try:
-                # 【修正のメス1】threads=False で429エラー(Too Many Requests)を回避
-                df = yf.download(
-                    missing_tickers_for_api, start=start_d, end=end_d,
-                    progress=False, group_by='ticker', auto_adjust=True,
-                    session=session, threads=False
-                )
-                
-                if not df.empty:
-                    # マルチインデックスの安全な解体 (xsメソッド)
-                    if isinstance(df.columns, pd.MultiIndex):
-                        try:
-                            if 'Close' in df.columns.get_level_values(1):
-                                result_df = df.xs('Close', level=1, axis=1).copy()
-                            elif 'Close' in df.columns.get_level_values(0):
-                                result_df = df.xs('Close', level=0, axis=1).copy()
-                        except Exception:
-                            pass
-                    else:
-                        if 'Close' in df.columns: 
-                            result_df = pd.DataFrame({missing_tickers_for_api[0]: df['Close']})
+            chunk_size = 5 # 5銘柄ずつ小分けにして取得
+            for i in range(0, len(missing_tickers_for_api), chunk_size):
+                chunk = missing_tickers_for_api[i:i + chunk_size]
+                time.sleep(1.0) # チャンク間で長めのスリープを挟む
+                try:
+                    df = yf.download(
+                        chunk, start=start_d, end=end_d,
+                        progress=False, group_by='ticker', auto_adjust=True,
+                        session=session, threads=False
+                    )
+                    
+                    if not df.empty:
+                        chunk_result = pd.DataFrame()
+                        # マルチインデックスの安全な解体 (xsメソッド)
+                        if isinstance(df.columns, pd.MultiIndex):
+                            try:
+                                if 'Close' in df.columns.get_level_values(1):
+                                    chunk_result = df.xs('Close', level=1, axis=1).copy()
+                                elif 'Close' in df.columns.get_level_values(0):
+                                    chunk_result = df.xs('Close', level=0, axis=1).copy()
+                            except Exception:
+                                pass
+                        else:
+                            if 'Close' in df.columns: 
+                                chunk_result = pd.DataFrame({chunk[0]: df['Close']})
 
-                    if not result_df.empty:
-                        # 【修正のメス2】タイムゾーンの除去と日付の正規化
-                        if result_df.index.tz is not None:
-                            result_df.index = result_df.index.tz_localize(None)
-                        result_df.index = pd.to_datetime(result_df.index).normalize()
-                        
-            except Exception:
-                pass
+                        if not chunk_result.empty:
+                            # タイムゾーンの除去と日付の正規化
+                            if chunk_result.index.tz is not None:
+                                chunk_result.index = chunk_result.index.tz_localize(None)
+                            chunk_result.index = pd.to_datetime(chunk_result.index).normalize()
+                            
+                            # 取得したチャンクを結合
+                            if result_df.empty:
+                                result_df = chunk_result
+                            else:
+                                result_df = pd.concat([result_df, chunk_result], axis=1)
+                except Exception:
+                    pass
 
         # 4. Yfinanceで取れなかった銘柄をFMPでフォールバック
         current_cols = result_df.columns.tolist() if not result_df.empty else []
@@ -494,10 +507,11 @@ class DataProvider:
         if missing_from_api and DataProvider.FMP_API_KEY:
             fmp_df = DataProvider._fetch_fmp_history(missing_from_api, days)
             if not fmp_df.empty:
-                # 【修正のメス2】フォールバック取得データも必ず正規化
+                # フォールバック取得データも必ず正規化
                 if fmp_df.index.tz is not None:
                     fmp_df.index = fmp_df.index.tz_localize(None)
                 fmp_df.index = pd.to_datetime(fmp_df.index).normalize()
+                
                 if result_df.empty:
                     result_df = fmp_df
                 else:
@@ -518,13 +532,9 @@ class DataProvider:
         else:
             final_df = result_df
             
-        # 7. ベンチマークによる最終フォールバック
-        final_cols = final_df.columns.tolist() if not final_df.empty else []
-        still_missing = list(set(unique_tickers) - set(final_cols))
-        
-        if still_missing and bench_etf and bench_etf in final_df.columns:
-            for t in still_missing:
-                final_df[t] = final_df[bench_etf]
+        # 【完全削除】「ベンチマークによる最終フォールバック」を削除。
+        # 取得に失敗した銘柄は欠損として扱い、QuantEngine側で正しく除外させることで
+        # 分析結果がベンチマークと完全に一致してしまう「偽装」を防ぎます。
 
         return final_df
 
