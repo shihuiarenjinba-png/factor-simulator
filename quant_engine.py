@@ -14,6 +14,8 @@ class QuantEngine:
     【第2工程パッチ】分母ゼロ爆発の防止(Sigma Floor)、対数化前のClip処理、Betaフォールバック強化
     【第3工程パッチ】Beta行列演算化、動的直交化、動的感応度、最小銘柄数バリデーション追加、Insight英語化
     【SyntaxError修正パッチ】Zスコア計算時のインデントエラーと不可視文字を完全排除
+    【重要修正1】動的な銘柄除外: 欠落データを計算から外し、残存銘柄でウェイトを再配分 (リウェイト)
+    【重要修正2】妥当性チェック: ベータ値が完全に「1.0」や「0.0」に張り付く偽装データを検出・排除
     """
     
     @staticmethod
@@ -69,6 +71,11 @@ class QuantEngine:
                         # 行列演算による共分散の一括計算
                         covariances = asset_premiums.cov(market_prem_aligned)
                         betas = (covariances / bench_var).to_dict()
+                        
+                        # 【妥当性チェック】 ベータが完全に「1.0」や「0.0」に張り付く場合は、ベンチマークが流用されたか無効データとみなして除外
+                        for k in list(betas.keys()):
+                            if abs(betas[k] - 1.0) < 1e-6 or abs(betas[k]) < 1e-6:
+                                betas[k] = np.nan
             except Exception:
                 # 失敗時は通常のベンチマーク計算へフォールバック
                 df_market = None 
@@ -91,23 +98,39 @@ class QuantEngine:
                 # 行列演算による共分散の一括計算
                 covariances = rets.cov(bench_ret)
                 betas = (covariances / bench_var).to_dict()
+                
+                # 【妥当性チェック】 対象がベンチマーク自身でないのにベータが「1.0」に張り付く場合は除外
+                for k in list(betas.keys()):
+                    if k != benchmark_ticker:
+                        if abs(betas[k] - 1.0) < 1e-6 or abs(betas[k]) < 1e-6:
+                            betas[k] = np.nan
         
         df['Beta_Raw'] = df['Ticker'].map(betas).astype(float)
         return df
 
     # =========================================================================
-    # スマート・ウェイト・エンジン (変更なし)
+    # スマート・ウェイト・エンジン (動的リウェイト機能搭載)
     # =========================================================================
     @staticmethod
     def calculate_portfolio_weights(df, user_weights_provided=False):
         df_out = df.copy()
         
+        # 【動的な銘柄除外】 Beta_Raw が計算不能 (NaN) になった銘柄を「死んだ銘柄」としてマークする
+        valid_mask = pd.Series(True, index=df_out.index)
+        if 'Beta_Raw' in df_out.columns:
+            valid_mask = df_out['Beta_Raw'].notna()
+        
         if user_weights_provided and 'Weight' in df_out.columns:
             df_out['Weight'] = pd.to_numeric(df_out['Weight'], errors='coerce').fillna(0)
+            
+            # 死んだ銘柄のウェイトを強制的に0にする
+            df_out.loc[~valid_mask, 'Weight'] = 0.0
+            
             valid_weights_count = (df_out['Weight'] > 0).sum()
             total_weight = df_out['Weight'].sum()
             
-            if total_weight > 0 and valid_weights_count == len(df_out):
+            if total_weight > 0 and valid_weights_count > 0:
+                # 残った健全な銘柄だけで合計が1(100%)になるように再配分(リウェイト)
                 df_out['Weight'] = df_out['Weight'] / total_weight
                 return df_out
             else:
@@ -115,13 +138,26 @@ class QuantEngine:
         
         if 'MarketCap' in df_out.columns:
             valid_mc = pd.to_numeric(df_out['MarketCap'], errors='coerce').fillna(0)
+            # 死んだ銘柄は時価総額0として扱い、ウェイト計算から排除
+            valid_mc.loc[~valid_mask] = 0.0
             mc_sum = valid_mc.sum()
+            
             if mc_sum > 0:
                 df_out['Weight'] = valid_mc / mc_sum
             else:
-                df_out['Weight'] = 1.0 / len(df_out)
+                # すべての時価総額が不明だが、有効な銘柄が残っている場合は等金額配分
+                valid_count = valid_mask.sum()
+                if valid_count > 0:
+                    df_out['Weight'] = np.where(valid_mask, 1.0 / valid_count, 0.0)
+                else:
+                    df_out['Weight'] = 1.0 / len(df_out)
         else:
-            df_out['Weight'] = 1.0 / len(df_out)
+            # 時価総額情報がない場合も、有効な銘柄だけで等金額配分
+            valid_count = valid_mask.sum()
+            if valid_count > 0:
+                df_out['Weight'] = np.where(valid_mask, 1.0 / valid_count, 0.0)
+            else:
+                df_out['Weight'] = 1.0 / len(df_out)
             
         return df_out
 
@@ -211,7 +247,6 @@ class QuantEngine:
     def compute_z_scores(df_target, stats, ortho_pairs=None):
         """
         Zスコア計算 
-        【修正】最小銘柄数のバリデーション強化、動的な直交化処理の導入、SyntaxError修正
         ortho_pairs: 直交化したいペアのリスト。例: [('Quality', 'Investment'), ('Value', 'Size')]
                      Noneの場合は後方互換性のため stats 内のパラメータから推論します。
         """
@@ -333,7 +368,6 @@ class QuantEngine:
             z_col = f"{f}_Z"
             if z_col not in df.columns:
                 df[z_col] = 0.0
-            # 【重要】以前インデントがずれてSyntaxErrorになっていた箇所を厳密に修正
             else:
                 df[z_col] = df[z_col].fillna(0.0)
             
@@ -346,7 +380,7 @@ class QuantEngine:
     def calculate_sensitivity_beta(df, market_sensitivities='dynamic'):
         """
         Zスコアからファクター感応度を加重平均し、特性ベータ（Sensitivity Beta）を算出。
-        【修正】引数に'dynamic'を渡すことで、ユニバース内のBetaとの相関から動的に係数を算出。
+        引数に'dynamic'を渡すことで、ユニバース内のBetaとの相関から動的に係数を算出。
         """
         df_out = df.copy()
 
@@ -393,8 +427,7 @@ class QuantEngine:
     def generate_insights(z_scores):
         """
         インサイト生成 (5ファクター対応版)
-        【修正】PDFでのUnicode/フォントレンダリングエラーを完全に回避するため、
-        出力テキストを純粋な英語（絵文字・全角文字なし）に置き換えました。
+        出力テキストを純粋な英語（絵文字・全角文字なし）に統一。
         """
         insights = []
         
