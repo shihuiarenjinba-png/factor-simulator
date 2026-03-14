@@ -50,8 +50,7 @@ st.title("Factor Simulator V17.2 - Portfolio Analysis")
 st.markdown("5ファクター（Beta, Value, Size, Quality, Investment）に基づくポートフォリオの直交化解析と可視化を行います。")
 
 # ---------------------------------------------------------
-# 【追加】一括データ取得＆強力キャッシュラッパー
-# app.py側で一括してキャッシュすることで、ボタン連打時の429エラーを完全に防ぐ
+# 一括データ取得＆強力キャッシュラッパー
 # ---------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_cached_market_data(tickers):
@@ -100,7 +99,6 @@ run_button = st.sidebar.button("分析を実行", type="primary")
 # 2. メイン処理ロジック
 # ---------------------------------------------------------
 if run_button:
-    # --- UI: プログレスバーの初期化 ---
     progress_bar = st.progress(0, text="初期化中...")
     status_text = st.empty()
     
@@ -159,36 +157,54 @@ if run_button:
         st.stop()
 
     # -----------------------------------------------------
-    # 【追加】データ品質の可視化（診断レポート）
+    # Step C: 回帰ベータの計算
+    # -----------------------------------------------------
+    progress_bar.progress(65, text="市場連動性（回帰ベータ）を計算中...")
+    df_all_fund = QuantEngine.calculate_beta(df_all_fund, df_hist, df_market)
+
+    # -----------------------------------------------------
+    # 【修正箇所】データ品質の可視化とエラーの明示
     # -----------------------------------------------------
     fetched_tickers = df_all_fund['Ticker'].tolist()
-    missing_port = [t for t in port_tickers if t not in fetched_tickers]
     
-    with st.expander("📊 データ品質・取得レポート", expanded=bool(missing_port)):
+    # 1. 物理的な取得失敗 (APIエラーなどで完全にデータがない)
+    missing_api = [t for t in port_tickers if t not in fetched_tickers]
+    
+    # 2. 計算結果が異常 (Beta_Raw が NaN になったもの)
+    invalid_data = []
+    if 'Beta_Raw' in df_all_fund.columns:
+        invalid_data = df_all_fund[
+            (df_all_fund['Ticker'].isin(port_tickers)) & 
+            (df_all_fund['Beta_Raw'].isna())
+        ]['Ticker'].tolist()
+
+    all_excluded = list(set(missing_api + invalid_data))
+    
+    with st.expander("📊 データ品質・取得レポート", expanded=bool(all_excluded)):
         st.markdown(f"**・リクエスト銘柄数**: {len(port_tickers)} 件")
-        st.markdown(f"**・取得成功**: {len(port_tickers) - len(missing_port)} 件")
+        st.markdown(f"**・分析採用銘柄数**: {len(port_tickers) - len(all_excluded)} 件")
         
-        if missing_port:
-            st.error(f"❌ 取得失敗（計算から除外）: {', '.join(missing_port)}")
-            st.markdown("※ 上記の銘柄は上場廃止、またはYahoo Financeからの応答がなかったため除外されました。0.00による計算のノイズを防ぐための安全措置です。")
+        if all_excluded:
+            st.warning("⚠️ 以下の銘柄はデータ不足のため分析から除外されました：")
+            
+            if missing_api:
+                st.error(f"❌ 取得失敗（API応答なし）: {', '.join(missing_api)}")
+            if invalid_data:
+                st.error(f"❌ 計算不能（データ異常・流動性不足）: {', '.join(invalid_data)}")
+                
+            st.markdown("※ 上記の銘柄はベンチマークへの同化による分析エラーを防ぐための安全措置として除外されました。残りの銘柄のみでポートフォリオを再構築し、ウェイトを自動配分します。")
         else:
-            st.success("✅ 全ポートフォリオ銘柄の基本データ取得に成功しました。")
+            st.success("✅ 全ポートフォリオ銘柄のデータ取得・計算に成功しました。")
             
         # ユニバースの取得状況
         fetched_bench = [t for t in bench_tickers if t in fetched_tickers]
         st.markdown(f"**・ユニバース(比較対象)取得**: {len(fetched_bench)} / {len(bench_tickers)} 件")
 
-    port_tickers = [t for t in port_tickers if t not in missing_port]
+    port_tickers = [t for t in port_tickers if t not in all_excluded]
     
     if not port_tickers:
         st.error("❌ 計算可能なポートフォリオ銘柄がなくなりました。分析を中止します。")
         st.stop()
-
-    # -----------------------------------------------------
-    # Step C: 回帰ベータの計算
-    # -----------------------------------------------------
-    progress_bar.progress(65, text="市場連動性（回帰ベータ）を計算中...")
-    df_all_fund = QuantEngine.calculate_beta(df_all_fund, df_hist, df_market)
 
     # -----------------------------------------------------
     # Step D: ユニバース統計量の算出とポートフォリオのZスコア化
@@ -209,17 +225,23 @@ if run_button:
     df_port_scored = QuantEngine.calculate_sensitivity_beta(df_port_scored)
 
     # -----------------------------------------------------
-    # 【修正】ウェイト入力の厳格なフィードバック
+    # ウェイト入力の厳格なフィードバック
     # -----------------------------------------------------
+    # 除外された銘柄がある場合、入力ウェイト数と合わなくなる可能性があるため再配分
+    original_port_length = len(port_tickers) + len(all_excluded)
     if weight_list:
-        if len(weight_list) == len(port_tickers):
-            weight_map = dict(zip(port_tickers, weight_list))
+        if len(weight_list) == original_port_length:
+            # 入力されたポートフォリオの順序と合わせてマップを作成
+            sanitized_port = unicodedata.normalize('NFKC', port_input)
+            raw_codes_temp = re.findall(r'\b\d{4}\b', sanitized_port)
+            original_tickers_ordered = [f"{code}.T" for code in list(dict.fromkeys(raw_codes_temp))]
+            
+            weight_map = dict(zip(original_tickers_ordered, weight_list))
             df_port_scored['Weight'] = df_port_scored['Ticker'].map(weight_map)
             df_port_scored = QuantEngine.calculate_portfolio_weights(df_port_scored, user_weights_provided=True)
-            st.success("✅ 指定されたウェイトを適用しました。")
+            st.success("✅ 指定されたウェイトを残存銘柄へ適用・再配分しました。")
         else:
-            # 入力数と銘柄数の不一致を赤字で明示
-            st.error(f"❌ ウェイト入力エラー: 有効な銘柄数（{len(port_tickers)}件）に対し、入力されたウェイト数が（{len(weight_list)}件）です。時価総額加重（または等金額）で自動計算します。")
+            st.error(f"❌ ウェイト入力エラー: リクエストされた銘柄数（{original_port_length}件）に対し、入力されたウェイト数が（{len(weight_list)}件）です。時価総額加重（または等金額）で自動計算します。")
             df_port_scored = QuantEngine.calculate_portfolio_weights(df_port_scored, user_weights_provided=False)
     else:
         df_port_scored = QuantEngine.calculate_portfolio_weights(df_port_scored, user_weights_provided=False)
@@ -244,12 +266,11 @@ if run_button:
     progress_bar.empty()
 
     # ---------------------------------------------------------
-    # 3. 分析結果の表示 (Visualizerの活用)
+    # 3. 分析結果の表示
     # ---------------------------------------------------------
     col1, col2 = st.columns([1, 1])
     
     with col1:
-        # 【追加】Regression Betaの解釈を助けるツールチップ
         st.subheader("🎯 5ファクター・エクスポージャー", help="【Regression Beta (回帰ベータ)】\n過去の価格データに基づき、市場ベンチマークに対する純粋な価格連動性（時系列回帰）を測定したものです。")
         
         max_z_val = 0
@@ -269,12 +290,10 @@ if run_button:
         st.plotly_chart(fig_radar, use_container_width=True)
         
     with col2:
-        # 【追加】Sensitivity Betaの解釈を助けるツールチップ
         st.subheader("🧩 ファクター寄与度分解", help="【Sensitivity Beta (特性ベータ)】\n各ファクター（割安性やクオリティなど）の組み合わせから逆算された、その銘柄が本質的に持つ市場感応度の理論値です。")
         fig_bar = Visualizer.plot_contribution_bar_chart(df_port_scored)
         st.plotly_chart(fig_bar, use_container_width=True)
 
-    # データテーブルの表示
     st.markdown("---")
     st.subheader("📋 銘柄別 Z-Score 詳細データ")
     
@@ -293,5 +312,5 @@ if run_button:
     }
     df_display.rename(columns=rename_dict, inplace=True)
     
-    # 小数点以下2桁にフォーマットして表示
-    st.dataframe(df_display.style.format({col: "{:.2f}" for col in df_display.columns if col not in ['Ticker']}), use_container_width=True)
+    # 小数点以下2桁にフォーマットし、インデックスを隠して表示
+    st.dataframe(df_display.style.format({col: "{:.2f}" for col in df_display.columns if col not in ['Ticker']}), use_container_width=True, hide_index=True)
