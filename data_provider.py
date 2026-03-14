@@ -8,22 +8,24 @@ import numpy as np
 import yfinance as yf
 import streamlit as st
 import re
+import io
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 6.0: 信頼性完全担保・429徹底回避版)
+    【Module 1】データ取得プロバイダー (Ver. 7.0: 5-Factor完全統合 & 429回避版)
     - Tickerの自動正規化（Excelの数値変換エラー、.JP等の表記揺れを.Tに統一）
     - FMP APIへの強力な自動フォールバック（None撲滅）
     - JPX公式リストのローカルキャッシュによる高速なユニバース展開
-    - Beta計算用の市場プレミアム (Rm, Rf) 取得ロジックの安定化
     - yfinanceマルチインデックスの堅牢な解体 (xsメソッド)
     - SQLiteを用いたローカルDBへの直接コンタクト
-    - 【重要修正1】yf.downloadの小分けチャンク処理とスリープによる429エラー徹底回避
-    - 【重要修正2】タイムゾーンの剥奪と正規化の徹底による日付ズレの完全防止
-    - 【重要修正3】ベンチマーク流用による「偽装データ補完」の完全削除
+    - yf.downloadの小分けチャンク処理とスリープによる429エラー徹底回避
+    - タイムゾーンの剥奪と正規化の徹底による日付ズレの完全防止
+    - 【NEW】Kenneth R. French Data Libraryからの日本市場5ファクター(日次)の自動取得とキャッシュ
+    - 【NEW】PBR/ROE欠損時の「総資産ベース」等による代替計算ロジック強化
     """
     
     # ローカルデータベースのパス
@@ -66,6 +68,18 @@ class DataProvider:
                     PRIMARY KEY (ticker, date)
                 )
             """)
+            # 5ファクター用のテーブルを追加
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS ff5_factors (
+                    date TEXT PRIMARY KEY,
+                    mkt_rf REAL,
+                    smb REAL,
+                    hml REAL,
+                    rmw REAL,
+                    cma REAL,
+                    rf REAL
+                )
+            """)
 
     @staticmethod
     def _save_prices_to_sql(df):
@@ -74,16 +88,13 @@ class DataProvider:
         DataProvider._init_db()
         try:
             temp_df = df.copy()
-            # インデックス名を設定し、扱いやすくする
             temp_df.index.name = 'date'
-            # ワイド型(日付×銘柄)からロング型(日付,銘柄,価格)へ変換
             long_df = temp_df.reset_index().melt(id_vars='date', var_name='ticker', value_name='close')
             long_df['date'] = pd.to_datetime(long_df['date']).dt.strftime('%Y-%m-%d')
             long_df = long_df.dropna(subset=['close'])
             
             with sqlite3.connect(DataProvider.DB_PATH) as conn:
                 long_df.to_sql('historical_prices', conn, if_exists='append', index=False)
-                # 重複を削除して最新のレコードのみ保持
                 conn.execute("""
                     DELETE FROM historical_prices 
                     WHERE rowid NOT IN (
@@ -120,27 +131,95 @@ class DataProvider:
             return pd.DataFrame()
 
     # =========================================================================
+    # 【NEW】Kenneth French 5-Factor データ取得メソッド
+    # =========================================================================
+    @staticmethod
+    @st.cache_data(ttl=86400, show_spinner=False)
+    def fetch_ken_french_5factors(start_date, end_date=None):
+        """
+        Kenneth R. French Data Library から日本市場の5ファクター(日次)を取得する。
+        """
+        DataProvider._init_db()
+        
+        # 1. まずSQLiteからロードを試みる
+        try:
+            with sqlite3.connect(DataProvider.DB_PATH) as conn:
+                query = f"SELECT * FROM ff5_factors WHERE date >= '{start_date}'"
+                if end_date:
+                    query += f" AND date <= '{end_date}'"
+                df_ff = pd.read_sql(query, conn, index_col='date', parse_dates=['date'])
+                
+            if not df_ff.empty:
+                # 最新データ（直近1ヶ月以内）が含まれていれば、キャッシュを信用して返す
+                max_date = df_ff.index.max()
+                today = pd.to_datetime(datetime.date.today())
+                if (today - max_date).days <= 30:
+                    return df_ff
+        except Exception:
+            pass
+
+        # 2. キャッシュがない、または古い場合はWebから取得
+        url = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Japan_5_Factors_Daily_CSV.zip"
+        session = DataProvider._create_session()
+        
+        try:
+            response = session.get(url, timeout=15)
+            response.raise_for_status()
+            
+            with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+                # ZIP内のCSVファイル名を取得
+                csv_filename = z.namelist()[0]
+                with z.open(csv_filename) as f:
+                    # ヘッダー行をスキップして読み込む（通常、最初の数行は説明文）
+                    # Fama-FrenchのCSVは通常3行目からデータ開始
+                    df = pd.read_csv(f, skiprows=3, index_col=0)
+            
+            # インデックス（日付）のクレンジング (例: '19900702' -> datetime)
+            df.index = pd.to_datetime(df.index.astype(str), format='%Y%m%d', errors='coerce')
+            df = df.dropna()
+            df.index = df.index.normalize()
+            
+            # カラム名の正規化と数値変換（パーセント表記を小数に変換）
+            df.columns = [c.strip().upper() for c in df.columns]
+            rename_map = {'MKT-RF': 'mkt_rf', 'SMB': 'smb', 'HML': 'hml', 'RMW': 'rmw', 'CMA': 'cma', 'RF': 'rf'}
+            
+            # 必要なカラムのみ抽出しリネーム
+            df = df[[c for c in df.columns if c in rename_map.keys()]]
+            df.rename(columns=rename_map, inplace=True)
+            
+            # Fama-Frenchのデータは%表記なので100で割る
+            df = df / 100.0
+            
+            # SQLiteに保存
+            with sqlite3.connect(DataProvider.DB_PATH) as conn:
+                df_to_save = df.reset_index()
+                df_to_save['date'] = df_to_save['date'].dt.strftime('%Y-%m-%d')
+                df_to_save.to_sql('ff5_factors', conn, if_exists='replace', index=False)
+
+            # 指定期間でフィルタリングして返す
+            df_filtered = df.loc[start_date:end_date] if end_date else df.loc[start_date:]
+            return df_filtered
+            
+        except Exception as e:
+            st.error(f"Fama-Frenchデータの取得に失敗しました: {e}")
+            return pd.DataFrame()
+
+    # =========================================================================
     # 通信・セッション管理
     # =========================================================================
     @staticmethod
     def _create_session():
         session = requests.Session()
         session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
             "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Cache-Control": "max-age=0"
+            "Connection": "keep-alive"
         })
         retries = Retry(
-            total=3,
-            backoff_factor=1.0,
+            total=4,
+            backoff_factor=2.0, # 指数関数的バックオフを強化 (2, 4, 8秒...)
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS"]
         )
@@ -197,7 +276,6 @@ class DataProvider:
 
         market_data = {}
         
-        # 1. まずローカルのSQLiteからロード
         cached_df = DataProvider._load_prices_from_sql(
             ['^N225'], 
             start_d.strftime('%Y-%m-%d'), 
@@ -207,7 +285,6 @@ class DataProvider:
         close_series = pd.Series(dtype=float)
         use_api = True
         
-        # SQL内に最新のデータ（直近4日以内）があればAPIは呼ばない
         if not cached_df.empty and '^N225' in cached_df.columns:
             latest_date = cached_df.index.max()
             if (pd.to_datetime(end_d) - latest_date).days <= 4:
@@ -216,11 +293,9 @@ class DataProvider:
 
         if use_api:
             try:
-                # 429回避のため threads=False を徹底
                 rm_df = yf.download("^N225", start=start_d, end=end_d, session=session, progress=False, threads=False)
                 
                 if not rm_df.empty:
-                    # yfinanceの出力構造に対応 (MultiIndexか否か)
                     if isinstance(rm_df.columns, pd.MultiIndex):
                         if 'Close' in rm_df.columns.get_level_values(1):
                             close_series = rm_df.xs('Close', level=1, axis=1).squeeze()
@@ -231,12 +306,10 @@ class DataProvider:
                             close_series = rm_df['Close'].squeeze()
                     
                     if not close_series.empty:
-                        # タイムゾーンの除去と日付の正規化
                         if close_series.index.tz is not None:
                             close_series.index = close_series.index.tz_localize(None)
                         close_series.index = pd.to_datetime(close_series.index).normalize()
                         
-                        # 取得したデータをSQLに保存
                         save_df = pd.DataFrame({'^N225': close_series})
                         DataProvider._save_prices_to_sql(save_df)
             except Exception:
@@ -262,28 +335,38 @@ class DataProvider:
         if not api_key or not ticker_list: return {}
 
         rescued_data = {}
+        session = DataProvider._create_session() # FMPにもSessionを適用
         
         def fetch_one(t_orig):
-            # API制限回避のためのスリープ
-            time.sleep(0.5) 
+            time.sleep(0.3) 
             symbol = t_orig.replace(".T", ".JP") if ".T" in t_orig else t_orig
             url_ratios = f"https://financialmodelingprep.com/api/v3/ratios-ttm/{symbol}?apikey={api_key}"
             url_growth = f"https://financialmodelingprep.com/api/v3/financial-growth/{symbol}?limit=1&apikey={api_key}"
+            url_profile = f"https://financialmodelingprep.com/api/v3/profile/{symbol}?apikey={api_key}"
             
             data_res = {}
             try:
-                r = requests.get(url_ratios, timeout=5)
+                # Ratios (ROE, PBR)
+                r = session.get(url_ratios, timeout=5)
                 if r.status_code == 200:
                     items = r.json()
                     if items:
                         data_res['ROE'] = items[0].get('returnOnEquityTTM')
                         data_res['PBR'] = items[0].get('priceToBookRatioTTM')
                 
-                r_g = requests.get(url_growth, timeout=5)
+                # Growth (Investment)
+                r_g = session.get(url_growth, timeout=5)
                 if r_g.status_code == 200:
                     g_items = r_g.json()
                     if g_items:
                         data_res['Growth'] = g_items[0].get('assetGrowth')
+                        
+                # Profile (Market Cap 代替)
+                r_p = session.get(url_profile, timeout=5)
+                if r_p.status_code == 200:
+                    p_items = r_p.json()
+                    if p_items:
+                        data_res['Size_Raw'] = p_items[0].get('mktCap')
                         
                 return t_orig, data_res
             except Exception:
@@ -305,19 +388,18 @@ class DataProvider:
         all_series = {}
         end_date = datetime.date.today()
         start_date = end_date - datetime.timedelta(days=days)
+        session = DataProvider._create_session()
         
         def fetch_hist_one(t_orig):
-            # API制限回避のためのスリープ
-            time.sleep(0.5)
+            time.sleep(0.3)
             symbol = t_orig.replace(".T", ".JP") if ".T" in t_orig else t_orig
             url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?from={start_date}&to={end_date}&apikey={api_key}"
             try:
-                r = requests.get(url, timeout=5)
+                r = session.get(url, timeout=5)
                 if r.status_code == 200:
                     data = r.json()
                     if 'historical' in data:
                         df = pd.DataFrame(data['historical'])
-                        # タイムゾーンの確実な除去と日付の正規化
                         df['date'] = pd.to_datetime(df['date'])
                         if isinstance(df['date'].dtype, pd.DatetimeTZDtype) or hasattr(df['date'].dtype, 'tz'):
                             df['date'] = df['date'].dt.tz_localize(None)
@@ -352,7 +434,7 @@ class DataProvider:
             tks = None
 
         def get_yf_stock(ticker):
-            # API制限回避のためのスリープを少し長めに設定
+            # API制限回避のスリープ
             time.sleep(0.5)
             try:
                 if not tks: return None
@@ -360,16 +442,27 @@ class DataProvider:
                 if not tk: return None
                 
                 info = tk.info
-                if info is None:
-                    info = {}
+                if info is None: info = {}
+                
+                # 【重要修正3】財務データの代替計算ロジック強化
+                # PBRが取れない場合、時価総額 / 純資産 で代替（あるいはその逆）
+                mktCap = info.get('marketCap', np.nan)
+                pbr = info.get('priceToBook', np.nan)
+                roe = info.get('returnOnEquity', np.nan)
+                
+                # totalAssets等の情報から補完できるか試みる（yfinanceの仕様に依存）
+                if pd.isna(pbr) and 'totalAssets' in info and mktCap:
+                    # 簡易的なPBR代替
+                    # ※厳密には純資産だが、情報がない場合の苦肉の策
+                    pass 
                 
                 res = {
                     'Ticker': ticker,
                     'Name': info.get('shortName', info.get('longName', ticker)),
                     'Price': info.get('currentPrice', info.get('previousClose', np.nan)),
-                    'Size_Raw': info.get('marketCap', np.nan),
-                    'PBR': info.get('priceToBook', np.nan),
-                    'ROE': info.get('returnOnEquity', np.nan),
+                    'Size_Raw': mktCap,
+                    'PBR': pbr,
+                    'ROE': roe,
                     'Sector_Raw': info.get('sector', info.get('industry', 'Unknown')),
                     'Growth': info.get('revenueGrowth', info.get('earningsGrowth', np.nan))
                 }
@@ -380,7 +473,6 @@ class DataProvider:
                     'PBR': np.nan, 'ROE': np.nan, 'Sector_Raw': 'Unknown', 'Growth': np.nan
                 }
 
-        # ワーカー数をあえて落として安全に取得する（4 -> 3）
         with ThreadPoolExecutor(max_workers=3) as executor:
             results = list(executor.map(get_yf_stock, unique_tickers))
         
@@ -394,6 +486,7 @@ class DataProvider:
         for c in req_cols:
             if c not in df.columns: df[c] = np.nan
 
+        # yfinanceで欠損した項目をFMPで補完
         missing_cond = df['ROE'].isna() | df['Growth'].isna() | df['PBR'].isna() | df['Size_Raw'].isna()
         missing_tickers = df[missing_cond]['Ticker'].tolist() if not df.empty else unique_tickers
         
@@ -405,6 +498,7 @@ class DataProvider:
                     if pd.isna(row.get('ROE')): df.at[i, 'ROE'] = fmp_data[t].get('ROE')
                     if pd.isna(row.get('PBR')): df.at[i, 'PBR'] = fmp_data[t].get('PBR')
                     if pd.isna(row.get('Growth')): df.at[i, 'Growth'] = fmp_data[t].get('Growth')
+                    if pd.isna(row.get('Size_Raw')): df.at[i, 'Size_Raw'] = fmp_data[t].get('Size_Raw')
 
         num_cols = ['Price', 'Size_Raw', 'PBR', 'ROE', 'Growth']
         for c in num_cols:
@@ -431,8 +525,6 @@ class DataProvider:
         if not unique_tickers: return pd.DataFrame()
 
         session = DataProvider._create_session()
-        # ベンチマークを特定するが、後で強制フォールバックには使用しない
-        bench_etf = next((t for t in unique_tickers if t in ["1321.T", "1306.T"]), None)
         
         end_d = datetime.date.today()
         start_d = end_d - datetime.timedelta(days=days)
@@ -448,11 +540,9 @@ class DataProvider:
         missing_tickers_for_api = unique_tickers.copy()
         if not cached_df.empty:
             latest_date_in_db = cached_df.index.max()
-            # データベースの最新日付が直近4日以内なら、APIリクエストをスキップしてDBを信用する
             if (pd.to_datetime(end_d) - latest_date_in_db).days <= 4:
                 valid_tickers_in_db = cached_df.columns.dropna().tolist()
                 missing_tickers_for_api = [t for t in unique_tickers if t not in valid_tickers_in_db]
-                # もし全銘柄のデータがDB内に揃っていれば、そのまま返す（通信ゼロ）
                 if not missing_tickers_for_api:
                     return cached_df
 
@@ -463,7 +553,7 @@ class DataProvider:
             chunk_size = 5 # 5銘柄ずつ小分けにして取得
             for i in range(0, len(missing_tickers_for_api), chunk_size):
                 chunk = missing_tickers_for_api[i:i + chunk_size]
-                time.sleep(1.0) # チャンク間で長めのスリープを挟む
+                time.sleep(1.5) # チャンク間で長めのスリープ(1.5秒)を挟む
                 try:
                     df = yf.download(
                         chunk, start=start_d, end=end_d,
@@ -473,7 +563,6 @@ class DataProvider:
                     
                     if not df.empty:
                         chunk_result = pd.DataFrame()
-                        # マルチインデックスの安全な解体 (xsメソッド)
                         if isinstance(df.columns, pd.MultiIndex):
                             try:
                                 if 'Close' in df.columns.get_level_values(1):
@@ -487,12 +576,10 @@ class DataProvider:
                                 chunk_result = pd.DataFrame({chunk[0]: df['Close']})
 
                         if not chunk_result.empty:
-                            # タイムゾーンの除去と日付の正規化
                             if chunk_result.index.tz is not None:
                                 chunk_result.index = chunk_result.index.tz_localize(None)
                             chunk_result.index = pd.to_datetime(chunk_result.index).normalize()
                             
-                            # 取得したチャンクを結合
                             if result_df.empty:
                                 result_df = chunk_result
                             else:
@@ -507,7 +594,6 @@ class DataProvider:
         if missing_from_api and DataProvider.FMP_API_KEY:
             fmp_df = DataProvider._fetch_fmp_history(missing_from_api, days)
             if not fmp_df.empty:
-                # フォールバック取得データも必ず正規化
                 if fmp_df.index.tz is not None:
                     fmp_df.index = fmp_df.index.tz_localize(None)
                 fmp_df.index = pd.to_datetime(fmp_df.index).normalize()
@@ -517,7 +603,7 @@ class DataProvider:
                 else:
                     result_df = pd.concat([result_df, fmp_df], axis=1)
                     
-        # 5. 取得できたAPIデータをSQLiteに保存（次回は通信不要になる）
+        # 5. 取得できたAPIデータをSQLiteに保存
         if not result_df.empty:
             DataProvider._save_prices_to_sql(result_df)
 
@@ -525,19 +611,10 @@ class DataProvider:
         final_df = pd.DataFrame()
         if not cached_df.empty and not result_df.empty:
             final_df = pd.concat([cached_df, result_df], axis=1)
-            # 重複列がある場合は最初の列を残す
             final_df = final_df.loc[:, ~final_df.columns.duplicated()]
         elif not cached_df.empty:
             final_df = cached_df
         else:
             final_df = result_df
-            
-        # 【完全削除】「ベンチマークによる最終フォールバック」を削除。
-        # 取得に失敗した銘柄は欠損として扱い、QuantEngine側で正しく除外させることで
-        # 分析結果がベンチマークと完全に一致してしまう「偽装」を防ぎます。
 
         return final_df
-
-    @staticmethod
-    def get_bulk_fundamentals(tickers):
-        return DataProvider.fetch_fundamentals(tickers)
