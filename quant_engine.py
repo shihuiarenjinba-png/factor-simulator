@@ -2,6 +2,12 @@ import pandas as pd
 import numpy as np
 from scipy.stats import linregress
 
+# 多変量回帰分析用ライブラリ
+try:
+    import statsmodels.api as sm
+except ImportError:
+    sm = None
+
 class QuantEngine:
     """
     ポートフォリオの数値計算、スコアリング、インサイト生成を担当するエンジン
@@ -16,8 +22,121 @@ class QuantEngine:
     【SyntaxError修正パッチ】Zスコア計算時のインデントエラーと不可視文字を完全排除
     【重要修正1】動的な銘柄除外: 欠落データを計算から外し、残存銘柄でウェイトを再配分 (リウェイト)
     【重要修正2】妥当性チェック: ベータ値が完全に「1.0」や「0.0」に張り付く偽装データを検出・排除
+    【重要修正3】多変量回帰分析 (Time-series Regression) の実装と統計的有意性(t値, R^2)の算出
+    【重要修正4】加重平均スコアリング: 銘柄ごとの固有ファクタースコアのウェイト寄与度分解
     """
     
+    # =========================================================================
+    # 【NEW】時系列多変量回帰分析 (Time-series Regression)
+    # =========================================================================
+    @staticmethod
+    def run_5factor_regression(df_hist, df_weights, df_ff5):
+        """
+        ポートフォリオの日次リターンと、ケネス・フレンチの5ファクターを日付で同期し、
+        多変量回帰分析を実行してポートフォリオ全体の「回帰後ベータ」と「t値」を算出する。
+        """
+        if df_hist.empty or df_ff5.empty or df_weights.empty or sm is None:
+            return None
+
+        try:
+            # 1. 銘柄別日次リターンの計算
+            rets = df_hist.pct_change().dropna()
+            
+            # 2. 有効な銘柄のみでウェイトを再正規化
+            valid_tickers = [t for t in df_weights['Ticker'] if t in rets.columns]
+            if not valid_tickers: return None
+            
+            w_dict = dict(zip(df_weights['Ticker'], df_weights['Weight']))
+            w_series = pd.Series({t: w_dict[t] for t in valid_tickers})
+            
+            if w_series.sum() == 0: return None
+            w_series = w_series / w_series.sum()
+            
+            # 3. ポートフォリオの加重平均日次リターンを算出
+            port_ret = (rets[valid_tickers] * w_series).sum(axis=1)
+            
+            # 4. 5ファクターデータとの日付同期 (Inner Joinによる完全一致)
+            aligned = pd.concat([port_ret.rename('Port_Ret'), df_ff5], axis=1, join='inner').dropna()
+            
+            if len(aligned) < 30: # 統計的有意性を出すための最低サンプル数(30日)
+                return None
+                
+            # 5. 超過リターン = ポートフォリオリターン - 無リスク金利
+            y = aligned['Port_Ret'] - aligned['rf']
+            
+            # 6. 独立変数 (Mkt-RF, SMB, HML, RMW, CMA)
+            X = aligned[['mkt_rf', 'smb', 'hml', 'rmw', 'cma']]
+            X = sm.add_constant(X) # アルファ(切片)の追加
+            
+            # 7. 最小二乗法(OLS)による多変量回帰の実行
+            model = sm.OLS(y, X).fit()
+            
+            # 8. 統計的有意性(t値)と決定係数(R^2)の抽出
+            results = {
+                'Alpha': model.params.get('const', 0),
+                'Beta': model.params.get('mkt_rf', 0),
+                'Size': model.params.get('smb', 0),    # Small Minus Big
+                'Value': model.params.get('hml', 0),   # High Minus Low
+                'Quality': model.params.get('rmw', 0), # Robust Minus Weak
+                'Investment': model.params.get('cma', 0), # Conservative Minus Aggressive
+                'R_squared': model.rsquared,
+                't_values': {
+                    'Alpha': model.tvalues.get('const', 0),
+                    'Beta': model.tvalues.get('mkt_rf', 0),
+                    'Size': model.tvalues.get('smb', 0),
+                    'Value': model.tvalues.get('hml', 0),
+                    'Quality': model.tvalues.get('rmw', 0),
+                    'Investment': model.tvalues.get('cma', 0),
+                },
+                'p_values': {
+                    'Alpha': model.pvalues.get('const', 1),
+                    'Beta': model.pvalues.get('mkt_rf', 1),
+                    'Size': model.pvalues.get('smb', 1),
+                    'Value': model.pvalues.get('hml', 1),
+                    'Quality': model.pvalues.get('rmw', 1),
+                    'Investment': model.pvalues.get('cma', 1),
+                }
+            }
+            return results
+        except Exception as e:
+            print(f"Regression Error: {e}")
+            return None
+
+    # =========================================================================
+    # 【NEW】加重平均スコアリングロジック (特性分解・棒グラフ用)
+    # =========================================================================
+    @staticmethod
+    def calculate_weighted_factor_contributions(df_port_scored):
+        """
+        各銘柄の「回帰前（固有）ファクタースコア（Value Z, Quality Z等）」に対して、
+        ポートフォリオ内のウェイトを掛け合わせた「加重平均寄与度」を算出する。
+        目的: 棒グラフで「どの銘柄がポートフォリオの特性を押し上げているか」を可視化するため。
+        """
+        factors = ['Beta_Z', 'Value_Z', 'Size_Z', 'Quality_Z', 'Investment_Z']
+        df_out = df_port_scored.copy()
+        
+        if 'Weight' not in df_out.columns:
+            df_out['Weight'] = 1.0 / len(df_out) if len(df_out) > 0 else 0
+            
+        for f in factors:
+            if f in df_out.columns:
+                contrib_col = f"{f}_Contrib"
+                # ウェイト × 固有Zスコア = その銘柄のファクターへの寄与
+                df_out[contrib_col] = df_out[f].fillna(0) * df_out['Weight']
+            else:
+                df_out[f"{f}_Contrib"] = 0.0
+                
+        # ポートフォリオ全体の加重平均スコア（サマリー用）
+        portfolio_summary = {}
+        for f in factors:
+            contrib_col = f"{f}_Contrib"
+            portfolio_summary[f] = df_out[contrib_col].sum()
+            
+        return df_out, portfolio_summary
+
+    # =========================================================================
+    # 既存のBeta計算ロジック（ユニバース比較等に使用）
+    # =========================================================================
     @staticmethod
     def calculate_beta(df_fund, df_hist, df_market=None, benchmark_ticker="1321.T"):
         """
@@ -49,7 +168,7 @@ class QuantEngine:
         
         betas = {}
 
-        # 【修正】 Rm と Rf を使った理論的Betaの計算ルート（行列演算化）
+        # Rm と Rf を使った理論的Betaの計算ルート（行列演算化）
         if df_market is not None and not df_market.empty and 'Rm' in df_market.columns and 'Rf' in df_market.columns:
             try:
                 rm_ret = df_market['Rm'].pct_change().dropna()
@@ -72,15 +191,14 @@ class QuantEngine:
                         covariances = asset_premiums.cov(market_prem_aligned)
                         betas = (covariances / bench_var).to_dict()
                         
-                        # 【妥当性チェック】 ベータが完全に「1.0」や「0.0」に張り付く場合は、ベンチマークが流用されたか無効データとみなして除外
+                        # 【妥当性チェック】 ベータが完全に「1.0」や「0.0」に張り付く場合は除外
                         for k in list(betas.keys()):
                             if abs(betas[k] - 1.0) < 1e-6 or abs(betas[k]) < 1e-6:
                                 betas[k] = np.nan
             except Exception:
-                # 失敗時は通常のベンチマーク計算へフォールバック
                 df_market = None 
 
-        # 【既存ロジック・修正】 df_marketがない場合のフォールバック（行列演算化）
+        # df_marketがない場合のフォールバック（行列演算化）
         if df_market is None or df_market.empty:
             if benchmark_ticker not in rets.columns:
                 if "1306.T" in rets.columns:
@@ -95,7 +213,6 @@ class QuantEngine:
             bench_var = bench_ret.var()
 
             if bench_var > 1e-8:
-                # 行列演算による共分散の一括計算
                 covariances = rets.cov(bench_ret)
                 betas = (covariances / bench_var).to_dict()
                 
@@ -374,13 +491,12 @@ class QuantEngine:
         return df, r_squared_map
 
     # =========================================================================
-    # 特性ベータ（Sensitivity Beta）の逆算ロジック
+    # 特性ベータ（Sensitivity Beta）の逆算ロジック (既存維持)
     # =========================================================================
     @staticmethod
     def calculate_sensitivity_beta(df, market_sensitivities='dynamic'):
         """
         Zスコアからファクター感応度を加重平均し、特性ベータ（Sensitivity Beta）を算出。
-        引数に'dynamic'を渡すことで、ユニバース内のBetaとの相関から動的に係数を算出。
         """
         df_out = df.copy()
 
@@ -388,19 +504,14 @@ class QuantEngine:
             market_sensitivities = {}
             factors_to_check = ['Size_Z', 'Value_Z', 'Quality_Z', 'Investment_Z']
             
-            # Beta_Zが存在し、かつサンプルサイズが最低限ある場合のみ動的計算
             if 'Beta_Z' in df_out.columns and df_out['Beta_Z'].notna().sum() >= 5:
                 for f in factors_to_check:
                     if f in df_out.columns:
                         corr = df_out['Beta_Z'].corr(df_out[f])
                         market_sensitivities[f] = corr if pd.notna(corr) else 0.0
             else:
-                # フォールバック (デフォルトの市場感応度係数)
                 market_sensitivities = {
-                    'Size_Z': 0.25, 
-                    'Value_Z': -0.15, 
-                    'Quality_Z': -0.20, 
-                    'Investment_Z': -0.10 
+                    'Size_Z': 0.25, 'Value_Z': -0.15, 'Quality_Z': -0.20, 'Investment_Z': -0.10 
                 }
         elif market_sensitivities is None:
             market_sensitivities = {
@@ -408,8 +519,6 @@ class QuantEngine:
             }
 
         sensitivity_sum = pd.Series(0.0, index=df_out.index)
-        
-        # 係数の絶対値合計で割ることで、Zスコアのスケール感を維持する
         total_weight = sum(abs(v) for v in market_sensitivities.values())
         
         for factor_col, weight in market_sensitivities.items():
