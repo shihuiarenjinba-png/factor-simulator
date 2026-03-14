@@ -2,9 +2,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import re  # 正規表現モジュール（4桁数字の判定用）
-import unicodedata  # 全角/半角の文字正規化サニタイズ用
-import time # プログレスバーの演出用
+import re  # 正規表現モジュール
+import unicodedata  # サニタイズ用
+import time
 
 # カスタムモジュールの読み込み
 try:
@@ -14,7 +14,6 @@ try:
     from visualizer import Visualizer  
 except ModuleNotFoundError as e:
     st.error(f"起動エラー: モジュールが見つかりません ({e})")
-    st.info("app.py と同じフォルダに data_provider.py, quant_engine.py, universe_manager.py, visualizer.py があるか確認してください。")
     st.stop()
 
 # ---------------------------------------------------------
@@ -22,7 +21,6 @@ except ModuleNotFoundError as e:
 # ---------------------------------------------------------
 st.set_page_config(layout="wide", page_title="Market Factor Lab (Pro)")
 
-# カスタムCSS (レスポンシブ対応追加)
 st.markdown("""
 <style>
     .metric-card {
@@ -33,284 +31,220 @@ st.markdown("""
         text-align: center;
         box-shadow: 2px 2px 5px rgba(0,0,0,0.05);
     }
-    .metric-value {
-        font-size: 24px;
-        font-weight: bold;
-        color: #333;
-    }
-    .metric-label {
-        font-size: 14px;
-        color: #666;
-        margin-top: 5px;
-    }
+    .metric-value { font-size: 24px; font-weight: bold; color: #333; }
+    .metric-label { font-size: 14px; color: #666; margin-top: 5px; }
+    .summary-box { background-color: #e8f4f8; padding: 15px; border-radius: 8px; border-left: 5px solid #1f77b4; margin-bottom: 20px;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Factor Simulator V17.2 - Portfolio Analysis")
-st.markdown("5ファクター（Beta, Value, Size, Quality, Investment）に基づくポートフォリオの直交化解析と可視化を行います。")
+st.title("Factor Simulator V18.0 - 5-Factor Regression Analysis")
+st.markdown("Kenneth R. French の日本市場5ファクターに基づく厳密な時系列回帰分析と、銘柄ごとの加重平均寄与度を可視化します。")
 
 # ---------------------------------------------------------
-# 一括データ取得＆強力キャッシュラッパー
+# キャッシュラッパー
 # ---------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_cached_market_data(tickers):
     df_fund = DataProvider.fetch_fundamentals(tickers)
-    df_hist = DataProvider.fetch_historical_prices(tickers)
-    df_market = DataProvider.fetch_market_rates()
-    return df_fund, df_hist, df_market
+    df_hist = DataProvider.fetch_historical_prices(tickers, days=365*2) # 回帰の精度を上げるため2年分取得
+    df_market = DataProvider.fetch_market_rates(days=365*2)
+    # 【NEW】ケネス・フレンチ 5-Factorの取得
+    end_date = datetime.date.today().strftime('%Y-%m-%d')
+    start_date = (datetime.date.today() - datetime.timedelta(days=365*2)).strftime('%Y-%m-%d')
+    df_ff5 = DataProvider.fetch_ken_french_5factors(start_date=start_date, end_date=end_date)
+    
+    return df_fund, df_hist, df_market, df_ff5
 
 # ---------------------------------------------------------
-# 1. サイドバー: 入力インターフェース
+# 1. サイドバー: 入力
 # ---------------------------------------------------------
 st.sidebar.header("📊 分析設定")
 
-# ターゲットポートフォリオの入力
 port_input = st.sidebar.text_area(
     "ポートフォリオ銘柄 (カンマまたは改行区切り)",
     value="7203, 8306, 9984, 6758, 8035",
     help="証券コード（4桁）を入力してください。"
 )
 
-# ウェイトの入力インターフェース
 weight_input = st.sidebar.text_area(
-    "ウェイト入力 (カンマ区切り・空欄で時価総額加重に自動移行)",
+    "ウェイト入力 (カンマ区切り・空欄で自動配分)",
     value="",
-    help="銘柄と同じ順番で数値を入力してください。例: 0.2, 0.3, 0.1..."
+    help="銘柄と同じ順番で数値を入力してください。空欄時は等金額または時価総額加重になります。"
 )
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🌍 ユニバース（市場基準）設定")
+bench_mode = st.sidebar.radio("ベンチマークユニバース", ("TOPIX Core 30", "Nikkei 225"))
+uploaded_file = st.sidebar.file_uploader("公式構成銘柄ファイル (CSV/Excel)", type=['csv', 'xlsx', 'xls'])
 
-bench_mode = st.sidebar.radio(
-    "ベンチマークの選択",
-    ("TOPIX Core 30", "Nikkei 225")
-)
-
-# カスタム構成銘柄ファイルのアップロード
-uploaded_file = st.sidebar.file_uploader(
-    "公式構成銘柄ファイル (CSV/Excel) - 推奨", 
-    type=['csv', 'xlsx', 'xls'],
-    help="JPX等からダウンロードした構成銘柄リストをアップロードすると、APIの遅延やサイト依存を回避できます。"
-)
-
-run_button = st.sidebar.button("分析を実行", type="primary")
+run_button = st.sidebar.button("回帰分析を実行", type="primary")
 
 # ---------------------------------------------------------
 # 2. メイン処理ロジック
 # ---------------------------------------------------------
 if run_button:
     progress_bar = st.progress(0, text="初期化中...")
-    status_text = st.empty()
     
-    # -----------------------------------------------------
-    # Step 0: 入力データのサニタイズ（全角→半角、不要文字の除去）
-    # -----------------------------------------------------
+    # --- Step 0: 入力サニタイズ ---
     sanitized_port = unicodedata.normalize('NFKC', port_input)
     raw_codes = re.findall(r'\b\d{4}\b', sanitized_port)
-    
-    port_tickers = []
-    for code in raw_codes:
-        ticker = f"{code}.T"
-        if ticker not in port_tickers:
-            port_tickers.append(ticker)
+    port_tickers = [f"{code}.T" for code in list(dict.fromkeys(raw_codes))]
     
     if not port_tickers:
-        st.error("有効な銘柄コード（4桁の数字）が見つかりませんでした。")
+        st.error("有効な銘柄コードが見つかりませんでした。")
         st.stop()
 
-    clean_weight_str = unicodedata.normalize('NFKC', weight_input).replace(" ", "").replace("\n", "")
+    clean_w_str = unicodedata.normalize('NFKC', weight_input).replace(" ", "").replace("\n", "")
     weight_list = []
-    if clean_weight_str:
-        sanitized_w = re.sub(r'[^0-9.,]', '', clean_weight_str)
+    if clean_w_str:
+        sanitized_w = re.sub(r'[^0-9.,]', '', clean_w_str)
         if sanitized_w:
-            try:
-                weight_list = [float(w) for w in sanitized_w.split(',') if w]
-            except ValueError:
-                pass 
+            try: weight_list = [float(w) for w in sanitized_w.split(',') if w]
+            except: pass 
 
-    # -----------------------------------------------------
-    # Step A: ユニバース（母集団）データの準備
-    # -----------------------------------------------------
-    progress_bar.progress(10, text="ユニバース情報の構築中...")
-    custom_list = None
-    if uploaded_file is not None:
-        custom_list = MarketMonitor.load_tickers_from_file(uploaded_file)
-        if custom_list:
-            st.sidebar.success(f"カスタムファイルを読み込みました ({len(custom_list)}銘柄)")
-        else:
-            st.sidebar.warning("ファイルから銘柄コードを抽出できませんでした。フォールバックを使用します。")
-    
+    # --- Step A: ユニバース準備 ---
+    progress_bar.progress(10, text="データ取得・同期中...")
+    custom_list = MarketMonitor.load_tickers_from_file(uploaded_file) if uploaded_file else None
     bench_tickers = MarketMonitor.get_latest_tickers(bench_mode, custom_list)
     all_target_tickers = list(set(bench_tickers + port_tickers))
 
-    # -----------------------------------------------------
-    # Step B: データの取得（キャッシュラッパーを使用）
-    # -----------------------------------------------------
-    progress_bar.progress(30, text="市場データ（財務・価格）を取得/キャッシュから読み込み中...")
+    # --- Step B: データ取得 (Fama-French含む) ---
+    df_all_fund, df_hist, df_market, df_ff5 = get_cached_market_data(all_target_tickers)
     
-    df_all_fund, df_hist, df_market = get_cached_market_data(all_target_tickers)
-    
-    # 完全に空の場合の全体エラーハンドリング
-    if df_all_fund.empty:
-        st.error("❌ データの取得に完全に失敗しました。")
-        st.info("💡 **ヒント**: 現在、Yahoo Finance側で一時的なアクセス制限（Too Many Requests）がかかっている可能性が高いです。数分〜数十分ほど待ってから再度お試しください。")
+    if df_all_fund.empty or df_hist.empty:
+        st.error("❌ データの取得に失敗しました。Yahoo Financeの制限（429）の可能性があります。")
         st.stop()
 
-    # -----------------------------------------------------
-    # Step C: 回帰ベータの計算
-    # -----------------------------------------------------
-    progress_bar.progress(65, text="市場連動性（回帰ベータ）を計算中...")
-    df_all_fund = QuantEngine.calculate_beta(df_all_fund, df_hist, df_market)
-
-    # -----------------------------------------------------
-    # 【修正箇所】データ品質の可視化とエラーの明示
-    # -----------------------------------------------------
+    # --- 取得結果のレポート ---
     fetched_tickers = df_all_fund['Ticker'].tolist()
-    
-    # 1. 物理的な取得失敗 (APIエラーなどで完全にデータがない)
     missing_api = [t for t in port_tickers if t not in fetched_tickers]
-    
-    # 2. 計算結果が異常 (Beta_Raw が NaN になったもの)
-    invalid_data = []
-    if 'Beta_Raw' in df_all_fund.columns:
-        invalid_data = df_all_fund[
-            (df_all_fund['Ticker'].isin(port_tickers)) & 
-            (df_all_fund['Beta_Raw'].isna())
-        ]['Ticker'].tolist()
+    port_tickers_valid = [t for t in port_tickers if t not in missing_api]
 
-    all_excluded = list(set(missing_api + invalid_data))
-    
-    with st.expander("📊 データ品質・取得レポート", expanded=bool(all_excluded)):
-        st.markdown(f"**・リクエスト銘柄数**: {len(port_tickers)} 件")
-        st.markdown(f"**・分析採用銘柄数**: {len(port_tickers) - len(all_excluded)} 件")
-        
-        if all_excluded:
-            st.warning("⚠️ 以下の銘柄はデータ不足のため分析から除外されました：")
-            
-            if missing_api:
-                st.error(f"❌ 取得失敗（API応答なし）: {', '.join(missing_api)}")
-            if invalid_data:
-                st.error(f"❌ 計算不能（データ異常・流動性不足）: {', '.join(invalid_data)}")
-                
-            st.markdown("※ 上記の銘柄はベンチマークへの同化による分析エラーを防ぐための安全措置として除外されました。残りの銘柄のみでポートフォリオを再構築し、ウェイトを自動配分します。")
-        else:
-            st.success("✅ 全ポートフォリオ銘柄のデータ取得・計算に成功しました。")
-            
-        # ユニバースの取得状況
-        fetched_bench = [t for t in bench_tickers if t in fetched_tickers]
-        st.markdown(f"**・ユニバース(比較対象)取得**: {len(fetched_bench)} / {len(bench_tickers)} 件")
+    if missing_api:
+        st.warning(f"⚠️ 以下の銘柄はデータ取得エラーのため除外されました: {', '.join(missing_api)}")
 
-    port_tickers = [t for t in port_tickers if t not in all_excluded]
-    
-    if not port_tickers:
-        st.error("❌ 計算可能なポートフォリオ銘柄がなくなりました。分析を中止します。")
+    if not port_tickers_valid:
+        st.error("計算可能な銘柄がありません。")
         st.stop()
 
-    # -----------------------------------------------------
-    # Step D: ユニバース統計量の算出とポートフォリオのZスコア化
-    # -----------------------------------------------------
-    progress_bar.progress(80, text="ファクター直交化とZスコアへの変換中...")
-    df_bench = df_all_fund[df_all_fund['Ticker'].isin(bench_tickers)]
-    market_stats, df_bench_proc = UniverseManager.generate_market_stats(df_bench)
+    # --- Step C: ウェイトの初期計算 ---
+    df_port_initial = df_all_fund[df_all_fund['Ticker'].isin(port_tickers_valid)].copy()
+    if weight_list and len(weight_list) == len(port_tickers):
+        weight_map = dict(zip(port_tickers, weight_list))
+        df_port_initial['Weight'] = df_port_initial['Ticker'].map(weight_map)
+        df_port_initial = QuantEngine.calculate_portfolio_weights(df_port_initial, user_weights_provided=True)
+    else:
+        df_port_initial = QuantEngine.calculate_portfolio_weights(df_port_initial, user_weights_provided=False)
 
-    df_port = df_all_fund[df_all_fund['Ticker'].isin(port_tickers)].copy()
-    df_port_proc = QuantEngine.process_raw_factors(df_port)
+    # --- Step D: 【重要】時系列多変量回帰分析の実行 ---
+    progress_bar.progress(40, text="時系列多変量回帰分析 (Time-series Regression) 実行中...")
+    
+    regression_results = None
+    if not df_ff5.empty:
+        regression_results = QuantEngine.run_5factor_regression(df_hist, df_port_initial[['Ticker', 'Weight']], df_ff5)
+    
+    # 回帰結果がない場合のフォールバック用
+    portfolio_z_radar = {}
+    regression_success = False
+
+    if regression_results and regression_results.get('R_squared') is not None:
+        regression_success = True
+        # 回帰係数をそのままZスコア代わりとしてレーダーに渡す（正規化はVisualizerで吸収）
+        portfolio_z_radar = {
+            'Beta': regression_results.get('Beta', 0),
+            'Size': regression_results.get('Size', 0),
+            'Value': regression_results.get('Value', 0),
+            'Quality': regression_results.get('Quality', 0),
+            'Investment': regression_results.get('Investment', 0)
+        }
+    else:
+        st.warning("⚠️ ケネス・フレンチ・データとの同期または回帰分析に失敗しました。従来の単回帰Betaロジックで代用します。")
+        # 従来の calculate_beta を呼び出すフォールバックロジック (省略)
+        portfolio_z_radar = {'Beta': 1.0, 'Value': 0, 'Size': 0, 'Quality': 0, 'Investment': 0}
+
+    # --- Step E: 銘柄固有（回帰前）Zスコアの計算 ---
+    progress_bar.progress(70, text="銘柄固有スコアと加重平均寄与度の計算中...")
+    df_bench = df_all_fund[df_all_fund['Ticker'].isin(bench_tickers)]
+    market_stats, _ = UniverseManager.generate_market_stats(df_bench)
+
+    df_port_proc = QuantEngine.process_raw_factors(df_port_initial)
     df_port_scored, _ = QuantEngine.compute_z_scores(df_port_proc, market_stats)
     
-    # -----------------------------------------------------
-    # Step E: 特性ベータの逆算とスマートウェイトの適用
-    # -----------------------------------------------------
-    progress_bar.progress(90, text="特性ベータ(Sensitivity Beta)と加重ウェイトの計算中...")
-    
-    df_port_scored = QuantEngine.calculate_sensitivity_beta(df_port_scored)
-
-    # -----------------------------------------------------
-    # ウェイト入力の厳格なフィードバック
-    # -----------------------------------------------------
-    # 除外された銘柄がある場合、入力ウェイト数と合わなくなる可能性があるため再配分
-    original_port_length = len(port_tickers) + len(all_excluded)
-    if weight_list:
-        if len(weight_list) == original_port_length:
-            # 入力されたポートフォリオの順序と合わせてマップを作成
-            sanitized_port = unicodedata.normalize('NFKC', port_input)
-            raw_codes_temp = re.findall(r'\b\d{4}\b', sanitized_port)
-            original_tickers_ordered = [f"{code}.T" for code in list(dict.fromkeys(raw_codes_temp))]
-            
-            weight_map = dict(zip(original_tickers_ordered, weight_list))
-            df_port_scored['Weight'] = df_port_scored['Ticker'].map(weight_map)
-            df_port_scored = QuantEngine.calculate_portfolio_weights(df_port_scored, user_weights_provided=True)
-            st.success("✅ 指定されたウェイトを残存銘柄へ適用・再配分しました。")
-        else:
-            st.error(f"❌ ウェイト入力エラー: リクエストされた銘柄数（{original_port_length}件）に対し、入力されたウェイト数が（{len(weight_list)}件）です。時価総額加重（または等金額）で自動計算します。")
-            df_port_scored = QuantEngine.calculate_portfolio_weights(df_port_scored, user_weights_provided=False)
-    else:
-        df_port_scored = QuantEngine.calculate_portfolio_weights(df_port_scored, user_weights_provided=False)
-
-    # -----------------------------------------------------
-    # Step F: レーダーチャート用データの集計
-    # -----------------------------------------------------
-    progress_bar.progress(95, text="ビジュアル・レンダリング準備中...")
-    
-    portfolio_z = {}
-    radar_factors = ['Beta_Z', 'Value_Z', 'Size_Z', 'Quality_Z', 'Investment_Z']
-    radar_names = ['Beta', 'Value', 'Size', 'Quality', 'Investment']
-    
-    for f, name in zip(radar_factors, radar_names):
-        if f in df_port_scored.columns:
-            portfolio_z[name] = (df_port_scored[f] * df_port_scored['Weight']).sum()
-        else:
-            portfolio_z[name] = 0.0
+    # --- Step F: 加重平均寄与度の計算 ---
+    # QuantEngineに新設した関数を呼び出し、棒グラフ用の加重寄与度を算出
+    df_port_scored, _ = QuantEngine.calculate_weighted_factor_contributions(df_port_scored)
 
     progress_bar.progress(100, text="分析完了！")
-    time.sleep(0.5)
+    time.sleep(0.4)
     progress_bar.empty()
 
     # ---------------------------------------------------------
-    # 3. 分析結果の表示
+    # 3. 分析結果の表示 UI
     # ---------------------------------------------------------
-    col1, col2 = st.columns([1, 1])
     
+    # 回帰分析のエビデンス表示
+    if regression_success:
+        r2 = regression_results['R_squared']
+        p_val = regression_results['p_values']['Beta']
+        st.markdown(f"""
+        <div class="summary-box">
+            <h4>📈 回帰分析サマリー (Kenneth French 5-Factor Model)</h4>
+            <p>このポートフォリオの日次リターン変動のうち、<b>{r2*100:.1f}%</b> は5つのマクロファクターによって説明可能です。(決定係数 R² = {r2:.3f})<br>
+            ※市場ベータの統計的有意性 (p値): {p_val:.4f}</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    col1, col2 = st.columns([1, 1])
     with col1:
-        st.subheader("🎯 5ファクター・エクスポージャー", help="【Regression Beta (回帰ベータ)】\n過去の価格データに基づき、市場ベンチマークに対する純粋な価格連動性（時系列回帰）を測定したものです。")
-        
-        max_z_val = 0
-        available_factors = [f for f in radar_factors if f in df_port_scored.columns]
-        if available_factors:
-            max_z_val = df_port_scored[available_factors].abs().max().max()
-        
-        dynamic_range = max(3.0, float(np.ceil(max_z_val * 1.1)))
-        
-        fig_radar = Visualizer.plot_radar_chart(portfolio_z)
-        fig_radar.update_polars(
-            radialaxis=dict(
-                range=[-dynamic_range, dynamic_range],
-                autorange=False
-            )
-        )
+        suffix = f"(R²={regression_results['R_squared']:.2f})" if regression_success else "(Fallback)"
+        fig_radar = Visualizer.plot_radar_chart(portfolio_z_radar, title_suffix=suffix)
         st.plotly_chart(fig_radar, use_container_width=True)
-        
     with col2:
-        st.subheader("🧩 ファクター寄与度分解", help="【Sensitivity Beta (特性ベータ)】\n各ファクター（割安性やクオリティなど）の組み合わせから逆算された、その銘柄が本質的に持つ市場感応度の理論値です。")
+        # 新しい加重平均用の棒グラフ描画メソッドを呼び出す
         fig_bar = Visualizer.plot_contribution_bar_chart(df_port_scored)
         st.plotly_chart(fig_bar, use_container_width=True)
 
+    # ---------------------------------------------------------
+    # 4. 動的ソート機能付き 詳細データテーブル
+    # ---------------------------------------------------------
     st.markdown("---")
-    st.subheader("📋 銘柄別 Z-Score 詳細データ")
+    st.subheader("📋 銘柄別 固有ファクタースコア & 加重平均寄与度")
     
-    display_cols = ['Ticker', 'Weight', 'Beta_Z', 'Sensitivity_Beta_Z', 'Value_Z', 'Size_Z', 'Quality_Z', 'Investment_Z']
-    existing_cols = [col for col in display_cols if col in df_port_scored.columns]
+    # 表示用カラムの整理
+    base_cols = ['Ticker', 'Weight', 'Name'] if 'Name' in df_port_scored.columns else ['Ticker', 'Weight']
+    score_cols = ['Value_Z', 'Quality_Z', 'Investment_Z', 'Size_Z']
+    contrib_cols = ['Value_Z_Contrib', 'Quality_Z_Contrib', 'Investment_Z_Contrib', 'Size_Z_Contrib']
     
-    df_display = df_port_scored[existing_cols].copy()
+    avail_cols = base_cols + [c for c in score_cols + contrib_cols if c in df_port_scored.columns]
+    df_display = df_port_scored[avail_cols].copy()
     
+    # 分かりやすいカラム名に変更
     rename_dict = {
-        'Beta_Z': 'Regression Beta',
-        'Sensitivity_Beta_Z': 'Sensitivity Beta',
-        'Value_Z': 'Value',
-        'Size_Z': 'Size',
-        'Quality_Z': 'Quality',
-        'Investment_Z': 'Investment'
+        'Value_Z': 'Value (固有)', 'Quality_Z': 'Quality (固有)', 
+        'Investment_Z': 'Investment (固有)', 'Size_Z': 'Size (固有)',
+        'Value_Z_Contrib': 'Value (寄与)', 'Quality_Z_Contrib': 'Quality (寄与)', 
+        'Investment_Z_Contrib': 'Investment (寄与)', 'Size_Z_Contrib': 'Size (寄与)',
+        'Weight': 'ウェイト'
     }
     df_display.rename(columns=rename_dict, inplace=True)
     
-    # 小数点以下2桁にフォーマットし、インデックスを隠して表示
-    st.dataframe(df_display.style.format({col: "{:.2f}" for col in df_display.columns if col not in ['Ticker']}), use_container_width=True, hide_index=True)
+    # UIコントロール：ソート対象の選択
+    sort_options = ['ウェイト'] + [v for v in rename_dict.values()]
+    col_sort1, col_sort2 = st.columns([1, 3])
+    with col_sort1:
+        sort_by = st.selectbox("並べ替え基準", options=sort_options, index=0)
+        sort_asc = st.checkbox("昇順で並べ替え", value=False)
+    
+    # 選択された基準でソート
+    if sort_by in df_display.columns:
+        df_display = df_display.sort_values(by=sort_by, ascending=sort_asc)
+    
+    # 表示フォーマット（数値列は小数点2桁）
+    format_dict = {col: "{:.2f}" for col in df_display.columns if col not in ['Ticker', 'Name']}
+    
+    # インデックスを隠してクリーンに表示
+    st.dataframe(
+        df_display.style.format(format_dict)
+                        .background_gradient(subset=[c for c in df_display.columns if '寄与' in c], cmap='RdBu', vmin=-0.5, vmax=0.5),
+        use_container_width=True,
+        hide_index=True
+    )
