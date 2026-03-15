@@ -4,7 +4,9 @@ import datetime
 import streamlit as st
 import re  # 4桁の証券コード抽出用に追加
 from scipy.stats import linregress
-from quant_engine import QuantEngine
+
+# 循環参照を避けるための遅延インポート
+# from quant_engine import QuantEngine
 
 # --- フォールバック用リスト (スクレイピング失敗時・サイト仕様変更時の保険・確定版) ---
 FALLBACK_NIKKEI_225 = [
@@ -110,8 +112,8 @@ class MarketMonitor:
         """
         最新の銘柄リストでバルク取得を行い、市場の「ものさし」を計算してメモリに保持する
         """
-        # 循環参照を防ぐためにメソッド内でインポート
         from data_provider import DataProvider  
+        from quant_engine import QuantEngine
         
         # 1. 公式サイトから最新銘柄リストを取得
         tickers = MarketMonitor.get_latest_tickers(bench_mode)
@@ -136,14 +138,19 @@ class MarketMonitor:
 class UniverseManager:
     """
     【Module 3】 市場統計管理 (Pro Version)
-    【完了版 Step 5】直交化パラメータの永続化と、市場の「ものさし」の完全固定
+    【修正版】Winsorization (外れ値処理) の強化と統計量の強力なキャッシュ化。
+    Zスコアの分母・分子が極端な一部の銘柄に引っ張られないよう保護する。
     """
 
     @staticmethod
+    @st.cache_data(ttl=3600, show_spinner=False)
     def generate_market_stats(df_universe_raw):
         """
         市場全体の生データを受け取り、統計情報(Stats)と処理済みデータを返す
+        st.cache_data により、同じユニバースでの再計算をスキップし高速化。
         """
+        from quant_engine import QuantEngine
+        
         # --- 0.00病の防止: 入力データの空チェックを追加 ---
         if df_universe_raw is None or df_universe_raw.empty:
             raise ValueError("ユニバース（市場基準）データが空です。データの取得に失敗した可能性があります。")
@@ -155,8 +162,7 @@ class UniverseManager:
         if df_proc is None or df_proc.empty:
             raise ValueError("ファクター算出後のデータが空になりました。入力データを確認してください。")
 
-        # 2. 統計作成用の外れ値処理 (Winsorization)
-        # Zスコア計算の基となるカラムを指定 (モメンタムを除外した5ファクター)
+        # 2. 統計作成用の外れ値処理 (Winsorization) の強化
         numeric_cols = [
             'Size_Log', 
             'Value_Raw',
@@ -169,14 +175,13 @@ class UniverseManager:
         
         for col in numeric_cols:
             if col in df_for_stats.columns:
-                # データ型を確実に数値にする
                 df_for_stats[col] = pd.to_numeric(df_for_stats[col], errors='coerce')
                 
-                # 上下1%をクリップして異常値（極端な資産変動など）を除外
-                # データが少ない場合はクリップしないよう制御
-                if len(df_for_stats[col].dropna()) > 10:
-                    lower = df_for_stats[col].quantile(0.01)
-                    upper = df_for_stats[col].quantile(0.99)
+                # 【Winsorization】 上下2.5%をクリップし、異常値が中央値・MADを歪めるのを防ぐ
+                valid_data = df_for_stats[col].dropna()
+                if len(valid_data) > 20: # サンプル数が十分な場合のみ実行
+                    lower = valid_data.quantile(0.025)
+                    upper = valid_data.quantile(0.975)
                     df_for_stats[col] = df_for_stats[col].clip(lower, upper)
 
         # 3. 直交化パラメータ & R² の算出 (Investmentに対してQualityを直交化)
@@ -188,7 +193,6 @@ class UniverseManager:
         )
 
         # 4. 各ファクターの統計量(Median, MAD)を算出
-        # 市場の「ものさし（傾き・切片）」を固定。KeyErrorを防ぐため get() で安全に取得
         stats = {
             'ortho_slope': ortho_params.get('slope', 0.0),
             'ortho_intercept': ortho_params.get('intercept', 0.0),
@@ -219,16 +223,16 @@ class UniverseManager:
                 stats[factor] = {'median': 0.0, 'mad': 1.0, 'col': col}
             else:
                 # 中央値 (Median)
-                median_val = series.median()
+                median_val = float(series.median())
                 
-                # MAD (Median Absolute Deviation)
+                # MAD (Median Absolute Deviation) を堅牢に算出
                 abs_deviation = np.abs(series - median_val)
-                mad_val = abs_deviation.median()
+                mad_val = float(abs_deviation.median())
                 
-                # 安全策: MADが0の場合は標準偏差で代用し、それでも0なら1.0にする
-                if mad_val == 0:
-                    mad_val = series.std()
-                    if pd.isna(mad_val) or mad_val == 0:
+                # 安全策: MADが極端に小さい(0に近い)場合は標準偏差で代用
+                if mad_val < 1e-6:
+                    mad_val = float(series.std())
+                    if pd.isna(mad_val) or mad_val < 1e-6:
                         mad_val = 1.0
 
                 stats[factor] = {
