@@ -10,16 +10,17 @@ import streamlit as st
 import re
 import io
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+# 並列処理(ThreadPoolExecutor)は429エラーの原因となるため削除
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 8.0: 45秒タイムアウト & 429防波堤搭載版)
-    - 外部通信に最大45秒の制限時間を設け、無限待ち(フリーズ)を防止
-    - Yahoo Financeからの429制限を即座に検知し、安全にアプリを停止させるエラーハンドリング
-    - 無駄なリトライを排除し、1回の試行で成否を判断して時間を節約
+    【Module 1】データ取得プロバイダー (Ver. 9.0: 超安全・直列処理＆Sleep搭載版)
+    - 429 Error (Too Many Requests) 回避のため、並列処理を完全廃止。
+    - 1銘柄ごとに time.sleep(1.0) のラグを入れ、人間らしいアクセス速度に制限。
+    - yfinance.download() に threads=False を明示し、内部的な並列アクセスを遮断。
+    - User-Agent の偽装と、指数関数的なリトライロジック (バックオフ) を強化。
     """
     
     # ローカルデータベースのパス
@@ -62,7 +63,6 @@ class DataProvider:
                     PRIMARY KEY (ticker, date)
                 )
             """)
-            # 5ファクター用のテーブルを追加
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS ff5_factors (
                     date TEXT PRIMARY KEY,
@@ -130,12 +130,9 @@ class DataProvider:
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
     def fetch_ken_french_5factors(start_date, end_date=None):
-        """
-        Kenneth R. French Data Library から日本市場の5ファクター(日次)を取得する。
-        """
+        """Kenneth R. French Data Library から日本市場の5ファクター(日次)を取得する。"""
         DataProvider._init_db()
         
-        # 1. まずSQLiteからロードを試みる
         try:
             with sqlite3.connect(DataProvider.DB_PATH) as conn:
                 query = f"SELECT * FROM ff5_factors WHERE date >= '{start_date}'"
@@ -151,12 +148,10 @@ class DataProvider:
         except Exception:
             pass
 
-        # 2. キャッシュがない、または古い場合はWebから取得
         url = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Japan_5_Factors_Daily_CSV.zip"
         session = DataProvider._create_session()
         
         try:
-            # 【重要修正】タイムアウトを45秒に厳格化
             response = session.get(url, timeout=45)
             response.raise_for_status()
             
@@ -196,18 +191,19 @@ class DataProvider:
     # =========================================================================
     @staticmethod
     def _create_session():
+        """User-Agent偽装と指数関数的バックオフ（リトライ）を搭載したセッション作成"""
         session = requests.Session()
         session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive"
         })
-        # 【重要修正】リトライの抑制: 429制限時に無駄な待機と複数回のリクエストをしないよう、1回で成否を判断する
+        # 【重要修正】429対策: エラー時にすぐ諦めず、待機時間を延ばしながら最大3回まで再試行する
         retries = Retry(
-            total=0,
-            status_forcelist=[500, 502, 503, 504],
+            total=3,
+            backoff_factor=1.5, # 1.5秒, 3.0秒, 6.0秒と待機時間が伸びる
+            status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS"]
         )
         session.mount("https://", HTTPAdapter(max_retries=retries))
@@ -215,12 +211,10 @@ class DataProvider:
 
     @staticmethod
     def _normalize_ticker(t):
-        if pd.isna(t) or not str(t).strip():
-            return ""
+        if pd.isna(t) or not str(t).strip(): return ""
         t_str = str(t).strip().upper()
         match = re.search(r'\b(\d{4})\b', t_str)
-        if match:
-            return f"{match.group(1)}.T"
+        if match: return f"{match.group(1)}.T"
         return t_str
 
     @staticmethod
@@ -243,11 +237,7 @@ class DataProvider:
                 st.warning(f"JPXリストの読み込みに失敗しました: {e}")
         
         fallback_tickers = [
-            "7203.T", "8306.T", "9984.T", "6861.T", "8035.T", "9432.T", "6758.T", "8316.T", "4063.T", "8058.T",
-            "6098.T", "4502.T", "6902.T", "8001.T", "8766.T", "7974.T", "4568.T", "8031.T", "6501.T", "7741.T",
-            "8411.T", "3382.T", "6367.T", "4519.T", "4543.T", "6954.T", "8053.T", "8002.T", "6594.T", "6981.T",
-            "4661.T", "4901.T", "2914.T", "6146.T", "7267.T", "8725.T", "4523.T", "7733.T", "4503.T", "6702.T",
-            "9022.T", "8591.T", "6503.T", "9020.T", "5108.T", "7269.T", "8802.T", "8801.T", "1925.T", "7011.T"
+            "7203.T", "8306.T", "9984.T", "6861.T", "8035.T", "9432.T", "6758.T", "8316.T", "4063.T", "8058.T"
         ]
         return {t: "JPX Data Missing" for t in fallback_tickers}
 
@@ -280,7 +270,7 @@ class DataProvider:
 
         if use_api:
             try:
-                # 【重要修正】タイムアウト45秒を追加
+                # threads=False で並列処理を防止
                 rm_df = yf.download("^N225", start=start_d, end=end_d, session=session, progress=False, threads=False, timeout=45)
                 
                 if not rm_df.empty:
@@ -301,10 +291,7 @@ class DataProvider:
                         save_df = pd.DataFrame({'^N225': close_series})
                         DataProvider._save_prices_to_sql(save_df)
             except Exception as e:
-                # 【重要修正】429エラーのキャッチと安全な停止
-                if "429" in str(e) or "Too Many Requests" in str(e):
-                    st.error("⚠️ 現在アクセス制限(429)がかかっています。10分ほどお待ちください。")
-                    st.stop()
+                # エラー時はスキップして後続の処理を生かす（アプリ全体を止めない）
                 pass
         
         if not close_series.empty:
@@ -323,14 +310,16 @@ class DataProvider:
 
     @staticmethod
     def _fetch_fmp_ratios(ticker_list):
+        """FMP APIからのファンダメンタルズ取得（直列処理＆Sleep）"""
         api_key = DataProvider.FMP_API_KEY
         if not api_key or not ticker_list: return {}
 
         rescued_data = {}
         session = DataProvider._create_session()
         
-        def fetch_one(t_orig):
-            time.sleep(0.3) 
+        # 【重要修正】ThreadPoolExecutorを廃止し、単純なforループ（直列）に変更
+        for t_orig in ticker_list:
+            time.sleep(0.5) # APIへの過負荷を防ぐためのSleep
             symbol = t_orig.replace(".T", ".JP") if ".T" in t_orig else t_orig
             url_ratios = f"https://financialmodelingprep.com/api/v3/ratios-ttm/{symbol}?apikey={api_key}"
             url_growth = f"https://financialmodelingprep.com/api/v3/financial-growth/{symbol}?limit=1&apikey={api_key}"
@@ -338,35 +327,25 @@ class DataProvider:
             
             data_res = {}
             try:
-                # 【重要修正】タイムアウト45秒を追加
                 r = session.get(url_ratios, timeout=45)
-                if r.status_code == 200:
+                if r.status_code == 200 and r.json():
                     items = r.json()
-                    if items:
-                        data_res['ROE'] = items[0].get('returnOnEquityTTM')
-                        data_res['PBR'] = items[0].get('priceToBookRatioTTM')
+                    data_res['ROE'] = items[0].get('returnOnEquityTTM')
+                    data_res['PBR'] = items[0].get('priceToBookRatioTTM')
                 
                 r_g = session.get(url_growth, timeout=45)
-                if r_g.status_code == 200:
+                if r_g.status_code == 200 and r_g.json():
                     g_items = r_g.json()
-                    if g_items:
-                        data_res['Growth'] = g_items[0].get('assetGrowth')
+                    data_res['Growth'] = g_items[0].get('assetGrowth')
                         
                 r_p = session.get(url_profile, timeout=45)
-                if r_p.status_code == 200:
+                if r_p.status_code == 200 and r_p.json():
                     p_items = r_p.json()
-                    if p_items:
-                        data_res['Size_Raw'] = p_items[0].get('mktCap')
+                    data_res['Size_Raw'] = p_items[0].get('mktCap')
                         
-                return t_orig, data_res
+                rescued_data[t_orig] = data_res
             except Exception:
-                return t_orig, None
-
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            results = list(executor.map(fetch_one, ticker_list))
-        
-        for t, data in results:
-            if data: rescued_data[t] = data
+                pass
             
         return rescued_data
 
@@ -380,12 +359,12 @@ class DataProvider:
         start_date = end_date - datetime.timedelta(days=days)
         session = DataProvider._create_session()
         
-        def fetch_hist_one(t_orig):
-            time.sleep(0.3)
+        # 【重要修正】直列処理＆Sleepに変更
+        for t_orig in ticker_list:
+            time.sleep(0.5)
             symbol = t_orig.replace(".T", ".JP") if ".T" in t_orig else t_orig
             url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?from={start_date}&to={end_date}&apikey={api_key}"
             try:
-                # 【重要修正】タイムアウト45秒を追加
                 r = session.get(url, timeout=45)
                 if r.status_code == 200:
                     data = r.json()
@@ -397,53 +376,34 @@ class DataProvider:
                         df['date'] = df['date'].dt.normalize()
                         df.set_index('date', inplace=True)
                         df.sort_index(inplace=True)
-                        return t_orig, df['close']
+                        all_series[t_orig] = df['close']
             except Exception:
                 pass
-            return t_orig, None
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            results = list(executor.map(fetch_hist_one, ticker_list))
-
-        for t, series in results:
-            if series is not None: all_series[t] = series
-        
         return pd.DataFrame(all_series)
 
     @staticmethod
     @st.cache_data(ttl=3600, show_spinner=False)
     def fetch_fundamentals(tickers):
+        """【最重要修正】ファンダメンタルズの直列・低速取得"""
         unique_tickers = list(set([DataProvider._normalize_ticker(t) for t in tickers if pd.notna(t)]))
         unique_tickers = [t for t in unique_tickers if t]
         if not unique_tickers: return pd.DataFrame()
 
         session = DataProvider._create_session()
-        tickers_str = " ".join(unique_tickers)
-        try:
-            tks = yf.Tickers(tickers_str, session=session)
-        except Exception as e:
-            # 【重要修正】429エラーハンドリング
-            if "429" in str(e) or "Too Many Requests" in str(e):
-                st.error("⚠️ 現在アクセス制限(429)がかかっています。10分ほどお待ちください。")
-                st.stop()
-            tks = None
+        valid_data = []
 
-        def get_yf_stock(ticker):
-            time.sleep(0.5)
+        # 【重要修正】yfinance.Tickers の一括取得をやめ、1銘柄ずつループで取得（直列処理）
+        for ticker in unique_tickers:
+            time.sleep(1.0) # 429回避のため1秒待機
             try:
-                if not tks: return None
-                tk = tks.tickers.get(ticker.upper())
-                if not tk: return None
-                
+                tk = yf.Ticker(ticker, session=session)
                 info = tk.info
                 if info is None: info = {}
                 
                 mktCap = info.get('marketCap', np.nan)
                 pbr = info.get('priceToBook', np.nan)
                 roe = info.get('returnOnEquity', np.nan)
-                
-                if pd.isna(pbr) and 'totalAssets' in info and mktCap:
-                    pass 
                 
                 res = {
                     'Ticker': ticker,
@@ -455,20 +415,15 @@ class DataProvider:
                     'Sector_Raw': info.get('sector', info.get('industry', 'Unknown')),
                     'Growth': info.get('revenueGrowth', info.get('earningsGrowth', np.nan))
                 }
-                return res
+                valid_data.append(res)
             except Exception as e:
-                # 内部エラー時もログに依存せずデフォルトNaNで返し、全体をフリーズさせない
-                return {
+                # 429エラー等が発生しても、空データを入れてアプリを止めない
+                valid_data.append({
                     'Ticker': ticker, 'Name': ticker, 'Price': np.nan, 'Size_Raw': np.nan,
                     'PBR': np.nan, 'ROE': np.nan, 'Sector_Raw': 'Unknown', 'Growth': np.nan
-                }
-
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            results = list(executor.map(get_yf_stock, unique_tickers))
+                })
         
-        valid_data = [d for d in results if d is not None]
         df = pd.DataFrame(valid_data)
-        
         if df.empty:
             df = pd.DataFrame({'Ticker': unique_tickers})
             
@@ -507,6 +462,7 @@ class DataProvider:
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
     def fetch_historical_prices(tickers, days=365):
+        """【最重要修正】履歴データの極小チャンク＆低速取得"""
         if not tickers: return pd.DataFrame()
         
         unique_tickers = list(set([DataProvider._normalize_ticker(t) for t in tickers if pd.notna(t)]))
@@ -536,16 +492,16 @@ class DataProvider:
         result_df = pd.DataFrame()
 
         if missing_tickers_for_api:
-            chunk_size = 5 
+            # 【重要修正】チャンクサイズを5から「2」に減らし、より安全に。
+            chunk_size = 2 
             for i in range(0, len(missing_tickers_for_api), chunk_size):
                 chunk = missing_tickers_for_api[i:i + chunk_size]
-                time.sleep(1.5) 
+                time.sleep(2.0) # 【重要修正】チャンク間の待機時間を2秒に延長
                 try:
-                    # 【重要修正】タイムアウト45秒を追加
                     df = yf.download(
                         chunk, start=start_d, end=end_d,
                         progress=False, group_by='ticker', auto_adjust=True,
-                        session=session, threads=False, timeout=45
+                        session=session, threads=False, timeout=45 # threads=False を維持
                     )
                     
                     if not df.empty:
@@ -571,11 +527,7 @@ class DataProvider:
                                 result_df = chunk_result
                             else:
                                 result_df = pd.concat([result_df, chunk_result], axis=1)
-                except Exception as e:
-                    # 【重要修正】429エラーのキャッチと安全な停止
-                    if "429" in str(e) or "Too Many Requests" in str(e):
-                        st.error("⚠️ 現在アクセス制限(429)がかかっています。10分ほどお待ちください。")
-                        st.stop()
+                except Exception:
                     pass
 
         current_cols = result_df.columns.tolist() if not result_df.empty else []
