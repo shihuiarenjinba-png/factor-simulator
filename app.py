@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 import re  # 正規表現モジュール
 import unicodedata  # サニタイズ用
 import time
-import datetime  # 【修正①】日付処理用のライブラリを追加し、NameErrorを解消
+import datetime  # 日付処理用のライブラリ
 
 # カスタムモジュールの読み込み
 try:
@@ -42,15 +42,23 @@ st.title("Factor Simulator V18.0 - 5-Factor Regression Analysis")
 st.markdown("Kenneth R. French の日本市場5ファクターに基づく厳密な時系列回帰分析と、銘柄ごとの加重平均寄与度を可視化します。")
 
 # ---------------------------------------------------------
-# キャッシュラッパー
+# キャッシュラッパー & 詳細進捗表示
 # ---------------------------------------------------------
+# 【重要修正】キャッシュの有効期限を1時間(3600秒)に設定し、再リクエストを防ぐ
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_cached_market_data(tickers):
+    """
+    データ取得プロセス。@st.cache_dataでラップされているため、
+    引数(tickers)が同じであれば、1時間は以下の処理をスキップして即座に結果を返す。
+    ※注: progress_barはキャッシュ関数の引数に含められないため、呼び出し側で制御する仕様に変更。
+    """
+    # 実際にはここで各DataProviderメソッドが個別のキャッシュ設定(ttl)を持っているので
+    # 2重のキャッシュ構造になっている。
+    
     df_fund = DataProvider.fetch_fundamentals(tickers)
-    df_hist = DataProvider.fetch_historical_prices(tickers, days=365*2) # 回帰の精度を上げるため2年分取得
+    df_hist = DataProvider.fetch_historical_prices(tickers, days=365*2)
     df_market = DataProvider.fetch_market_rates(days=365*2)
     
-    # 【NEW】ケネス・フレンチ 5-Factorの取得
     end_date = datetime.date.today().strftime('%Y-%m-%d')
     start_date = (datetime.date.today() - datetime.timedelta(days=365*2)).strftime('%Y-%m-%d')
     df_ff5 = DataProvider.fetch_ken_french_5factors(start_date=start_date, end_date=end_date)
@@ -84,7 +92,9 @@ run_button = st.sidebar.button("回帰分析を実行", type="primary")
 # 2. メイン処理ロジック
 # ---------------------------------------------------------
 if run_button:
-    progress_bar = st.progress(0, text="初期化中...")
+    # 【重要修正】プログレスバーの細分化。
+    # ユーザーが「フリーズした」と誤解しないよう、進捗を明確にする。
+    progress_bar = st.progress(0, text="[1/5] 初期化中...")
     
     # --- Step 0: 入力サニタイズ ---
     sanitized_port = unicodedata.normalize('NFKC', port_input)
@@ -104,16 +114,20 @@ if run_button:
             except: pass 
 
     # --- Step A: ユニバース準備 ---
-    progress_bar.progress(10, text="データ取得・同期中...")
+    progress_bar.progress(10, text="[2/5] ユニバース（比較基準）の準備中...")
     custom_list = MarketMonitor.load_tickers_from_file(uploaded_file) if uploaded_file else None
     bench_tickers = MarketMonitor.get_latest_tickers(bench_mode, custom_list)
     all_target_tickers = list(set(bench_tickers + port_tickers))
 
     # --- Step B: データ取得 (Fama-French含む) ---
+    # 直列処理になったため時間がかかることをユーザーに明示
+    progress_bar.progress(20, text=f"[3/5] 市場データの取得中... (429エラー回避のため、安全な速度でダウンロードしています。最大1分程度)")
+    
+    # キャッシュされた関数を呼び出す
     df_all_fund, df_hist, df_market, df_ff5 = get_cached_market_data(all_target_tickers)
     
     if df_all_fund.empty or df_hist.empty:
-        st.error("❌ データの取得に失敗しました。Yahoo Financeの制限（429）の可能性があります。")
+        st.error("❌ データの取得に失敗しました。Yahoo Financeの制限（429）の可能性があります。10分ほど時間を置いて再試行してください。")
         st.stop()
 
     # --- 取得結果のレポート ---
@@ -138,7 +152,7 @@ if run_button:
         df_port_initial = QuantEngine.calculate_portfolio_weights(df_port_initial, user_weights_provided=False)
 
     # --- Step D: 【重要】時系列多変量回帰分析の実行 ---
-    progress_bar.progress(40, text="時系列多変量回帰分析 (Time-series Regression) 実行中...")
+    progress_bar.progress(60, text="[4/5] 時系列多変量回帰分析 (Time-series Regression) 実行中...")
     
     regression_results = None
     if not df_ff5.empty:
@@ -150,7 +164,6 @@ if run_button:
 
     if regression_results and regression_results.get('R_squared') is not None:
         regression_success = True
-        # 回帰係数をそのままZスコア代わりとしてレーダーに渡す（正規化はVisualizerで吸収）
         portfolio_z_radar = {
             'Beta': regression_results.get('Beta', 0),
             'Size': regression_results.get('Size', 0),
@@ -159,11 +172,11 @@ if run_button:
             'Investment': regression_results.get('Investment', 0)
         }
     else:
-        st.warning("⚠️ ケネス・フレンチ・データとの同期または回帰分析に失敗しました。従来の単回帰Betaロジックで代用します。")
+        st.warning("⚠️ ケネス・フレンチ・データとの同期または回帰分析に失敗しました。")
         portfolio_z_radar = {'Beta': 1.0, 'Value': 0, 'Size': 0, 'Quality': 0, 'Investment': 0}
 
     # --- Step E: 銘柄固有（回帰前）Zスコアの計算 ---
-    progress_bar.progress(70, text="銘柄固有スコアと加重平均寄与度の計算中...")
+    progress_bar.progress(80, text="[5/5] 銘柄固有スコアと加重平均寄与度の計算中...")
     df_bench = df_all_fund[df_all_fund['Ticker'].isin(bench_tickers)]
     market_stats, _ = UniverseManager.generate_market_stats(df_bench)
 
@@ -171,7 +184,6 @@ if run_button:
     df_port_scored, _ = QuantEngine.compute_z_scores(df_port_proc, market_stats)
     
     # --- Step F: 加重平均寄与度の計算 ---
-    # QuantEngineに新設した関数を呼び出し、棒グラフ用の加重寄与度を算出
     df_port_scored, _ = QuantEngine.calculate_weighted_factor_contributions(df_port_scored)
 
     progress_bar.progress(100, text="分析完了！")
@@ -182,7 +194,6 @@ if run_button:
     # 3. 分析結果の表示 UI
     # ---------------------------------------------------------
     
-    # 回帰分析のエビデンス表示
     if regression_success:
         r2 = regression_results['R_squared']
         p_val = regression_results['p_values']['Beta']
@@ -200,7 +211,6 @@ if run_button:
         fig_radar = Visualizer.plot_radar_chart(portfolio_z_radar, title_suffix=suffix)
         st.plotly_chart(fig_radar, use_container_width=True)
     with col2:
-        # 新しい加重平均用の棒グラフ描画メソッドを呼び出す
         fig_bar = Visualizer.plot_contribution_bar_chart(df_port_scored)
         st.plotly_chart(fig_bar, use_container_width=True)
 
@@ -210,7 +220,6 @@ if run_button:
     st.markdown("---")
     st.subheader("📋 銘柄別 固有ファクタースコア & 加重平均寄与度")
     
-    # 表示用カラムの整理
     base_cols = ['Ticker', 'Weight', 'Name'] if 'Name' in df_port_scored.columns else ['Ticker', 'Weight']
     score_cols = ['Value_Z', 'Quality_Z', 'Investment_Z', 'Size_Z']
     contrib_cols = ['Value_Z_Contrib', 'Quality_Z_Contrib', 'Investment_Z_Contrib', 'Size_Z_Contrib']
@@ -218,7 +227,6 @@ if run_button:
     avail_cols = base_cols + [c for c in score_cols + contrib_cols if c in df_port_scored.columns]
     df_display = df_port_scored[avail_cols].copy()
     
-    # 分かりやすいカラム名に変更
     rename_dict = {
         'Value_Z': 'Value (固有)', 'Quality_Z': 'Quality (固有)', 
         'Investment_Z': 'Investment (Asset Growth) (固有)', 'Size_Z': 'Size (固有)',
@@ -228,26 +236,20 @@ if run_button:
     }
     df_display.rename(columns=rename_dict, inplace=True)
     
-    # UIコントロール：ソート対象の選択
-    # 実際に df_display に存在するカラムのみを選択肢にする安全処理を追加
     sort_options = ['ウェイト'] + [v for v in rename_dict.values() if v in df_display.columns]
     
     col_sort1, col_sort2 = st.columns([1, 3])
     with col_sort1:
         sort_by = st.selectbox("並べ替え基準", options=sort_options, index=0)
     with col_sort2:
-        # チェックボックスを右側のカラムに配置してUIを整頓
-        st.markdown("<br>", unsafe_allow_html=True) # 位置合わせの空白
+        st.markdown("<br>", unsafe_allow_html=True) 
         sort_asc = st.checkbox("昇順で並べ替え", value=False)
     
-    # 選択された基準でソート
     if sort_by in df_display.columns:
         df_display = df_display.sort_values(by=sort_by, ascending=sort_asc)
     
-    # 表示フォーマット（数値列は小数点2桁）
     format_dict = {col: "{:.2f}" for col in df_display.columns if col not in ['Ticker', 'Name']}
     
-    # インデックスを隠してクリーンに表示
     st.dataframe(
         df_display.style.format(format_dict)
                         .background_gradient(subset=[c for c in df_display.columns if '寄与' in c], cmap='RdBu', vmin=-0.5, vmax=0.5),
