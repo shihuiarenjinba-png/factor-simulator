@@ -1,13 +1,15 @@
 import plotly.graph_objects as go
 import plotly.express as px
 import pandas as pd
+import numpy as np  # 【重要修正】NameErrorを解消するためインポートを追加
 import streamlit as st
 
 class Visualizer:
     """
-    【修正版 V18.0】可視化・グラフ生成モジュール
+    【修正版 V18.1】可視化・グラフ生成モジュール
     多変量回帰分析結果（マクロ視点）のレーダーチャートと、
     銘柄固有スコアの加重平均寄与度（ミクロ視点）の棒グラフを統合したプロ仕様。
+    インポート漏れを解消し、描画の安定性を向上。
     """
 
     @staticmethod
@@ -60,8 +62,9 @@ class Visualizer:
             hovertemplate="%{text}<br>スコア: %{r:.2f}<extra></extra>"
         ))
 
-        # スケールの動的調整（基本は-3から+3だが、突出している場合は広げる）
-        max_val = max([abs(v) for v in values])
+        # 【修正】スケールの動的調整の安定化（NaNが含まれる場合のクラッシュ防止）
+        safe_values = np.nan_to_num(values, nan=0.0) # NaNを0に変換
+        max_val = max([abs(v) for v in safe_values])
         dynamic_range = max(3.0, float(np.ceil(max_val * 1.2)))
 
         fig.update_layout(
@@ -141,6 +144,10 @@ class Visualizer:
         # カスタム・ホバーテキストの作成
         def create_hover_text(row):
             val = row['Contribution']
+            # NaNの安全処理
+            if pd.isna(val):
+                return f"<b>銘柄: {row['Ticker']}</b><br>ファクター: {row['Factor']}<br>データ不足"
+                
             if val > 0:
                 status = "🟢 全体スコアを押し上げ"
             elif val < 0:
