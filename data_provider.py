@@ -16,16 +16,10 @@ from urllib3.util.retry import Retry
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 7.0: 5-Factor完全統合 & 429回避版)
-    - Tickerの自動正規化（Excelの数値変換エラー、.JP等の表記揺れを.Tに統一）
-    - FMP APIへの強力な自動フォールバック（None撲滅）
-    - JPX公式リストのローカルキャッシュによる高速なユニバース展開
-    - yfinanceマルチインデックスの堅牢な解体 (xsメソッド)
-    - SQLiteを用いたローカルDBへの直接コンタクト
-    - yf.downloadの小分けチャンク処理とスリープによる429エラー徹底回避
-    - タイムゾーンの剥奪と正規化の徹底による日付ズレの完全防止
-    - 【NEW】Kenneth R. French Data Libraryからの日本市場5ファクター(日次)の自動取得とキャッシュ
-    - 【NEW】PBR/ROE欠損時の「総資産ベース」等による代替計算ロジック強化
+    【Module 1】データ取得プロバイダー (Ver. 8.0: 45秒タイムアウト & 429防波堤搭載版)
+    - 外部通信に最大45秒の制限時間を設け、無限待ち(フリーズ)を防止
+    - Yahoo Financeからの429制限を即座に検知し、安全にアプリを停止させるエラーハンドリング
+    - 無駄なリトライを排除し、1回の試行で成否を判断して時間を節約
     """
     
     # ローカルデータベースのパス
@@ -131,7 +125,7 @@ class DataProvider:
             return pd.DataFrame()
 
     # =========================================================================
-    # 【NEW】Kenneth French 5-Factor データ取得メソッド
+    # Kenneth French 5-Factor データ取得メソッド
     # =========================================================================
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
@@ -150,7 +144,6 @@ class DataProvider:
                 df_ff = pd.read_sql(query, conn, index_col='date', parse_dates=['date'])
                 
             if not df_ff.empty:
-                # 最新データ（直近1ヶ月以内）が含まれていれば、キャッシュを信用して返す
                 max_date = df_ff.index.max()
                 today = pd.to_datetime(datetime.date.today())
                 if (today - max_date).days <= 30:
@@ -163,43 +156,37 @@ class DataProvider:
         session = DataProvider._create_session()
         
         try:
-            response = session.get(url, timeout=15)
+            # 【重要修正】タイムアウトを45秒に厳格化
+            response = session.get(url, timeout=45)
             response.raise_for_status()
             
             with zipfile.ZipFile(io.BytesIO(response.content)) as z:
-                # ZIP内のCSVファイル名を取得
                 csv_filename = z.namelist()[0]
                 with z.open(csv_filename) as f:
-                    # ヘッダー行をスキップして読み込む（通常、最初の数行は説明文）
-                    # Fama-FrenchのCSVは通常3行目からデータ開始
                     df = pd.read_csv(f, skiprows=3, index_col=0)
             
-            # インデックス（日付）のクレンジング (例: '19900702' -> datetime)
             df.index = pd.to_datetime(df.index.astype(str), format='%Y%m%d', errors='coerce')
             df = df.dropna()
             df.index = df.index.normalize()
             
-            # カラム名の正規化と数値変換（パーセント表記を小数に変換）
             df.columns = [c.strip().upper() for c in df.columns]
             rename_map = {'MKT-RF': 'mkt_rf', 'SMB': 'smb', 'HML': 'hml', 'RMW': 'rmw', 'CMA': 'cma', 'RF': 'rf'}
             
-            # 必要なカラムのみ抽出しリネーム
             df = df[[c for c in df.columns if c in rename_map.keys()]]
             df.rename(columns=rename_map, inplace=True)
-            
-            # Fama-Frenchのデータは%表記なので100で割る
             df = df / 100.0
             
-            # SQLiteに保存
             with sqlite3.connect(DataProvider.DB_PATH) as conn:
                 df_to_save = df.reset_index()
                 df_to_save['date'] = df_to_save['date'].dt.strftime('%Y-%m-%d')
                 df_to_save.to_sql('ff5_factors', conn, if_exists='replace', index=False)
 
-            # 指定期間でフィルタリングして返す
             df_filtered = df.loc[start_date:end_date] if end_date else df.loc[start_date:]
             return df_filtered
             
+        except requests.exceptions.Timeout:
+            st.error("⚠️ Fama-Frenchデータの取得がタイムアウトしました(45秒)。通信環境を確認してください。")
+            return pd.DataFrame()
         except Exception as e:
             st.error(f"Fama-Frenchデータの取得に失敗しました: {e}")
             return pd.DataFrame()
@@ -217,10 +204,10 @@ class DataProvider:
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive"
         })
+        # 【重要修正】リトライの抑制: 429制限時に無駄な待機と複数回のリクエストをしないよう、1回で成否を判断する
         retries = Retry(
-            total=4,
-            backoff_factor=2.0, # 指数関数的バックオフを強化 (2, 4, 8秒...)
-            status_forcelist=[429, 500, 502, 503, 504],
+            total=0,
+            status_forcelist=[500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS"]
         )
         session.mount("https://", HTTPAdapter(max_retries=retries))
@@ -265,7 +252,7 @@ class DataProvider:
         return {t: "JPX Data Missing" for t in fallback_tickers}
 
     # =========================================================================
-    # マーケットデータ (Rm, Rf) の取得 (SQLite対応)
+    # マーケットデータ (Rm, Rf) の取得
     # =========================================================================
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
@@ -293,7 +280,8 @@ class DataProvider:
 
         if use_api:
             try:
-                rm_df = yf.download("^N225", start=start_d, end=end_d, session=session, progress=False, threads=False)
+                # 【重要修正】タイムアウト45秒を追加
+                rm_df = yf.download("^N225", start=start_d, end=end_d, session=session, progress=False, threads=False, timeout=45)
                 
                 if not rm_df.empty:
                     if isinstance(rm_df.columns, pd.MultiIndex):
@@ -312,7 +300,11 @@ class DataProvider:
                         
                         save_df = pd.DataFrame({'^N225': close_series})
                         DataProvider._save_prices_to_sql(save_df)
-            except Exception:
+            except Exception as e:
+                # 【重要修正】429エラーのキャッチと安全な停止
+                if "429" in str(e) or "Too Many Requests" in str(e):
+                    st.error("⚠️ 現在アクセス制限(429)がかかっています。10分ほどお待ちください。")
+                    st.stop()
                 pass
         
         if not close_series.empty:
@@ -335,7 +327,7 @@ class DataProvider:
         if not api_key or not ticker_list: return {}
 
         rescued_data = {}
-        session = DataProvider._create_session() # FMPにもSessionを適用
+        session = DataProvider._create_session()
         
         def fetch_one(t_orig):
             time.sleep(0.3) 
@@ -346,23 +338,21 @@ class DataProvider:
             
             data_res = {}
             try:
-                # Ratios (ROE, PBR)
-                r = session.get(url_ratios, timeout=5)
+                # 【重要修正】タイムアウト45秒を追加
+                r = session.get(url_ratios, timeout=45)
                 if r.status_code == 200:
                     items = r.json()
                     if items:
                         data_res['ROE'] = items[0].get('returnOnEquityTTM')
                         data_res['PBR'] = items[0].get('priceToBookRatioTTM')
                 
-                # Growth (Investment)
-                r_g = session.get(url_growth, timeout=5)
+                r_g = session.get(url_growth, timeout=45)
                 if r_g.status_code == 200:
                     g_items = r_g.json()
                     if g_items:
                         data_res['Growth'] = g_items[0].get('assetGrowth')
                         
-                # Profile (Market Cap 代替)
-                r_p = session.get(url_profile, timeout=5)
+                r_p = session.get(url_profile, timeout=45)
                 if r_p.status_code == 200:
                     p_items = r_p.json()
                     if p_items:
@@ -395,7 +385,8 @@ class DataProvider:
             symbol = t_orig.replace(".T", ".JP") if ".T" in t_orig else t_orig
             url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?from={start_date}&to={end_date}&apikey={api_key}"
             try:
-                r = session.get(url, timeout=5)
+                # 【重要修正】タイムアウト45秒を追加
+                r = session.get(url, timeout=45)
                 if r.status_code == 200:
                     data = r.json()
                     if 'historical' in data:
@@ -430,11 +421,14 @@ class DataProvider:
         tickers_str = " ".join(unique_tickers)
         try:
             tks = yf.Tickers(tickers_str, session=session)
-        except Exception:
+        except Exception as e:
+            # 【重要修正】429エラーハンドリング
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                st.error("⚠️ 現在アクセス制限(429)がかかっています。10分ほどお待ちください。")
+                st.stop()
             tks = None
 
         def get_yf_stock(ticker):
-            # API制限回避のスリープ
             time.sleep(0.5)
             try:
                 if not tks: return None
@@ -444,16 +438,11 @@ class DataProvider:
                 info = tk.info
                 if info is None: info = {}
                 
-                # 【重要修正3】財務データの代替計算ロジック強化
-                # PBRが取れない場合、時価総額 / 純資産 で代替（あるいはその逆）
                 mktCap = info.get('marketCap', np.nan)
                 pbr = info.get('priceToBook', np.nan)
                 roe = info.get('returnOnEquity', np.nan)
                 
-                # totalAssets等の情報から補完できるか試みる（yfinanceの仕様に依存）
                 if pd.isna(pbr) and 'totalAssets' in info and mktCap:
-                    # 簡易的なPBR代替
-                    # ※厳密には純資産だが、情報がない場合の苦肉の策
                     pass 
                 
                 res = {
@@ -467,7 +456,8 @@ class DataProvider:
                     'Growth': info.get('revenueGrowth', info.get('earningsGrowth', np.nan))
                 }
                 return res
-            except Exception:
+            except Exception as e:
+                # 内部エラー時もログに依存せずデフォルトNaNで返し、全体をフリーズさせない
                 return {
                     'Ticker': ticker, 'Name': ticker, 'Price': np.nan, 'Size_Raw': np.nan,
                     'PBR': np.nan, 'ROE': np.nan, 'Sector_Raw': 'Unknown', 'Growth': np.nan
@@ -486,7 +476,6 @@ class DataProvider:
         for c in req_cols:
             if c not in df.columns: df[c] = np.nan
 
-        # yfinanceで欠損した項目をFMPで補完
         missing_cond = df['ROE'].isna() | df['Growth'].isna() | df['PBR'].isna() | df['Size_Raw'].isna()
         missing_tickers = df[missing_cond]['Ticker'].tolist() if not df.empty else unique_tickers
         
@@ -513,7 +502,7 @@ class DataProvider:
         return df
 
     # =========================================================================
-    # 履歴データ取得（SQLite対応・APIリクエスト最小化・チャンク処理）
+    # 履歴データ取得
     # =========================================================================
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
@@ -529,14 +518,12 @@ class DataProvider:
         end_d = datetime.date.today()
         start_d = end_d - datetime.timedelta(days=days)
         
-        # 1. SQLデータベースから既存の株価履歴をロード
         cached_df = DataProvider._load_prices_from_sql(
             unique_tickers, 
             start_d.strftime('%Y-%m-%d'), 
             end_d.strftime('%Y-%m-%d')
         )
         
-        # 2. APIで新たに取得しなければならないティッカーを選別
         missing_tickers_for_api = unique_tickers.copy()
         if not cached_df.empty:
             latest_date_in_db = cached_df.index.max()
@@ -548,17 +535,17 @@ class DataProvider:
 
         result_df = pd.DataFrame()
 
-        # 3. 不足している銘柄のみAPIで取得 (429対策として小分けチャンク処理)
         if missing_tickers_for_api:
-            chunk_size = 5 # 5銘柄ずつ小分けにして取得
+            chunk_size = 5 
             for i in range(0, len(missing_tickers_for_api), chunk_size):
                 chunk = missing_tickers_for_api[i:i + chunk_size]
-                time.sleep(1.5) # チャンク間で長めのスリープ(1.5秒)を挟む
+                time.sleep(1.5) 
                 try:
+                    # 【重要修正】タイムアウト45秒を追加
                     df = yf.download(
                         chunk, start=start_d, end=end_d,
                         progress=False, group_by='ticker', auto_adjust=True,
-                        session=session, threads=False
+                        session=session, threads=False, timeout=45
                     )
                     
                     if not df.empty:
@@ -584,10 +571,13 @@ class DataProvider:
                                 result_df = chunk_result
                             else:
                                 result_df = pd.concat([result_df, chunk_result], axis=1)
-                except Exception:
+                except Exception as e:
+                    # 【重要修正】429エラーのキャッチと安全な停止
+                    if "429" in str(e) or "Too Many Requests" in str(e):
+                        st.error("⚠️ 現在アクセス制限(429)がかかっています。10分ほどお待ちください。")
+                        st.stop()
                     pass
 
-        # 4. Yfinanceで取れなかった銘柄をFMPでフォールバック
         current_cols = result_df.columns.tolist() if not result_df.empty else []
         missing_from_api = list(set(missing_tickers_for_api) - set(current_cols))
         
@@ -603,11 +593,9 @@ class DataProvider:
                 else:
                     result_df = pd.concat([result_df, fmp_df], axis=1)
                     
-        # 5. 取得できたAPIデータをSQLiteに保存
         if not result_df.empty:
             DataProvider._save_prices_to_sql(result_df)
 
-        # 6. キャッシュ（DB）と今回取得したAPIデータを統合して返す
         final_df = pd.DataFrame()
         if not cached_df.empty and not result_df.empty:
             final_df = pd.concat([cached_df, result_df], axis=1)
