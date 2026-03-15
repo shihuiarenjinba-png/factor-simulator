@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 import re  # 正規表現モジュール
 import unicodedata  # サニタイズ用
 import time
+import datetime  # 【修正①】日付処理用のライブラリを追加し、NameErrorを解消
 
 # カスタムモジュールの読み込み
 try:
@@ -48,6 +49,7 @@ def get_cached_market_data(tickers):
     df_fund = DataProvider.fetch_fundamentals(tickers)
     df_hist = DataProvider.fetch_historical_prices(tickers, days=365*2) # 回帰の精度を上げるため2年分取得
     df_market = DataProvider.fetch_market_rates(days=365*2)
+    
     # 【NEW】ケネス・フレンチ 5-Factorの取得
     end_date = datetime.date.today().strftime('%Y-%m-%d')
     start_date = (datetime.date.today() - datetime.timedelta(days=365*2)).strftime('%Y-%m-%d')
@@ -158,7 +160,6 @@ if run_button:
         }
     else:
         st.warning("⚠️ ケネス・フレンチ・データとの同期または回帰分析に失敗しました。従来の単回帰Betaロジックで代用します。")
-        # 従来の calculate_beta を呼び出すフォールバックロジック (省略)
         portfolio_z_radar = {'Beta': 1.0, 'Value': 0, 'Size': 0, 'Quality': 0, 'Investment': 0}
 
     # --- Step E: 銘柄固有（回帰前）Zスコアの計算 ---
@@ -220,18 +221,23 @@ if run_button:
     # 分かりやすいカラム名に変更
     rename_dict = {
         'Value_Z': 'Value (固有)', 'Quality_Z': 'Quality (固有)', 
-        'Investment_Z': 'Investment (固有)', 'Size_Z': 'Size (固有)',
+        'Investment_Z': 'Investment (Asset Growth) (固有)', 'Size_Z': 'Size (固有)',
         'Value_Z_Contrib': 'Value (寄与)', 'Quality_Z_Contrib': 'Quality (寄与)', 
-        'Investment_Z_Contrib': 'Investment (寄与)', 'Size_Z_Contrib': 'Size (寄与)',
+        'Investment_Z_Contrib': 'Investment (Asset Growth) (寄与)', 'Size_Z_Contrib': 'Size (寄与)',
         'Weight': 'ウェイト'
     }
     df_display.rename(columns=rename_dict, inplace=True)
     
     # UIコントロール：ソート対象の選択
-    sort_options = ['ウェイト'] + [v for v in rename_dict.values()]
+    # 実際に df_display に存在するカラムのみを選択肢にする安全処理を追加
+    sort_options = ['ウェイト'] + [v for v in rename_dict.values() if v in df_display.columns]
+    
     col_sort1, col_sort2 = st.columns([1, 3])
     with col_sort1:
         sort_by = st.selectbox("並べ替え基準", options=sort_options, index=0)
+    with col_sort2:
+        # チェックボックスを右側のカラムに配置してUIを整頓
+        st.markdown("<br>", unsafe_allow_html=True) # 位置合わせの空白
         sort_asc = st.checkbox("昇順で並べ替え", value=False)
     
     # 選択された基準でソート
