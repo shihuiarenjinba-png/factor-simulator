@@ -38,32 +38,23 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Factor Simulator V18.0 - 5-Factor Regression Analysis")
+st.title("Factor Simulator V18.1 - 5-Factor Regression Analysis")
 st.markdown("Kenneth R. French の日本市場5ファクターに基づく厳密な時系列回帰分析と、銘柄ごとの加重平均寄与度を可視化します。")
 
 # ---------------------------------------------------------
 # キャッシュラッパー & 詳細進捗表示
 # ---------------------------------------------------------
-# 【重要修正】キャッシュの有効期限を1時間(3600秒)に設定し、再リクエストを防ぐ
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_cached_market_data(tickers):
     """
-    データ取得プロセス。@st.cache_dataでラップされているため、
-    引数(tickers)が同じであれば、1時間は以下の処理をスキップして即座に結果を返す。
-    ※注: progress_barはキャッシュ関数の引数に含められないため、呼び出し側で制御する仕様に変更。
+    【重要修正】yfinance由来のデータ（株価・財務）のみをここで取得。
+    ファクターデータ(Fama-French)はエラー切り分けのためこの関数の外で取得する。
     """
-    # 実際にはここで各DataProviderメソッドが個別のキャッシュ設定(ttl)を持っているので
-    # 2重のキャッシュ構造になっている。
-    
     df_fund = DataProvider.fetch_fundamentals(tickers)
     df_hist = DataProvider.fetch_historical_prices(tickers, days=365*2)
     df_market = DataProvider.fetch_market_rates(days=365*2)
     
-    end_date = datetime.date.today().strftime('%Y-%m-%d')
-    start_date = (datetime.date.today() - datetime.timedelta(days=365*2)).strftime('%Y-%m-%d')
-    df_ff5 = DataProvider.fetch_ken_french_5factors(start_date=start_date, end_date=end_date)
-    
-    return df_fund, df_hist, df_market, df_ff5
+    return df_fund, df_hist, df_market
 
 # ---------------------------------------------------------
 # 1. サイドバー: 入力
@@ -92,8 +83,6 @@ run_button = st.sidebar.button("回帰分析を実行", type="primary")
 # 2. メイン処理ロジック
 # ---------------------------------------------------------
 if run_button:
-    # 【重要修正】プログレスバーの細分化。
-    # ユーザーが「フリーズした」と誤解しないよう、進捗を明確にする。
     progress_bar = st.progress(0, text="[1/5] 初期化中...")
     
     # --- Step 0: 入力サニタイズ ---
@@ -120,15 +109,26 @@ if run_button:
     all_target_tickers = list(set(bench_tickers + port_tickers))
 
     # --- Step B: データ取得 (Fama-French含む) ---
-    # 直列処理になったため時間がかかることをユーザーに明示
-    progress_bar.progress(20, text=f"[3/5] 市場データの取得中... (429エラー回避のため、安全な速度でダウンロードしています。最大1分程度)")
+    progress_bar.progress(20, text=f"[3/5] 市場データ(株価・財務)の取得中... (最大1分程度)")
     
-    # キャッシュされた関数を呼び出す
-    df_all_fund, df_hist, df_market, df_ff5 = get_cached_market_data(all_target_tickers)
+    # 1. yfinanceからのデータ取得
+    df_all_fund, df_hist, df_market = get_cached_market_data(all_target_tickers)
     
     if df_all_fund.empty or df_hist.empty:
-        st.error("❌ データの取得に失敗しました。Yahoo Financeの制限（429）の可能性があります。10分ほど時間を置いて再試行してください。")
+        # yfinanceが原因のエラーであることがここで確定する
+        st.error("❌ 株価・財務データの取得に失敗しました。Yahoo Financeの制限（429エラー）の可能性があります。10分ほど時間を置いて再試行してください。")
         st.stop()
+
+    progress_bar.progress(40, text=f"[3/5] マクロファクターデータの同期中...")
+    
+    # 2. 【重要修正】ケネス・フレンチデータの独立取得
+    end_date = datetime.date.today().strftime('%Y-%m-%d')
+    start_date = (datetime.date.today() - datetime.timedelta(days=365*2)).strftime('%Y-%m-%d')
+    df_ff5 = DataProvider.fetch_ken_french_5factors(start_date=start_date, end_date=end_date)
+
+    if df_ff5.empty:
+        # ファクターデータが原因のエラーであることがここで確定する
+        st.warning("⚠️ ケネス・フレンチの5ファクターデータの取得に失敗しました。サイトの仕様変更または一時的なアクセス制限の可能性があります。")
 
     # --- 取得結果のレポート ---
     fetched_tickers = df_all_fund['Ticker'].tolist()
@@ -136,7 +136,7 @@ if run_button:
     port_tickers_valid = [t for t in port_tickers if t not in missing_api]
 
     if missing_api:
-        st.warning(f"⚠️ 以下の銘柄はデータ取得エラーのため除外されました: {', '.join(missing_api)}")
+        st.warning(f"⚠️ 以下の銘柄は株価取得エラー(429等)のため除外されました: {', '.join(missing_api)}")
 
     if not port_tickers_valid:
         st.error("計算可能な銘柄がありません。")
@@ -172,7 +172,7 @@ if run_button:
             'Investment': regression_results.get('Investment', 0)
         }
     else:
-        st.warning("⚠️ ケネス・フレンチ・データとの同期または回帰分析に失敗しました。")
+        st.warning("⚠️ 回帰分析に必要なデータ(十分な履歴またはファクターデータ)が揃わなかったため、一部の分析をスキップしました。")
         portfolio_z_radar = {'Beta': 1.0, 'Value': 0, 'Size': 0, 'Quality': 0, 'Investment': 0}
 
     # --- Step E: 銘柄固有（回帰前）Zスコアの計算 ---
@@ -200,7 +200,7 @@ if run_button:
         st.markdown(f"""
         <div class="summary-box">
             <h4>📈 回帰分析サマリー (Kenneth French 5-Factor Model)</h4>
-            <p>このポートフォリオの日次リターン変動のうち、<b>{r2*100:.1f}%</b> は5つのマクロファクターによって説明可能です。(決定係数 R² = {r2:.3f})<br>
+            <p>このポートフォリオの日次超過リターン変動のうち、<b>{r2*100:.1f}%</b> は5つのマクロファクターによって説明可能です。(決定係数 R² = {r2:.3f})<br>
             ※市場ベータの統計的有意性 (p値): {p_val:.4f}</p>
         </div>
         """, unsafe_allow_html=True)
