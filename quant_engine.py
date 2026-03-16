@@ -24,6 +24,7 @@ class QuantEngine:
     【重要修正2】妥当性チェック: ベータ値が完全に「1.0」や「0.0」に張り付く偽装データを検出・排除
     【重要修正3】多変量回帰分析 (Time-series Regression) の実装と統計的有意性(t値, R^2)の算出
     【重要修正4】加重平均スコアリング: 銘柄ごとの固有ファクタースコアのウェイト寄与度分解
+    【最重要修正 V18.0】回帰分析の目的変数を純粋なリターンから「超過リターン(Ri - Rf)」に厳密化
     """
     
     # =========================================================================
@@ -32,7 +33,7 @@ class QuantEngine:
     @staticmethod
     def run_5factor_regression(df_hist, df_weights, df_ff5):
         """
-        ポートフォリオの日次リターンと、ケネス・フレンチの5ファクターを日付で同期し、
+        ポートフォリオの日次超過リターンと、ケネス・フレンチの5ファクターを日付で同期し、
         多変量回帰分析を実行してポートフォリオ全体の「回帰後ベータ」と「t値」を算出する。
         """
         if df_hist.empty or df_ff5.empty or df_weights.empty or sm is None:
@@ -41,6 +42,15 @@ class QuantEngine:
         try:
             # 1. 銘柄別日次リターンの計算
             rets = df_hist.pct_change().dropna()
+            
+            # インデックス(日付)の型を厳密に合わせる (tz-naive & normalized)
+            if rets.index.tz is not None:
+                rets.index = rets.index.tz_localize(None)
+            rets.index = pd.to_datetime(rets.index).normalize()
+            
+            if df_ff5.index.tz is not None:
+                df_ff5.index = df_ff5.index.tz_localize(None)
+            df_ff5.index = pd.to_datetime(df_ff5.index).normalize()
             
             # 2. 有効な銘柄のみでウェイトを再正規化
             valid_tickers = [t for t in df_weights['Ticker'] if t in rets.columns]
@@ -59,9 +69,11 @@ class QuantEngine:
             aligned = pd.concat([port_ret.rename('Port_Ret'), df_ff5], axis=1, join='inner').dropna()
             
             if len(aligned) < 30: # 統計的有意性を出すための最低サンプル数(30日)
+                print(f"[Regression] サンプル数不足: {len(aligned)} 日分しか同期できませんでした。")
                 return None
                 
-            # 5. 超過リターン = ポートフォリオリターン - 無リスク金利
+            # 5. 【重要修正】超過リターン = ポートフォリオリターン - 無リスク金利(RF)
+            # 理論通り、左辺を (Ri - Rf) にする
             y = aligned['Port_Ret'] - aligned['rf']
             
             # 6. 独立変数 (Mkt-RF, SMB, HML, RMW, CMA)
