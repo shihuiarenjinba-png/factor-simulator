@@ -35,10 +35,11 @@ st.markdown("""
     .metric-value { font-size: 24px; font-weight: bold; color: #333; }
     .metric-label { font-size: 14px; color: #666; margin-top: 5px; }
     .summary-box { background-color: #e8f4f8; padding: 15px; border-radius: 8px; border-left: 5px solid #1f77b4; margin-bottom: 20px;}
+    .warning-box { background-color: #fff3f3; padding: 15px; border-radius: 8px; border-left: 5px solid #ff4b4b; margin-bottom: 20px;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Factor Simulator V18.2 - 5-Factor Regression Analysis")
+st.title("Factor Simulator V18.3 - 5-Factor Regression Analysis")
 st.markdown("Kenneth R. French の日本市場5ファクターに基づく厳密な時系列回帰分析と、銘柄ごとの加重平均寄与度を可視化します。")
 
 # ---------------------------------------------------------
@@ -85,7 +86,7 @@ run_button = st.sidebar.button("回帰分析を実行", type="primary")
 if run_button:
     progress_bar = st.progress(0, text="[1/5] 初期化中...")
     
-    # 【重要修正1】日付定義の共通化。ここで決めた日付を全てに使い回す。
+    # 日付定義の共通化。ここで決めた日付を全てに使い回す。
     lookback_days = 365 * 2
     global_end_date = datetime.date.today()
     global_start_date = global_end_date - datetime.timedelta(days=lookback_days)
@@ -120,7 +121,7 @@ if run_button:
     df_all_fund, df_hist, df_market = get_cached_market_data(all_target_tickers, days=lookback_days)
     
     if df_all_fund.empty or df_hist.empty:
-        # 【重要修正2】429エラー時の具体的な回避策を提示
+        # 429エラー時の具体的な回避策を提示
         st.error("❌ 株価・財務データの取得に失敗しました。Yahoo Financeの制限（429エラー）の可能性があります。\n\n**【回避策】分析するポートフォリオ銘柄数を減らすか、10分ほど時間を置いてから再試行してください。**")
         st.stop()
 
@@ -176,7 +177,7 @@ if run_button:
             'Investment': regression_results.get('Investment', 0)
         }
     else:
-        st.warning("⚠️ 回帰分析に必要なデータ(十分な履歴またはファクターデータ)が揃わなかったため、一部の分析をスキップしました。")
+        # 回帰失敗時のフォールバック値（あくまで参考値として扱う）
         portfolio_z_radar = {'Beta': 1.0, 'Value': 0, 'Size': 0, 'Quality': 0, 'Investment': 0}
 
     # --- Step E: 銘柄固有（回帰前）Zスコアの計算 ---
@@ -198,6 +199,7 @@ if run_button:
     # 3. 分析結果の表示 UI
     # ---------------------------------------------------------
     
+    # 【重要修正】分析成功時と失敗時でUIブロック（フィードバック）を明確に分ける
     if regression_success:
         r2 = regression_results['R_squared']
         p_val = regression_results['p_values']['Beta']
@@ -208,10 +210,18 @@ if run_button:
             ※市場ベータの統計的有意性 (p値): {p_val:.4f}</p>
         </div>
         """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div class="warning-box">
+            <h4>⚠️ 回帰分析の実行条件が揃いませんでした</h4>
+            <p>ファクターデータの取得失敗、または株価データとの有効な結合日数が不足(30日未満)しています。<br>
+            表示されているレーダーチャートは回帰分析を伴わない<b>推定不能な参考値(Fallback)</b>です。</p>
+        </div>
+        """, unsafe_allow_html=True)
 
     col1, col2 = st.columns([1, 1])
     with col1:
-        # 【重要修正3】回帰分析失敗時のグラフタイトルを明確に変更
+        # 回帰分析失敗時のグラフタイトルを明確に変更
         suffix = f"(R²={regression_results['R_squared']:.2f})" if regression_success else "(推定不能：参考値)"
         fig_radar = Visualizer.plot_radar_chart(portfolio_z_radar, title_suffix=suffix)
         st.plotly_chart(fig_radar, use_container_width=True)
