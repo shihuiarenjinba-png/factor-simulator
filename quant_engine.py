@@ -25,6 +25,7 @@ class QuantEngine:
     【重要修正3】多変量回帰分析 (Time-series Regression) の実装と統計的有意性(t値, R^2)の算出
     【重要修正4】加重平均スコアリング: 銘柄ごとの固有ファクタースコアのウェイト寄与度分解
     【最重要修正 V18.0】回帰分析の目的変数を純粋なリターンから「超過リターン(Ri - Rf)」に厳密化
+    【最重要修正 V18.1】ファクター同期の厳格化 (Inner Joinと正規化の徹底)、サンプル数バリデーション強化
     """
     
     # =========================================================================
@@ -37,6 +38,7 @@ class QuantEngine:
         多変量回帰分析を実行してポートフォリオ全体の「回帰後ベータ」と「t値」を算出する。
         """
         if df_hist.empty or df_ff5.empty or df_weights.empty or sm is None:
+            print("[Regression] 初期データが不足しているか、statsmodelsがインストールされていません。")
             return None
 
         try:
@@ -54,7 +56,9 @@ class QuantEngine:
             
             # 2. 有効な銘柄のみでウェイトを再正規化
             valid_tickers = [t for t in df_weights['Ticker'] if t in rets.columns]
-            if not valid_tickers: return None
+            if not valid_tickers: 
+                print("[Regression] リターン計算可能な有効なティッカーがありません。")
+                return None
             
             w_dict = dict(zip(df_weights['Ticker'], df_weights['Weight']))
             w_series = pd.Series({t: w_dict[t] for t in valid_tickers})
@@ -66,10 +70,11 @@ class QuantEngine:
             port_ret = (rets[valid_tickers] * w_series).sum(axis=1)
             
             # 4. 5ファクターデータとの日付同期 (Inner Joinによる完全一致)
+            # 【重要】互いに存在する日付のデータだけを抽出する
             aligned = pd.concat([port_ret.rename('Port_Ret'), df_ff5], axis=1, join='inner').dropna()
             
             if len(aligned) < 30: # 統計的有意性を出すための最低サンプル数(30日)
-                print(f"[Regression] サンプル数不足: {len(aligned)} 日分しか同期できませんでした。")
+                print(f"[Regression] サンプル数不足: 結合後の有効日数が {len(aligned)} 日分しかありません。(最低30日必要)")
                 return None
                 
             # 5. 【重要修正】超過リターン = ポートフォリオリターン - 無リスク金利(RF)
