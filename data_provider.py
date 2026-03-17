@@ -11,15 +11,13 @@ import re
 import io
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-# 並列処理(ThreadPoolExecutor)は429エラーの原因となるため削除
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 9.2: ファクター取得徹底強化版)
-    - Kenneth French 5-Factorデータを pandas_datareader 経由で取得 (Japan_5_Factors_Daily指定)
-    - 取得したファクター数値を100で割り、小数表記(リターン)へ強制変換。
-    - インデックスの時刻・タイムゾーンを完全排除し、線形補間でわずかな欠損を修復。
-    - yfinance呼び出しの前後にログ(print)を配置し、429エラーの発生箇所を特定可能に。
+    【Module 1】データ取得プロバイダー (Ver. 10.0: 月次・長期整合性強化版)
+    - Kenneth French 5-Factorデータの取得(CSV優先)と月次リサンプリングを実装。
+    - 株価リターンの算出を月次(月末終値ベース)へ統合。
+    - リスクフリーレート(Rf)を月次(1/12)に変換し、超過リターン算出の整合性を確保。
     """
     
     # ローカルデータベースのパス
@@ -124,91 +122,150 @@ class DataProvider:
             return pd.DataFrame()
 
     # =========================================================================
-    # Kenneth French 5-Factor データ取得メソッド (pandas_datareader徹底対策版)
+    # Kenneth French 5-Factor データ取得メソッド (月次・長期対応版)
     # =========================================================================
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
     def fetch_ken_french_5factors(start_date, end_date=None):
         """
-        Kenneth R. French Data Library から日本市場の5ファクター(日次)を取得する。
-        pandas_datareaderを使用してJapan_5_Factors_Dailyを確実に取得し、
-        スケール統一・インデックス正規化・欠損値補完を行う。
+        Kenneth R. Frenchデータの取得。
+        1. ローカルの Japan_5_Factors.csv を最優先。
+        2. 月次データとして整形し、小数表記へ統一。
         """
-        DataProvider._init_db()
+        csv_path = "Japan_5_Factors.csv"
+        df_ff = pd.DataFrame()
+
+        # 1. ローカルCSVの読み込み試行
+        if os.path.exists(csv_path):
+            try:
+                # 事前にアップロードされたCSVのフォーマット(ヘッダー位置等)を考慮
+                df_ff = pd.read_csv(csv_path, skiprows=6, index_col=0)
+                
+                # インデックスをYYYYMMからDatetimeに変換
+                df_ff.index = pd.to_datetime(df_ff.index.astype(str), format='%Y%m', errors='coerce')
+                df_ff = df_ff.dropna(how='all')
+                print(f"[Factor] {csv_path} から読み込み成功")
+            except Exception as e:
+                print(f"[Factor Error] CSV読み込み失敗: {e}")
+
+        # 2. オンライン取得(CSVがない場合や読み込み失敗時のフォールバック)
+        if df_ff.empty:
+            try:
+                import pandas_datareader.data as web
+                dataset_name = "Japan_5_Factors" # 月次版データセットを指定
+                print(f"[Factor] pandas_datareaderより {dataset_name} の取得開始...")
+                ff_dict = web.DataReader(dataset_name, 'famafrench', start="1990-01-01")
+                df_ff = ff_dict[0]
+                if isinstance(df_ff.index, pd.PeriodIndex):
+                    df_ff.index = df_ff.index.to_timestamp(how='end')
+                print("[Factor] pandas_datareaderより取得成功")
+            except Exception as e:
+                print(f"[Factor Error] オンライン取得失敗: {e}")
+
+        if df_ff.empty: 
+            return pd.DataFrame()
+
+        # カラム名の正規化と抽出
+        df_ff.columns = [str(c).strip().upper() for c in df_ff.columns]
+        rename_map = {'MKT-RF': 'mkt_rf', 'SMB': 'smb', 'HML': 'hml', 'RMW': 'rmw', 'CMA': 'cma', 'RF': 'rf'}
+        df_ff = df_ff[[c for c in df_ff.columns if c in rename_map.keys()]]
+        df_ff.rename(columns=rename_map, inplace=True)
+
+        # 【重要】%表記を小数(リターン)へ変換
+        df_ff = df_ff.apply(pd.to_numeric, errors='coerce')
+        if df_ff.max().max() > 0.5:
+            df_ff = df_ff.astype(float) / 100.0
+
+        # インデックスの正規化（月次月末に合わせる）
+        df_ff.index = pd.to_datetime(df_ff.index)
+        df_ff = df_ff.resample('ME').last()
+        df_ff.index = df_ff.index.normalize().tz_localize(None)
+
+        # 欠損値補完
+        df_ff = df_ff.interpolate(method='linear').ffill().bfill()
+
+        # 指定期間でフィルタリング
+        start_ts = pd.to_datetime(start_date).replace(tzinfo=None)
+        if end_date:
+            end_ts = pd.to_datetime(end_date).replace(tzinfo=None)
+            df_ff = df_ff[(df_ff.index >= start_ts) & (df_ff.index <= end_ts)]
+        else:
+            df_ff = df_ff[df_ff.index >= start_ts]
+
+        return df_ff
+
+    # =========================================================================
+    # 【新規追加】月次株価履歴データの取得
+    # =========================================================================
+    @staticmethod
+    @st.cache_data(ttl=86400, show_spinner=False)
+    def fetch_historical_prices_monthly(tickers, days=365):
+        """
+        日次株価を取得し、月末時点の月次リターンに変換する。
+        """
+        # 既存の日次取得ロジックを呼び出す
+        df_daily = DataProvider.fetch_historical_prices(tickers, days=days)
+        if df_daily.empty: 
+            return pd.DataFrame()
+
+        # 月末時点の価格へリサンプリング
+        df_monthly_price = df_daily.resample('ME').last()
         
-        # 1. ローカルキャッシュの確認
-        try:
-            with sqlite3.connect(DataProvider.DB_PATH) as conn:
-                query = f"SELECT * FROM ff5_factors WHERE date >= '{start_date}'"
-                if end_date:
-                    query += f" AND date <= '{end_date}'"
-                df_ff = pd.read_sql(query, conn, index_col='date', parse_dates=['date'])
-                
-            if not df_ff.empty:
-                max_date = df_ff.index.max()
-                today = pd.to_datetime(datetime.date.today())
-                if (today - max_date).days <= 30:
-                    return df_ff
-        except Exception:
-            pass
+        # 月次リターン(％変化率)へ変換
+        df_monthly_return = df_monthly_price.pct_change().dropna(how='all')
+        
+        return df_monthly_return
 
-        # 2. pandas_datareaderによるオンライン取得
-        dataset_name = "Japan_5_Factors_Daily"
+    # =========================================================================
+    # マーケットデータ (Rm, Rf) の取得 (月次対応版)
+    # =========================================================================
+    @staticmethod
+    @st.cache_data(ttl=86400, show_spinner=False)
+    def fetch_market_rates(days=365):
+        """
+        市場インデックスとリスクフリーレートの取得。
+        【重要】月次分析に合わせ、Rfを月次(1/12)に変換。
+        """
+        session = DataProvider._create_session()
+        end_d = datetime.date.today()
+        start_d = end_d - datetime.timedelta(days=days)
+        
+        df_market_daily = pd.DataFrame()
         try:
-            import pandas_datareader.data as web
-            print(f"[Factor] Kenneth Frenchデータ ({dataset_name}) 取得開始...")
-            
-            if not end_date:
-                end_date = datetime.date.today().strftime('%Y-%m-%d')
+            rm_df = yf.download("^N225", start=start_d, end=end_d, session=session, progress=False, threads=False, timeout=45)
+            if not rm_df.empty:
+                # MultiIndex/SingleIndex両対応
+                if isinstance(rm_df.columns, pd.MultiIndex):
+                    if 'Close' in rm_df.columns.get_level_values(1):
+                        close = rm_df.xs('Close', level=1, axis=1).squeeze()
+                    elif 'Close' in rm_df.columns.get_level_values(0):
+                        close = rm_df.xs('Close', level=0, axis=1).squeeze()
+                else:
+                    if 'Close' in rm_df.columns:
+                        close = rm_df['Close'].squeeze()
                 
-            ff_dict = web.DataReader(dataset_name, 'famafrench', start=start_date, end=end_date)
-            if not ff_dict:
-                print(f"[Factor Error] {dataset_name} の取得結果が空です。")
-                return pd.DataFrame()
-            
-            ff_data = ff_dict[0]
-            
-            # カラム名の正規化
-            ff_data.columns = [c.strip().upper() for c in ff_data.columns]
-            rename_map = {'MKT-RF': 'mkt_rf', 'SMB': 'smb', 'HML': 'hml', 'RMW': 'rmw', 'CMA': 'cma', 'RF': 'rf'}
-            
-            # 必要なカラムのみ抽出してリネーム
-            ff_data = ff_data[[c for c in ff_data.columns if c in rename_map.keys()]]
-            ff_data.rename(columns=rename_map, inplace=True)
-            
-            # 【重要修正1】%表記を小数表記(リターン)に変換
-            if ff_data.max().max() > 0.5:
-                ff_data = ff_data.astype(float) / 100.0
-                
-            # 【重要修正2】インデックスの正規化 (PeriodIndex -> Timestamp, normalize, timezone削除)
-            if isinstance(ff_data.index, pd.PeriodIndex):
-                ff_data.index = ff_data.index.to_timestamp()
-            
-            ff_data.index = pd.to_datetime(ff_data.index).normalize()
-            
-            if ff_data.index.tz is not None:
-                ff_data.index = ff_data.index.tz_localize(None)
-                
-            # 【重要修正3】欠損値補完 (interpolate)
-            ff_data = ff_data.interpolate(method='linear').ffill().bfill()
-            
-            # DBに保存
-            ff_data.index.name = 'date'
-            with sqlite3.connect(DataProvider.DB_PATH) as conn:
-                df_to_save = ff_data.reset_index()
-                df_to_save['date'] = df_to_save['date'].dt.strftime('%Y-%m-%d')
-                df_to_save.to_sql('ff5_factors', conn, if_exists='replace', index=False)
-
-            print("[Factor] Kenneth Frenchデータ取得・整形完了")
-            return ff_data
-            
-        except ImportError:
-            st.error("⚠️ `pandas_datareader` モジュールが見つかりません。`requirements.txt`に `pandas-datareader` が含まれているか確認してください。")
-            return pd.DataFrame()
+                if not close.empty:
+                    df_market_daily['Rm_Price'] = close
         except Exception as e:
-            print(f"[Factor Error] 取得に失敗: {e}")
-            st.error(f"Fama-Frenchデータの取得に失敗しました: {e}")
+            print(f"[yfinance Error] 市場インデックス取得失敗: {e}")
+
+        if df_market_daily.empty: 
             return pd.DataFrame()
+
+        # 月末リサンプリングと月次リターンの計算
+        df_market_monthly = df_market_daily.resample('ME').last()
+        df_market_monthly['Rm'] = df_market_monthly['Rm_Price'].pct_change()
+        
+        # リスクフリーレートの設定(年率0.5%を想定)
+        annual_rf = 0.005
+        monthly_rf = annual_rf / 12.0 # 【修正】月次(1/12)へ変換
+        
+        df_market_monthly['Rf'] = monthly_rf
+        
+        # インデックスの正規化
+        df_market_monthly.index = df_market_monthly.index.normalize().tz_localize(None)
+        
+        return df_market_monthly.dropna(subset=['Rm'])
 
     # =========================================================================
     # 通信・セッション管理
@@ -262,74 +319,6 @@ class DataProvider:
             "7203.T", "8306.T", "9984.T", "6861.T", "8035.T", "9432.T", "6758.T", "8316.T", "4063.T", "8058.T"
         ]
         return {t: "JPX Data Missing" for t in fallback_tickers}
-
-    # =========================================================================
-    # マーケットデータ (Rm, Rf) の取得
-    # =========================================================================
-    @staticmethod
-    @st.cache_data(ttl=86400, show_spinner=False)
-    def fetch_market_rates(days=365):
-        session = DataProvider._create_session()
-        end_d = datetime.date.today()
-        start_d = end_d - datetime.timedelta(days=days)
-
-        market_data = {}
-        
-        cached_df = DataProvider._load_prices_from_sql(
-            ['^N225'], 
-            start_d.strftime('%Y-%m-%d'), 
-            end_d.strftime('%Y-%m-%d')
-        )
-        
-        close_series = pd.Series(dtype=float)
-        use_api = True
-        
-        if not cached_df.empty and '^N225' in cached_df.columns:
-            latest_date = cached_df.index.max()
-            if (pd.to_datetime(end_d) - latest_date).days <= 4:
-                close_series = cached_df['^N225']
-                use_api = False
-
-        if use_api:
-            try:
-                print(f"[yfinance] 市場インデックス(^N225)の取得開始...")
-                rm_df = yf.download("^N225", start=start_d, end=end_d, session=session, progress=False, threads=False, timeout=45)
-                
-                if not rm_df.empty:
-                    if isinstance(rm_df.columns, pd.MultiIndex):
-                        if 'Close' in rm_df.columns.get_level_values(1):
-                            close_series = rm_df.xs('Close', level=1, axis=1).squeeze()
-                        elif 'Close' in rm_df.columns.get_level_values(0):
-                            close_series = rm_df.xs('Close', level=0, axis=1).squeeze()
-                    else:
-                        if 'Close' in rm_df.columns:
-                            close_series = rm_df['Close'].squeeze()
-                    
-                    if not close_series.empty:
-                        if close_series.index.tz is not None:
-                            close_series.index = close_series.index.tz_localize(None)
-                        close_series.index = pd.to_datetime(close_series.index).normalize()
-                        
-                        save_df = pd.DataFrame({'^N225': close_series})
-                        DataProvider._save_prices_to_sql(save_df)
-                print(f"[yfinance] 市場インデックス(^N225)の取得成功")
-            except Exception as e:
-                print(f"[yfinance Error] 市場インデックス取得失敗: {e}")
-                pass
-        
-        if not close_series.empty:
-            market_data['Rm'] = close_series
-        else:
-            market_data['Rm'] = pd.Series(dtype=float)
-
-        if 'Rm' in market_data and not market_data['Rm'].empty:
-            dates = market_data['Rm'].index
-            daily_rf = (1 + 0.005) ** (1/252) - 1
-            market_data['Rf'] = pd.Series(daily_rf, index=dates)
-        else:
-            market_data['Rf'] = pd.Series(dtype=float)
-
-        return pd.DataFrame(market_data)
 
     @staticmethod
     def _fetch_fmp_ratios(ticker_list):
@@ -478,7 +467,7 @@ class DataProvider:
         return df
 
     # =========================================================================
-    # 履歴データ取得
+    # 既存の日次履歴データ取得 (内部で呼び出し用として維持)
     # =========================================================================
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
