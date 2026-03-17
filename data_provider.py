@@ -3,6 +3,7 @@ import sqlite3
 import datetime
 import time
 import requests
+import random
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -14,13 +15,12 @@ from urllib3.util.retry import Retry
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 10.0: 月次・長期整合性強化版)
-    - Kenneth French 5-Factorデータの取得(CSV優先)と月次リサンプリングを実装。
-    - 株価リターンの算出を月次(月末終値ベース)へ統合。
-    - リスクフリーレート(Rf)を月次(1/12)に変換し、超過リターン算出の整合性を確保。
+    【Module 1】データ取得プロバイダー (Ver. 10.1: 429 Error回避＆永続キャッシュ強化版)
+    - 429 Too Many Requests 対策として、指数バックオフ(Exponential Backoff)とUAローテーションを導入。
+    - 財務データ(Fundamentals)をSQLiteに永続化し、APIの呼び出し回数を劇的に削減。
+    - チャンク取得の最適化と、各リクエスト間の優しいスリープ処理を実装。
     """
     
-    # ローカルデータベースのパス
     DB_PATH = "market_data.db"
     FMP_API_KEY = st.secrets.get("FMP_API_KEY", os.environ.get("FMP_API_KEY"))
 
@@ -52,6 +52,7 @@ class DataProvider:
     def _init_db():
         """SQLiteデータベースとテーブルの初期化"""
         with sqlite3.connect(DataProvider.DB_PATH) as conn:
+            # 履歴データ用テーブル
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS historical_prices (
                     ticker TEXT,
@@ -60,21 +61,30 @@ class DataProvider:
                     PRIMARY KEY (ticker, date)
                 )
             """)
+            # ファクターデータ用テーブル
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS ff5_factors (
                     date TEXT PRIMARY KEY,
-                    mkt_rf REAL,
-                    smb REAL,
-                    hml REAL,
-                    rmw REAL,
-                    cma REAL,
-                    rf REAL
+                    mkt_rf REAL, smb REAL, hml REAL, rmw REAL, cma REAL, rf REAL
+                )
+            """)
+            # 【新規】財務データ(Fundamentals)キャッシュ用テーブル (429対策の要)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS fundamentals_cache (
+                    ticker TEXT PRIMARY KEY,
+                    name TEXT,
+                    price REAL,
+                    size_raw REAL,
+                    pbr REAL,
+                    roe REAL,
+                    sector_raw TEXT,
+                    growth REAL,
+                    last_updated TIMESTAMP
                 )
             """)
 
     @staticmethod
     def _save_prices_to_sql(df):
-        """取得した株価データ(DataFrame)をSQLiteに保存（重複排除）"""
         if df.empty: return
         DataProvider._init_db()
         try:
@@ -89,9 +99,7 @@ class DataProvider:
                 conn.execute("""
                     DELETE FROM historical_prices 
                     WHERE rowid NOT IN (
-                        SELECT MIN(rowid) 
-                        FROM historical_prices 
-                        GROUP BY ticker, date
+                        SELECT MIN(rowid) FROM historical_prices GROUP BY ticker, date
                     )
                 """)
         except Exception as e:
@@ -99,60 +107,74 @@ class DataProvider:
 
     @staticmethod
     def _load_prices_from_sql(tickers, start_date, end_date):
-        """SQLiteからデータを読み込み、DataFrameで返す"""
         DataProvider._init_db()
         if not tickers: return pd.DataFrame()
         ticker_list = "','".join(tickers)
         query = f"""
             SELECT date, ticker, close FROM historical_prices 
-            WHERE ticker IN ('{ticker_list}') 
-            AND date >= '{start_date}' AND date <= '{end_date}'
+            WHERE ticker IN ('{ticker_list}') AND date >= '{start_date}' AND date <= '{end_date}'
         """
         try:
             with sqlite3.connect(DataProvider.DB_PATH) as conn:
                 df = pd.read_sql(query, conn)
-            
             if df.empty: return pd.DataFrame()
-            
             df['date'] = pd.to_datetime(df['date'])
-            pivot_df = df.pivot(index='date', columns='ticker', values='close')
-            return pivot_df
+            return df.pivot(index='date', columns='ticker', values='close')
         except Exception as e:
             print(f"SQL Load Error: {e}")
             return pd.DataFrame()
 
     # =========================================================================
-    # Kenneth French 5-Factor データ取得メソッド (月次・長期対応版)
+    # 通信・セッション管理 (429 Error 回避の要)
+    # =========================================================================
+    @staticmethod
+    def _create_session():
+        session = requests.Session()
+        # 【新規】User-Agentのローテーションでスクレイピング判定を回避
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+        ]
+        session.headers.update({
+            "User-Agent": random.choice(user_agents),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+            "Connection": "keep-alive"
+        })
+        # リトライ設定の強化
+        retries = Retry(
+            total=5,
+            backoff_factor=2.0,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS"]
+        )
+        session.mount("https://", HTTPAdapter(max_retries=retries))
+        return session
+
+    # =========================================================================
+    # Kenneth French 5-Factor データ取得メソッド
     # =========================================================================
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
     def fetch_ken_french_5factors(start_date, end_date=None):
-        """
-        Kenneth R. Frenchデータの取得。
-        1. ローカルの Japan_5_Factors.csv を最優先。
-        2. 月次データとして整形し、小数表記へ統一。
-        """
         csv_path = "Japan_5_Factors.csv"
         df_ff = pd.DataFrame()
 
-        # 1. ローカルCSVの読み込み試行
         if os.path.exists(csv_path):
             try:
-                # 事前にアップロードされたCSVのフォーマット(ヘッダー位置等)を考慮
                 df_ff = pd.read_csv(csv_path, skiprows=6, index_col=0)
-                
-                # インデックスをYYYYMMからDatetimeに変換
                 df_ff.index = pd.to_datetime(df_ff.index.astype(str), format='%Y%m', errors='coerce')
                 df_ff = df_ff.dropna(how='all')
                 print(f"[Factor] {csv_path} から読み込み成功")
             except Exception as e:
                 print(f"[Factor Error] CSV読み込み失敗: {e}")
 
-        # 2. オンライン取得(CSVがない場合や読み込み失敗時のフォールバック)
         if df_ff.empty:
             try:
                 import pandas_datareader.data as web
-                dataset_name = "Japan_5_Factors" # 月次版データセットを指定
+                dataset_name = "Japan_5_Factors" 
                 print(f"[Factor] pandas_datareaderより {dataset_name} の取得開始...")
                 ff_dict = web.DataReader(dataset_name, 'famafrench', start="1990-01-01")
                 df_ff = ff_dict[0]
@@ -165,26 +187,21 @@ class DataProvider:
         if df_ff.empty: 
             return pd.DataFrame()
 
-        # カラム名の正規化と抽出
         df_ff.columns = [str(c).strip().upper() for c in df_ff.columns]
         rename_map = {'MKT-RF': 'mkt_rf', 'SMB': 'smb', 'HML': 'hml', 'RMW': 'rmw', 'CMA': 'cma', 'RF': 'rf'}
         df_ff = df_ff[[c for c in df_ff.columns if c in rename_map.keys()]]
         df_ff.rename(columns=rename_map, inplace=True)
 
-        # 【重要】%表記を小数(リターン)へ変換
         df_ff = df_ff.apply(pd.to_numeric, errors='coerce')
         if df_ff.max().max() > 0.5:
             df_ff = df_ff.astype(float) / 100.0
 
-        # インデックスの正規化（月次月末に合わせる）
         df_ff.index = pd.to_datetime(df_ff.index)
         df_ff = df_ff.resample('ME').last()
         df_ff.index = df_ff.index.normalize().tz_localize(None)
 
-        # 欠損値補完
         df_ff = df_ff.interpolate(method='linear').ffill().bfill()
 
-        # 指定期間でフィルタリング
         start_ts = pd.to_datetime(start_date).replace(tzinfo=None)
         if end_date:
             end_ts = pd.to_datetime(end_date).replace(tzinfo=None)
@@ -195,99 +212,332 @@ class DataProvider:
         return df_ff
 
     # =========================================================================
-    # 【新規追加】月次株価履歴データの取得
+    # 株価履歴データ取得 (指数バックオフ対応版)
     # =========================================================================
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
     def fetch_historical_prices_monthly(tickers, days=365):
-        """
-        日次株価を取得し、月末時点の月次リターンに変換する。
-        """
-        # 既存の日次取得ロジックを呼び出す
         df_daily = DataProvider.fetch_historical_prices(tickers, days=days)
         if df_daily.empty: 
             return pd.DataFrame()
-
-        # 月末時点の価格へリサンプリング
         df_monthly_price = df_daily.resample('ME').last()
+        return df_monthly_price.pct_change().dropna(how='all')
+
+    @staticmethod
+    @st.cache_data(ttl=86400, show_spinner=False)
+    def fetch_historical_prices(tickers, days=365):
+        if not tickers: return pd.DataFrame()
         
-        # 月次リターン(％変化率)へ変換
-        df_monthly_return = df_monthly_price.pct_change().dropna(how='all')
+        unique_tickers = list(set([DataProvider._normalize_ticker(t) for t in tickers if pd.notna(t)]))
+        unique_tickers = [t for t in unique_tickers if t]
+        if not unique_tickers: return pd.DataFrame()
+
+        end_d = datetime.date.today()
+        start_d = end_d - datetime.timedelta(days=days)
         
-        return df_monthly_return
+        cached_df = DataProvider._load_prices_from_sql(
+            unique_tickers, 
+            start_d.strftime('%Y-%m-%d'), 
+            end_d.strftime('%Y-%m-%d')
+        )
+        
+        missing_tickers_for_api = unique_tickers.copy()
+        if not cached_df.empty:
+            latest_date_in_db = cached_df.index.max()
+            if (pd.to_datetime(end_d) - latest_date_in_db).days <= 4:
+                valid_tickers_in_db = cached_df.columns.dropna().tolist()
+                missing_tickers_for_api = [t for t in unique_tickers if t not in valid_tickers_in_db]
+                if not missing_tickers_for_api:
+                    return cached_df
+
+        result_df = pd.DataFrame()
+
+        if missing_tickers_for_api:
+            chunk_size = 5  # 【修正】リクエスト回数を減らすためチャンクを5に拡大
+            print(f"--- yfinance 履歴データ取得開始 (全{len(missing_tickers_for_api)}銘柄, チャンクサイズ:{chunk_size}) ---")
+            
+            for i in range(0, len(missing_tickers_for_api), chunk_size):
+                chunk = missing_tickers_for_api[i:i + chunk_size]
+                
+                # 【新規】指数バックオフによるリトライ処理
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        time.sleep(1.0 + random.uniform(0, 1)) # アクセス前にランダムな間隔を空ける
+                        fresh_session = DataProvider._create_session() # 毎回新しいUAでセッション作成
+                        
+                        print(f"[yfinance] チャンク取得中: {chunk} ...")
+                        df = yf.download(
+                            chunk, start=start_d, end=end_d,
+                            progress=False, group_by='ticker', auto_adjust=True,
+                            session=fresh_session, threads=False, timeout=30
+                        )
+                        
+                        if not df.empty:
+                            chunk_result = pd.DataFrame()
+                            if isinstance(df.columns, pd.MultiIndex):
+                                try:
+                                    if 'Close' in df.columns.get_level_values(1):
+                                        chunk_result = df.xs('Close', level=1, axis=1).copy()
+                                    elif 'Close' in df.columns.get_level_values(0):
+                                        chunk_result = df.xs('Close', level=0, axis=1).copy()
+                                except Exception: pass
+                            else:
+                                if 'Close' in df.columns: 
+                                    chunk_result = pd.DataFrame({chunk[0]: df['Close']})
+
+                            if not chunk_result.empty:
+                                if chunk_result.index.tz is not None:
+                                    chunk_result.index = chunk_result.index.tz_localize(None)
+                                chunk_result.index = pd.to_datetime(chunk_result.index).normalize()
+                                
+                                if result_df.empty:
+                                    result_df = chunk_result
+                                else:
+                                    result_df = pd.concat([result_df, chunk_result], axis=1)
+                        # 成功したらリトライループを抜ける
+                        break
+                        
+                    except Exception as e:
+                        err_msg = str(e).lower()
+                        # 429エラーを検知した場合のみバックオフ待機
+                        if "429" in err_msg or "too many" in err_msg:
+                            wait_time = (2 ** attempt) + random.uniform(1, 3)
+                            print(f"⚠️ [429 Error] 制限到達。{wait_time:.1f}秒待機して再試行({attempt+1}/{max_retries})")
+                            time.sleep(wait_time)
+                        else:
+                            print(f"[yfinance Error] チャンク {chunk} 取得失敗: {e}")
+                            break
+                            
+            print("--- yfinance 履歴データ取得終了 ---")
+
+        current_cols = result_df.columns.tolist() if not result_df.empty else []
+        missing_from_api = list(set(missing_tickers_for_api) - set(current_cols))
+        
+        if missing_from_api and DataProvider.FMP_API_KEY:
+            fmp_df = DataProvider._fetch_fmp_history(missing_from_api, days)
+            if not fmp_df.empty:
+                if fmp_df.index.tz is not None:
+                    fmp_df.index = fmp_df.index.tz_localize(None)
+                fmp_df.index = pd.to_datetime(fmp_df.index).normalize()
+                
+                if result_df.empty:
+                    result_df = fmp_df
+                else:
+                    result_df = pd.concat([result_df, fmp_df], axis=1)
+                    
+        if not result_df.empty:
+            DataProvider._save_prices_to_sql(result_df)
+
+        final_df = pd.DataFrame()
+        if not cached_df.empty and not result_df.empty:
+            final_df = pd.concat([cached_df, result_df], axis=1)
+            final_df = final_df.loc[:, ~final_df.columns.duplicated()]
+        elif not cached_df.empty:
+            final_df = cached_df
+        else:
+            final_df = result_df
+
+        return final_df
 
     # =========================================================================
-    # マーケットデータ (Rm, Rf) の取得 (月次対応版)
+    # 財務データ取得 (SQLite永続キャッシュによる429完全回避)
+    # =========================================================================
+    @staticmethod
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def fetch_fundamentals(tickers):
+        unique_tickers = list(set([DataProvider._normalize_ticker(t) for t in tickers if pd.notna(t)]))
+        unique_tickers = [t for t in unique_tickers if t]
+        if not unique_tickers: return pd.DataFrame()
+
+        DataProvider._init_db()
+        cached_data = []
+        tickers_to_fetch = []
+
+        # 1. DBから直近3日以内のキャッシュを取得
+        try:
+            with sqlite3.connect(DataProvider.DB_PATH) as conn:
+                ticker_list_str = "','".join(unique_tickers)
+                # 3日以内のデータがあればそれを採用
+                query = f"SELECT * FROM fundamentals_cache WHERE ticker IN ('{ticker_list_str}') AND datetime(last_updated) >= datetime('now', '-3 days')"
+                df_cache = pd.read_sql(query, conn)
+                
+            if not df_cache.empty:
+                for _, row in df_cache.iterrows():
+                    cached_data.append({
+                        'Ticker': row['ticker'],
+                        'Name': row['name'],
+                        'Price': row['price'],
+                        'Size_Raw': row['size_raw'],
+                        'PBR': row['pbr'],
+                        'ROE': row['roe'],
+                        'Sector_Raw': row['sector_raw'],
+                        'Growth': row['growth']
+                    })
+                cached_tickers = df_cache['ticker'].tolist()
+                tickers_to_fetch = [t for t in unique_tickers if t not in cached_tickers]
+            else:
+                tickers_to_fetch = unique_tickers
+        except Exception as e:
+            print(f"Fundamentals DB Load Error: {e}")
+            tickers_to_fetch = unique_tickers
+
+        # 2. キャッシュにない銘柄のみAPIで取得 (指数バックオフ搭載)
+        valid_api_data = []
+        if tickers_to_fetch:
+            print(f"--- yfinance 財務データAPI取得開始 (全{len(tickers_to_fetch)}銘柄, DBキャッシュ利用) ---")
+            for ticker in tickers_to_fetch:
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        time.sleep(0.5 + random.uniform(0, 1))
+                        session = DataProvider._create_session()
+                        tk = yf.Ticker(ticker, session=session)
+                        info = tk.info or {}
+                        
+                        mktCap = info.get('marketCap', np.nan)
+                        pbr = info.get('priceToBook', np.nan)
+                        roe = info.get('returnOnEquity', np.nan)
+                        
+                        res = {
+                            'Ticker': ticker,
+                            'Name': info.get('shortName', info.get('longName', ticker)),
+                            'Price': info.get('currentPrice', info.get('previousClose', np.nan)),
+                            'Size_Raw': mktCap,
+                            'PBR': pbr,
+                            'ROE': roe,
+                            'Sector_Raw': info.get('sector', info.get('industry', 'Unknown')),
+                            'Growth': info.get('revenueGrowth', info.get('earningsGrowth', np.nan))
+                        }
+                        valid_api_data.append(res)
+                        break # 成功したらリトライループを抜ける
+                    except Exception as e:
+                        err_msg = str(e).lower()
+                        if "429" in err_msg or "too many" in err_msg:
+                            wait_time = (2 ** attempt) + random.uniform(1, 2)
+                            print(f"⚠️ [429 Error] 財務データ取得制限。{wait_time:.1f}秒待機({attempt+1}/{max_retries})")
+                            time.sleep(wait_time)
+                        else:
+                            print(f"[yfinance Error] {ticker} 取得失敗: {e}")
+                            valid_api_data.append({
+                                'Ticker': ticker, 'Name': ticker, 'Price': np.nan, 'Size_Raw': np.nan,
+                                'PBR': np.nan, 'ROE': np.nan, 'Sector_Raw': 'Unknown', 'Growth': np.nan
+                            })
+                            break
+            print("--- yfinance 財務データ取得終了 ---")
+
+            # 取得したデータをDBに保存
+            if valid_api_data:
+                try:
+                    df_to_save = pd.DataFrame(valid_api_data)
+                    df_to_save['last_updated'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    # DBのカラム名に合わせる
+                    rename_cols = {
+                        'Ticker': 'ticker', 'Name': 'name', 'Price': 'price', 
+                        'Size_Raw': 'size_raw', 'PBR': 'pbr', 'ROE': 'roe', 
+                        'Sector_Raw': 'sector_raw', 'Growth': 'growth'
+                    }
+                    df_db = df_to_save.rename(columns=rename_cols)
+                    
+                    with sqlite3.connect(DataProvider.DB_PATH) as conn:
+                        # 既存のレコードがあれば上書き (INSERT OR REPLACE)
+                        for _, row in df_db.iterrows():
+                            conn.execute(f"""
+                                INSERT OR REPLACE INTO fundamentals_cache 
+                                (ticker, name, price, size_raw, pbr, roe, sector_raw, growth, last_updated) 
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (row['ticker'], row['name'], row['price'], row['size_raw'], row['pbr'], row['roe'], row['sector_raw'], row['growth'], row['last_updated']))
+                except Exception as e:
+                    print(f"Fundamentals DB Save Error: {e}")
+
+        # 3. データの結合と後処理
+        all_data = cached_data + valid_api_data
+        df = pd.DataFrame(all_data)
+        
+        if df.empty:
+            df = pd.DataFrame({'Ticker': unique_tickers})
+            
+        req_cols = ['ROE', 'PBR', 'Growth', 'Size_Raw']
+        for c in req_cols:
+            if c not in df.columns: df[c] = np.nan
+
+        missing_cond = df['ROE'].isna() | df['Growth'].isna() | df['PBR'].isna() | df['Size_Raw'].isna()
+        missing_tickers = df[missing_cond]['Ticker'].tolist() if not df.empty else unique_tickers
+        
+        if missing_tickers and DataProvider.FMP_API_KEY:
+            fmp_data = DataProvider._fetch_fmp_ratios(missing_tickers)
+            for i, row in df.iterrows():
+                t = row['Ticker']
+                if t in fmp_data:
+                    if pd.isna(row.get('ROE')): df.at[i, 'ROE'] = fmp_data[t].get('ROE')
+                    if pd.isna(row.get('PBR')): df.at[i, 'PBR'] = fmp_data[t].get('PBR')
+                    if pd.isna(row.get('Growth')): df.at[i, 'Growth'] = fmp_data[t].get('Growth')
+                    if pd.isna(row.get('Size_Raw')): df.at[i, 'Size_Raw'] = fmp_data[t].get('Size_Raw')
+
+        num_cols = ['Price', 'Size_Raw', 'PBR', 'ROE', 'Growth']
+        for c in num_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+
+        if 'Sector_Raw' in df.columns:
+            df['sector'] = df['Sector_Raw'].apply(DataProvider._map_sector)
+        else:
+            df['sector'] = 'Other'
+
+        return df
+
+    # =========================================================================
+    # マーケットデータ (Rm, Rf) の取得 (指数バックオフ対応版)
     # =========================================================================
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
     def fetch_market_rates(days=365):
-        """
-        市場インデックスとリスクフリーレートの取得。
-        【重要】月次分析に合わせ、Rfを月次(1/12)に変換。
-        """
-        session = DataProvider._create_session()
         end_d = datetime.date.today()
         start_d = end_d - datetime.timedelta(days=days)
         
         df_market_daily = pd.DataFrame()
-        try:
-            rm_df = yf.download("^N225", start=start_d, end=end_d, session=session, progress=False, threads=False, timeout=45)
-            if not rm_df.empty:
-                # MultiIndex/SingleIndex両対応
-                if isinstance(rm_df.columns, pd.MultiIndex):
-                    if 'Close' in rm_df.columns.get_level_values(1):
-                        close = rm_df.xs('Close', level=1, axis=1).squeeze()
-                    elif 'Close' in rm_df.columns.get_level_values(0):
-                        close = rm_df.xs('Close', level=0, axis=1).squeeze()
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                session = DataProvider._create_session()
+                rm_df = yf.download("^N225", start=start_d, end=end_d, session=session, progress=False, threads=False, timeout=30)
+                if not rm_df.empty:
+                    if isinstance(rm_df.columns, pd.MultiIndex):
+                        if 'Close' in rm_df.columns.get_level_values(1):
+                            close = rm_df.xs('Close', level=1, axis=1).squeeze()
+                        elif 'Close' in rm_df.columns.get_level_values(0):
+                            close = rm_df.xs('Close', level=0, axis=1).squeeze()
+                    else:
+                        if 'Close' in rm_df.columns:
+                            close = rm_df['Close'].squeeze()
+                    
+                    if not close.empty:
+                        df_market_daily['Rm_Price'] = close
+                break
+            except Exception as e:
+                err_msg = str(e).lower()
+                if "429" in err_msg or "too many" in err_msg:
+                    time.sleep((2 ** attempt) + random.uniform(1, 2))
                 else:
-                    if 'Close' in rm_df.columns:
-                        close = rm_df['Close'].squeeze()
-                
-                if not close.empty:
-                    df_market_daily['Rm_Price'] = close
-        except Exception as e:
-            print(f"[yfinance Error] 市場インデックス取得失敗: {e}")
+                    break
 
         if df_market_daily.empty: 
             return pd.DataFrame()
 
-        # 月末リサンプリングと月次リターンの計算
         df_market_monthly = df_market_daily.resample('ME').last()
         df_market_monthly['Rm'] = df_market_monthly['Rm_Price'].pct_change()
         
-        # リスクフリーレートの設定(年率0.5%を想定)
         annual_rf = 0.005
-        monthly_rf = annual_rf / 12.0 # 【修正】月次(1/12)へ変換
+        monthly_rf = annual_rf / 12.0 
         
         df_market_monthly['Rf'] = monthly_rf
-        
-        # インデックスの正規化
         df_market_monthly.index = df_market_monthly.index.normalize().tz_localize(None)
         
         return df_market_monthly.dropna(subset=['Rm'])
 
     # =========================================================================
-    # 通信・セッション管理
+    # ユーティリティ・FMPフォールバック (変更なし)
     # =========================================================================
-    @staticmethod
-    def _create_session():
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-            "Connection": "keep-alive"
-        })
-        retries = Retry(
-            total=3,
-            backoff_factor=1.5,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS"]
-        )
-        session.mount("https://", HTTPAdapter(max_retries=retries))
-        return session
-
     @staticmethod
     def _normalize_ticker(t):
         if pd.isna(t) or not str(t).strip(): return ""
@@ -315,9 +565,7 @@ class DataProvider:
             except Exception as e:
                 st.warning(f"JPXリストの読み込みに失敗しました: {e}")
         
-        fallback_tickers = [
-            "7203.T", "8306.T", "9984.T", "6861.T", "8035.T", "9432.T", "6758.T", "8316.T", "4063.T", "8058.T"
-        ]
+        fallback_tickers = ["7203.T", "8306.T", "9984.T", "6861.T", "8035.T", "9432.T", "6758.T", "8316.T", "4063.T", "8058.T"]
         return {t: "JPX Data Missing" for t in fallback_tickers}
 
     @staticmethod
@@ -390,183 +638,3 @@ class DataProvider:
                 pass
 
         return pd.DataFrame(all_series)
-
-    @staticmethod
-    @st.cache_data(ttl=3600, show_spinner=False)
-    def fetch_fundamentals(tickers):
-        unique_tickers = list(set([DataProvider._normalize_ticker(t) for t in tickers if pd.notna(t)]))
-        unique_tickers = [t for t in unique_tickers if t]
-        if not unique_tickers: return pd.DataFrame()
-
-        session = DataProvider._create_session()
-        valid_data = []
-
-        print(f"--- yfinance 財務データ取得開始 (全{len(unique_tickers)}銘柄) ---")
-        for ticker in unique_tickers:
-            time.sleep(1.0) 
-            print(f"[yfinance] {ticker} の財務データ取得中...")
-            try:
-                tk = yf.Ticker(ticker, session=session)
-                info = tk.info
-                if info is None: info = {}
-                
-                mktCap = info.get('marketCap', np.nan)
-                pbr = info.get('priceToBook', np.nan)
-                roe = info.get('returnOnEquity', np.nan)
-                
-                res = {
-                    'Ticker': ticker,
-                    'Name': info.get('shortName', info.get('longName', ticker)),
-                    'Price': info.get('currentPrice', info.get('previousClose', np.nan)),
-                    'Size_Raw': mktCap,
-                    'PBR': pbr,
-                    'ROE': roe,
-                    'Sector_Raw': info.get('sector', info.get('industry', 'Unknown')),
-                    'Growth': info.get('revenueGrowth', info.get('earningsGrowth', np.nan))
-                }
-                valid_data.append(res)
-            except Exception as e:
-                print(f"[yfinance Error] {ticker} 取得失敗: {e}")
-                valid_data.append({
-                    'Ticker': ticker, 'Name': ticker, 'Price': np.nan, 'Size_Raw': np.nan,
-                    'PBR': np.nan, 'ROE': np.nan, 'Sector_Raw': 'Unknown', 'Growth': np.nan
-                })
-        print("--- yfinance 財務データ取得終了 ---")
-        
-        df = pd.DataFrame(valid_data)
-        if df.empty:
-            df = pd.DataFrame({'Ticker': unique_tickers})
-            
-        req_cols = ['ROE', 'PBR', 'Growth', 'Size_Raw']
-        for c in req_cols:
-            if c not in df.columns: df[c] = np.nan
-
-        missing_cond = df['ROE'].isna() | df['Growth'].isna() | df['PBR'].isna() | df['Size_Raw'].isna()
-        missing_tickers = df[missing_cond]['Ticker'].tolist() if not df.empty else unique_tickers
-        
-        if missing_tickers and DataProvider.FMP_API_KEY:
-            fmp_data = DataProvider._fetch_fmp_ratios(missing_tickers)
-            for i, row in df.iterrows():
-                t = row['Ticker']
-                if t in fmp_data:
-                    if pd.isna(row.get('ROE')): df.at[i, 'ROE'] = fmp_data[t].get('ROE')
-                    if pd.isna(row.get('PBR')): df.at[i, 'PBR'] = fmp_data[t].get('PBR')
-                    if pd.isna(row.get('Growth')): df.at[i, 'Growth'] = fmp_data[t].get('Growth')
-                    if pd.isna(row.get('Size_Raw')): df.at[i, 'Size_Raw'] = fmp_data[t].get('Size_Raw')
-
-        num_cols = ['Price', 'Size_Raw', 'PBR', 'ROE', 'Growth']
-        for c in num_cols:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors='coerce')
-
-        if 'Sector_Raw' in df.columns:
-            df['sector'] = df['Sector_Raw'].apply(DataProvider._map_sector)
-        else:
-            df['sector'] = 'Other'
-
-        return df
-
-    # =========================================================================
-    # 既存の日次履歴データ取得 (内部で呼び出し用として維持)
-    # =========================================================================
-    @staticmethod
-    @st.cache_data(ttl=86400, show_spinner=False)
-    def fetch_historical_prices(tickers, days=365):
-        if not tickers: return pd.DataFrame()
-        
-        unique_tickers = list(set([DataProvider._normalize_ticker(t) for t in tickers if pd.notna(t)]))
-        unique_tickers = [t for t in unique_tickers if t]
-        if not unique_tickers: return pd.DataFrame()
-
-        session = DataProvider._create_session()
-        
-        end_d = datetime.date.today()
-        start_d = end_d - datetime.timedelta(days=days)
-        
-        cached_df = DataProvider._load_prices_from_sql(
-            unique_tickers, 
-            start_d.strftime('%Y-%m-%d'), 
-            end_d.strftime('%Y-%m-%d')
-        )
-        
-        missing_tickers_for_api = unique_tickers.copy()
-        if not cached_df.empty:
-            latest_date_in_db = cached_df.index.max()
-            if (pd.to_datetime(end_d) - latest_date_in_db).days <= 4:
-                valid_tickers_in_db = cached_df.columns.dropna().tolist()
-                missing_tickers_for_api = [t for t in unique_tickers if t not in valid_tickers_in_db]
-                if not missing_tickers_for_api:
-                    return cached_df
-
-        result_df = pd.DataFrame()
-
-        if missing_tickers_for_api:
-            chunk_size = 2 
-            print(f"--- yfinance 履歴データ取得開始 (全{len(missing_tickers_for_api)}銘柄, チャンクサイズ:{chunk_size}) ---")
-            for i in range(0, len(missing_tickers_for_api), chunk_size):
-                chunk = missing_tickers_for_api[i:i + chunk_size]
-                time.sleep(2.0)
-                print(f"[yfinance] チャンク取得中: {chunk} ...")
-                try:
-                    df = yf.download(
-                        chunk, start=start_d, end=end_d,
-                        progress=False, group_by='ticker', auto_adjust=True,
-                        session=session, threads=False, timeout=45
-                    )
-                    
-                    if not df.empty:
-                        chunk_result = pd.DataFrame()
-                        if isinstance(df.columns, pd.MultiIndex):
-                            try:
-                                if 'Close' in df.columns.get_level_values(1):
-                                    chunk_result = df.xs('Close', level=1, axis=1).copy()
-                                elif 'Close' in df.columns.get_level_values(0):
-                                    chunk_result = df.xs('Close', level=0, axis=1).copy()
-                            except Exception:
-                                pass
-                        else:
-                            if 'Close' in df.columns: 
-                                chunk_result = pd.DataFrame({chunk[0]: df['Close']})
-
-                        if not chunk_result.empty:
-                            if chunk_result.index.tz is not None:
-                                chunk_result.index = chunk_result.index.tz_localize(None)
-                            chunk_result.index = pd.to_datetime(chunk_result.index).normalize()
-                            
-                            if result_df.empty:
-                                result_df = chunk_result
-                            else:
-                                result_df = pd.concat([result_df, chunk_result], axis=1)
-                except Exception as e:
-                    print(f"[yfinance Error] チャンク {chunk} 取得失敗: {e}")
-                    pass
-            print("--- yfinance 履歴データ取得終了 ---")
-
-        current_cols = result_df.columns.tolist() if not result_df.empty else []
-        missing_from_api = list(set(missing_tickers_for_api) - set(current_cols))
-        
-        if missing_from_api and DataProvider.FMP_API_KEY:
-            fmp_df = DataProvider._fetch_fmp_history(missing_from_api, days)
-            if not fmp_df.empty:
-                if fmp_df.index.tz is not None:
-                    fmp_df.index = fmp_df.index.tz_localize(None)
-                fmp_df.index = pd.to_datetime(fmp_df.index).normalize()
-                
-                if result_df.empty:
-                    result_df = fmp_df
-                else:
-                    result_df = pd.concat([result_df, fmp_df], axis=1)
-                    
-        if not result_df.empty:
-            DataProvider._save_prices_to_sql(result_df)
-
-        final_df = pd.DataFrame()
-        if not cached_df.empty and not result_df.empty:
-            final_df = pd.concat([cached_df, result_df], axis=1)
-            final_df = final_df.loc[:, ~final_df.columns.duplicated()]
-        elif not cached_df.empty:
-            final_df = cached_df
-        else:
-            final_df = result_df
-
-        return final_df
