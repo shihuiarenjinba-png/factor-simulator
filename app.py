@@ -39,21 +39,20 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Factor Simulator V18.3 - 5-Factor Regression Analysis")
-st.markdown("Kenneth R. French の日本市場5ファクターに基づく厳密な時系列回帰分析と、銘柄ごとの加重平均寄与度を可視化します。")
+st.title("Factor Simulator V19.0 - Long-term Monthly Regression")
+st.markdown("Kenneth R. French の日本市場5ファクターに基づく厳密な月次時系列回帰分析と、銘柄ごとの加重平均寄与度を可視化します。")
 
 # ---------------------------------------------------------
-# キャッシュラッパー & 詳細進捗表示
+# キャッシュラッパー
 # ---------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_cached_market_data(tickers, days=730):
     """
-    yfinance由来のデータ（株価・財務）のみをここで取得。
-    【修正】日数を引数で受け取り、ファクターデータと期間を厳密に一致させる。
+    【修正】月次分析に合わせ、履歴データは _monthly メソッドを呼び出す
     """
     df_fund = DataProvider.fetch_fundamentals(tickers)
-    df_hist = DataProvider.fetch_historical_prices(tickers, days=days)
-    df_market = DataProvider.fetch_market_rates(days=days)
+    df_hist = DataProvider.fetch_historical_prices_monthly(tickers, days=days)
+    df_market = DataProvider.fetch_market_rates(days=days) # 内側で月次処理済み
     
     return df_fund, df_hist, df_market
 
@@ -61,6 +60,15 @@ def get_cached_market_data(tickers, days=730):
 # 1. サイドバー: 入力
 # ---------------------------------------------------------
 st.sidebar.header("📊 分析設定")
+
+# 【新規】動的期間選択
+analysis_mode = st.sidebar.radio(
+    "分析期間の設定 (Monthly Data)", 
+    ["直近指定期間", "利用可能な最大期間 (Max Historical)"],
+    help="「最大期間」を選ぶと1990年以降のデータを全て使用し、精度の高い回帰分析を行います。"
+)
+
+lookback_years = st.sidebar.slider("直近指定期間 (年)", 1, 10, 5) if analysis_mode == "直近指定期間" else 30
 
 port_input = st.sidebar.text_area(
     "ポートフォリオ銘柄 (カンマまたは改行区切り)",
@@ -86,10 +94,14 @@ run_button = st.sidebar.button("回帰分析を実行", type="primary")
 if run_button:
     progress_bar = st.progress(0, text="[1/5] 初期化中...")
     
-    # 日付定義の共通化。ここで決めた日付を全てに使い回す。
-    lookback_days = 365 * 2
+    # 日付の動的計算
     global_end_date = datetime.date.today()
-    global_start_date = global_end_date - datetime.timedelta(days=lookback_days)
+    if analysis_mode == "利用可能な最大期間 (Max Historical)":
+        global_start_date = datetime.date(1990, 1, 1)
+        lookback_days = (global_end_date - global_start_date).days
+    else:
+        lookback_days = 365 * lookback_years
+        global_start_date = global_end_date - datetime.timedelta(days=lookback_days)
     
     # --- Step 0: 入力サニタイズ ---
     sanitized_port = unicodedata.normalize('NFKC', port_input)
@@ -114,41 +126,37 @@ if run_button:
     bench_tickers = MarketMonitor.get_latest_tickers(bench_mode, custom_list)
     all_target_tickers = list(set(bench_tickers + port_tickers))
 
-    # --- Step B: データ取得 (Fama-French含む) ---
-    progress_bar.progress(20, text=f"[3/5] 市場データ(株価・財務)の取得中... (最大1分程度)")
+    # --- Step B: データ取得 ---
+    progress_bar.progress(20, text=f"[3/5] 市場データ(株価・財務)の取得中...")
     
-    # 1. yfinanceからのデータ取得 (共通のlookback_daysを使用)
     df_all_fund, df_hist, df_market = get_cached_market_data(all_target_tickers, days=lookback_days)
     
     if df_all_fund.empty or df_hist.empty:
-        # 429エラー時の具体的な回避策を提示
         st.error("❌ 株価・財務データの取得に失敗しました。Yahoo Financeの制限（429エラー）の可能性があります。\n\n**【回避策】分析するポートフォリオ銘柄数を減らすか、10分ほど時間を置いてから再試行してください。**")
         st.stop()
 
     progress_bar.progress(40, text=f"[3/5] マクロファクターデータの同期中...")
     
-    # 2. ケネス・フレンチデータの独立取得 (共通のstart/end_dateを使用)
     df_ff5 = DataProvider.fetch_ken_french_5factors(
         start_date=global_start_date.strftime('%Y-%m-%d'), 
         end_date=global_end_date.strftime('%Y-%m-%d')
     )
 
     if df_ff5.empty:
-        st.warning("⚠️ ケネス・フレンチの5ファクターデータの取得に失敗しました。サイトの仕様変更または一時的なアクセス制限の可能性があります。")
+        st.warning("⚠️ ケネス・フレンチの5ファクターデータの取得に失敗しました。ローカルCSVまたはオンライン接続を確認してください。")
 
-    # --- 取得結果のレポート ---
     fetched_tickers = df_all_fund['Ticker'].tolist()
     missing_api = [t for t in port_tickers if t not in fetched_tickers]
     port_tickers_valid = [t for t in port_tickers if t not in missing_api]
 
     if missing_api:
-        st.warning(f"⚠️ 以下の銘柄は株価取得エラー(429等)のため除外されました: {', '.join(missing_api)}")
+        st.warning(f"⚠️ 以下の銘柄は株価取得エラーのため除外されました: {', '.join(missing_api)}")
 
     if not port_tickers_valid:
         st.error("計算可能な銘柄がありません。")
         st.stop()
 
-    # --- Step C: ウェイトの初期計算 ---
+    # --- Step C: ウェイト計算 ---
     df_port_initial = df_all_fund[df_all_fund['Ticker'].isin(port_tickers_valid)].copy()
     if weight_list and len(weight_list) == len(port_tickers):
         weight_map = dict(zip(port_tickers, weight_list))
@@ -157,12 +165,13 @@ if run_button:
     else:
         df_port_initial = QuantEngine.calculate_portfolio_weights(df_port_initial, user_weights_provided=False)
 
-    # --- Step D: 時系列多変量回帰分析の実行 ---
-    progress_bar.progress(60, text="[4/5] 時系列多変量回帰分析 (Time-series Regression) 実行中...")
+    # --- Step D: 二段構え 時系列多変量回帰分析 ---
+    progress_bar.progress(60, text="[4/5] 月次多変量回帰分析 (二段構え) 実行中...")
     
     regression_results = None
     if not df_ff5.empty:
-        regression_results = QuantEngine.run_5factor_regression(df_hist, df_port_initial[['Ticker', 'Weight']], df_ff5)
+        # 月次分析の最低サンプル数は「24ヶ月」に設定
+        regression_results = QuantEngine.run_5factor_regression(df_hist, df_port_initial[['Ticker', 'Weight']], df_ff5, min_n_obs=24)
     
     portfolio_z_radar = {}
     regression_success = False
@@ -177,18 +186,17 @@ if run_button:
             'Investment': regression_results.get('Investment', 0)
         }
     else:
-        # 回帰失敗時のフォールバック値（あくまで参考値として扱う）
         portfolio_z_radar = {'Beta': 1.0, 'Value': 0, 'Size': 0, 'Quality': 0, 'Investment': 0}
 
-    # --- Step E: 銘柄固有（回帰前）Zスコアの計算 ---
-    progress_bar.progress(80, text="[5/5] 銘柄固有スコアと加重平均寄与度の計算中...")
+    # --- Step E: スコア計算 ---
+    progress_bar.progress(80, text="[5/5] 固有スコアと寄与度の計算中...")
     df_bench = df_all_fund[df_all_fund['Ticker'].isin(bench_tickers)]
     market_stats, _ = UniverseManager.generate_market_stats(df_bench)
 
     df_port_proc = QuantEngine.process_raw_factors(df_port_initial)
     df_port_scored, _ = QuantEngine.compute_z_scores(df_port_proc, market_stats)
     
-    # --- Step F: 加重平均寄与度の計算 ---
+    # --- Step F: 寄与度計算 ---
     df_port_scored, _ = QuantEngine.calculate_weighted_factor_contributions(df_port_scored)
 
     progress_bar.progress(100, text="分析完了！")
@@ -196,35 +204,48 @@ if run_button:
     progress_bar.empty()
 
     # ---------------------------------------------------------
-    # 3. 分析結果の表示 UI
+    # 3. 分析結果の表示 UI (フィードバックの高度化)
     # ---------------------------------------------------------
     
-    # 【重要修正】分析成功時と失敗時でUIブロック（フィードバック）を明確に分ける
     if regression_success:
-        r2 = regression_results['R_squared']
-        p_val = regression_results['p_values']['Beta']
+        # QuantEngineから返ってくる各種指標を展開
+        adj_r2 = regression_results.get('Adjusted_R_squared', 0)
+        n_obs = regression_results.get('N_Observations', 'Unknown')
+        method = regression_results.get('Method', 'Unknown')
+        p_val = regression_results.get('p_values', {}).get('Beta', 1.0)
+        
+        mode_text = "全期間 (1990~)" if analysis_mode == "利用可能な最大期間 (Max Historical)" else f"直近 {lookback_years} 年間"
+        
+        # 専門的フィードバックの可視化
         st.markdown(f"""
         <div class="summary-box">
-            <h4>📈 回帰分析サマリー (Kenneth French 5-Factor Model)</h4>
-            <p>このポートフォリオの日次超過リターン変動のうち、<b>{r2*100:.1f}%</b> は5つのマクロファクターによって説明可能です。(決定係数 R² = {r2:.3f})<br>
-            ※市場ベータの統計的有意性 (p値): {p_val:.4f}</p>
+            <h4>📈 回帰分析サマリー ({mode_text} / 月次ベース)</h4>
+            <p>このポートフォリオの月次超過リターン変動のうち、<b>{adj_r2*100:.1f}%</b> が5つのマクロファクターによって説明可能です。<br>
+            <ul style="margin-top: 5px; margin-bottom: 5px; line-height: 1.6;">
+                <li><b>分析手法 (Engine):</b> {method} 
+                <span style="font-size:0.85em; color:#666;">(Portfolio=共通期間一括, Individual=個別回帰加重平均)</span></li>
+                <li><b>分析サンプル数 (N):</b> {n_obs} ヶ月</li>
+                <li><b>自由度調整済み決定係数 (Adj R²):</b> {adj_r2:.3f}</li>
+                <li><b>市場ベータの有意確率 (p-value):</b> {p_val:.4f}</li>
+            </ul>
+            </p>
         </div>
         """, unsafe_allow_html=True)
     else:
         st.markdown(f"""
         <div class="warning-box">
             <h4>⚠️ 回帰分析の実行条件が揃いませんでした</h4>
-            <p>ファクターデータの取得失敗、または株価データとの有効な結合日数が不足(30日未満)しています。<br>
+            <p>ファクターデータの取得失敗、または株価データとの有効な月次結合数が不足(24ヶ月未満)しています。<br>
             表示されているレーダーチャートは回帰分析を伴わない<b>推定不能な参考値(Fallback)</b>です。</p>
         </div>
         """, unsafe_allow_html=True)
 
     col1, col2 = st.columns([1, 1])
     with col1:
-        # 回帰分析失敗時のグラフタイトルを明確に変更
-        suffix = f"(R²={regression_results['R_squared']:.2f})" if regression_success else "(推定不能：参考値)"
+        # グラフのタイトルに Adj R2 と N数 を明示
+        suffix = f"(Adj R²={regression_results.get('Adjusted_R_squared', 0):.2f}, N={regression_results.get('N_Observations', 0)})" if regression_success else "(推定不能：参考値)"
         fig_radar = Visualizer.plot_radar_chart(portfolio_z_radar, title_suffix=suffix)
-        st.plotly_chart(fig_radar, use_container_width=True)
+        st.plotly_chart(fig_radar, use_container_width=True) # visualizerの仕様に合わせておく
     with col2:
         fig_bar = Visualizer.plot_contribution_bar_chart(df_port_scored)
         st.plotly_chart(fig_bar, use_container_width=True)
