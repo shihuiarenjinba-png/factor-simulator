@@ -26,108 +26,180 @@ class QuantEngine:
     【重要修正4】加重平均スコアリング: 銘柄ごとの固有ファクタースコアのウェイト寄与度分解
     【最重要修正 V18.0】回帰分析の目的変数を純粋なリターンから「超過リターン(Ri - Rf)」に厳密化
     【最重要修正 V18.1】ファクター同期の厳格化 (Inner Joinと正規化の徹底)、サンプル数バリデーション強化
+    【最重要修正 V19.0】二段構え回帰(共通期間一括 vs 個別加重平均)の実装、Adj R2とN数の出力強化
     """
     
     # =========================================================================
-    # 【NEW】時系列多変量回帰分析 (Time-series Regression)
+    # 時系列多変量回帰分析 (二段構え: 共通期間一括 or 個別加重平均)
     # =========================================================================
     @staticmethod
-    def run_5factor_regression(df_hist, df_weights, df_ff5):
+    def run_5factor_regression(df_hist_ret, df_weights, df_ff5, min_n_obs=24, force_individual=False):
         """
-        ポートフォリオの日次超過リターンと、ケネス・フレンチの5ファクターを日付で同期し、
-        多変量回帰分析を実行してポートフォリオ全体の「回帰後ベータ」と「t値」を算出する。
+        df_hist_ret: 既にリターン化されたヒストリカルデータ (月次を想定)
+        df_weights: 'Ticker' と 'Weight' を持つ DataFrame
+        df_ff5: Fama-French 5要素 + RF (月次を想定)
+        min_n_obs: プランA(一括回帰)を許容する最小共通サンプル数 (デフォルト24ヶ月)
+        force_individual: 強制的にプランB(個別回帰の積み上げ)を実行するか
         """
-        if df_hist.empty or df_ff5.empty or df_weights.empty or sm is None:
-            print("[Regression] 初期データが不足しているか、statsmodelsがインストールされていません。")
+        if df_hist_ret.empty or df_ff5.empty or df_weights.empty or sm is None:
+            print("[Regression] 初期データ不足、または statsmodels が未インストールです。")
             return None
 
         try:
-            # 1. 銘柄別日次リターンの計算
-            rets = df_hist.pct_change().dropna()
-            
-            # インデックス(日付)の型を厳密に合わせる (tz-naive & normalized)
-            if rets.index.tz is not None:
-                rets.index = rets.index.tz_localize(None)
-            rets.index = pd.to_datetime(rets.index).normalize()
+            # インデックスの厳密な同期処理
+            if df_hist_ret.index.tz is not None:
+                df_hist_ret.index = df_hist_ret.index.tz_localize(None)
+            df_hist_ret.index = pd.to_datetime(df_hist_ret.index).normalize()
             
             if df_ff5.index.tz is not None:
                 df_ff5.index = df_ff5.index.tz_localize(None)
             df_ff5.index = pd.to_datetime(df_ff5.index).normalize()
             
-            # 2. 有効な銘柄のみでウェイトを再正規化
-            valid_tickers = [t for t in df_weights['Ticker'] if t in rets.columns]
+            valid_tickers = [t for t in df_weights['Ticker'] if t in df_hist_ret.columns]
             if not valid_tickers: 
-                print("[Regression] リターン計算可能な有効なティッカーがありません。")
+                print("[Regression] 有効なティッカーが履歴データに存在しません。")
                 return None
             
             w_dict = dict(zip(df_weights['Ticker'], df_weights['Weight']))
             w_series = pd.Series({t: w_dict[t] for t in valid_tickers})
-            
             if w_series.sum() == 0: return None
             w_series = w_series / w_series.sum()
+
+            # -------------------------------------------------------------
+            # プランA: 共通期間による一括回帰 (Portfolio Regression)
+            # -------------------------------------------------------------
+            if not force_individual:
+                # 全銘柄が欠損していない行だけを残す (完全な共通期間)
+                common_rets = df_hist_ret[valid_tickers].dropna()
+                
+                # ポートフォリオの加重平均リターン
+                port_ret = (common_rets * w_series).sum(axis=1)
+                
+                # ファクターと Inner Join
+                aligned = pd.concat([port_ret.rename('Port_Ret'), df_ff5], axis=1, join='inner').dropna()
+                n_obs = len(aligned)
+                
+                if n_obs >= min_n_obs:
+                    print(f"[Regression Plan A] 共通期間({n_obs}ヶ月)での一括回帰を実行します。")
+                    y = aligned['Port_Ret'] - aligned['rf']
+                    X = aligned[['mkt_rf', 'smb', 'hml', 'rmw', 'cma']]
+                    X = sm.add_constant(X)
+                    
+                    model = sm.OLS(y, X).fit()
+                    
+                    return {
+                        'Method': 'Portfolio',
+                        'N_Observations': n_obs,
+                        'Alpha': model.params.get('const', 0),
+                        'Beta': model.params.get('mkt_rf', 0),
+                        'Size': model.params.get('smb', 0),
+                        'Value': model.params.get('hml', 0),
+                        'Quality': model.params.get('rmw', 0),
+                        'Investment': model.params.get('cma', 0),
+                        'R_squared': model.rsquared,
+                        'Adjusted_R_squared': model.rsquared_adj, # 【重要】Adj R2を出力
+                        'p_values': {
+                            'Alpha': model.pvalues.get('const', 1),
+                            'Beta': model.pvalues.get('mkt_rf', 1)
+                        }
+                    }
+                else:
+                    print(f"[Regression] 共通期間が {n_obs} ヶ月しかありません。プランB(個別回帰)へ移行します。")
+
+            # -------------------------------------------------------------
+            # プランB: 個別回帰の加重平均 (Individual Aggregation)
+            # -------------------------------------------------------------
+            print("[Regression Plan B] 各銘柄の個別回帰による加重平均を実行します。")
+            indiv_results = []
+            total_n_obs = 0
+            valid_count = 0
             
-            # 3. ポートフォリオの加重平均日次リターンを算出
-            port_ret = (rets[valid_tickers] * w_series).sum(axis=1)
-            
-            # 4. 5ファクターデータとの日付同期 (Inner Joinによる完全一致)
-            # 【重要】互いに存在する日付のデータだけを抽出する
-            aligned = pd.concat([port_ret.rename('Port_Ret'), df_ff5], axis=1, join='inner').dropna()
-            
-            if len(aligned) < 30: # 統計的有意性を出すための最低サンプル数(30日)
-                print(f"[Regression] サンプル数不足: 結合後の有効日数が {len(aligned)} 日分しかありません。(最低30日必要)")
+            for ticker in valid_tickers:
+                ticker_ret = df_hist_ret[ticker].dropna()
+                aligned_indiv = pd.concat([ticker_ret.rename('Ret'), df_ff5], axis=1, join='inner').dropna()
+                
+                n_indiv_obs = len(aligned_indiv)
+                if n_indiv_obs < min_n_obs:
+                    continue # この銘柄はデータが少なすぎるため除外
+                    
+                y_i = aligned_indiv['Ret'] - aligned_indiv['rf']
+                X_i = aligned_indiv[['mkt_rf', 'smb', 'hml', 'rmw', 'cma']]
+                X_i = sm.add_constant(X_i)
+                
+                try:
+                    mod_i = sm.OLS(y_i, X_i).fit()
+                    indiv_results.append({
+                        'Ticker': ticker,
+                        'Weight': w_series[ticker],
+                        'N': n_indiv_obs,
+                        'Alpha': mod_i.params.get('const', 0),
+                        'Beta': mod_i.params.get('mkt_rf', 0),
+                        'Size': mod_i.params.get('smb', 0),
+                        'Value': mod_i.params.get('hml', 0),
+                        'Quality': mod_i.params.get('rmw', 0),
+                        'Investment': mod_i.params.get('cma', 0),
+                        'R_squared': mod_i.rsquared,
+                        'Adjusted_R_squared': mod_i.rsquared_adj,
+                        'p_Beta': mod_i.pvalues.get('mkt_rf', 1)
+                    })
+                    total_n_obs += n_indiv_obs
+                    valid_count += 1
+                except Exception:
+                    pass
+                    
+            if not indiv_results:
+                print("[Regression] 有効なデータを持つ銘柄が一つもありませんでした。")
                 return None
                 
-            # 5. 【重要修正】超過リターン = ポートフォリオリターン - 無リスク金利(RF)
-            # 理論通り、左辺を (Ri - Rf) にする
-            y = aligned['Port_Ret'] - aligned['rf']
+            # 加重平均の計算
+            df_res = pd.DataFrame(indiv_results)
+            # ウェイトの再正規化 (除外された銘柄分を配分)
+            df_res['Weight'] = df_res['Weight'] / df_res['Weight'].sum()
             
-            # 6. 独立変数 (Mkt-RF, SMB, HML, RMW, CMA)
-            X = aligned[['mkt_rf', 'smb', 'hml', 'rmw', 'cma']]
-            X = sm.add_constant(X) # アルファ(切片)の追加
+            avg_n_obs = int(total_n_obs / valid_count)
             
-            # 7. 最小二乗法(OLS)による多変量回帰の実行
-            model = sm.OLS(y, X).fit()
+            # 各指標の加重平均
+            agg_alpha = (df_res['Alpha'] * df_res['Weight']).sum()
+            agg_beta = (df_res['Beta'] * df_res['Weight']).sum()
+            agg_size = (df_res['Size'] * df_res['Weight']).sum()
+            agg_value = (df_res['Value'] * df_res['Weight']).sum()
+            agg_quality = (df_res['Quality'] * df_res['Weight']).sum()
+            agg_invest = (df_res['Investment'] * df_res['Weight']).sum()
             
-            # 8. 統計的有意性(t値)と決定係数(R^2)の抽出
-            results = {
-                'Alpha': model.params.get('const', 0),
-                'Beta': model.params.get('mkt_rf', 0),
-                'Size': model.params.get('smb', 0),    # Small Minus Big
-                'Value': model.params.get('hml', 0),   # High Minus Low
-                'Quality': model.params.get('rmw', 0), # Robust Minus Weak
-                'Investment': model.params.get('cma', 0), # Conservative Minus Aggressive
-                'R_squared': model.rsquared,
-                't_values': {
-                    'Alpha': model.tvalues.get('const', 0),
-                    'Beta': model.tvalues.get('mkt_rf', 0),
-                    'Size': model.tvalues.get('smb', 0),
-                    'Value': model.tvalues.get('hml', 0),
-                    'Quality': model.tvalues.get('rmw', 0),
-                    'Investment': model.tvalues.get('cma', 0),
-                },
+            # R2とp値も目安として加重平均 (厳密な意味は薄れるが、ポートフォリオの平均的な当てはまり度として提示)
+            agg_r2 = (df_res['R_squared'] * df_res['Weight']).sum()
+            agg_adj_r2 = (df_res['Adjusted_R_squared'] * df_res['Weight']).sum()
+            agg_p_beta = (df_res['p_Beta'] * df_res['Weight']).sum()
+
+            return {
+                'Method': 'Individual Aggregation',
+                'N_Observations': avg_n_obs, # 平均の観察月数を返す
+                'Alpha': agg_alpha,
+                'Beta': agg_beta,
+                'Size': agg_size,
+                'Value': agg_value,
+                'Quality': agg_quality,
+                'Investment': agg_invest,
+                'R_squared': agg_r2,
+                'Adjusted_R_squared': agg_adj_r2,
                 'p_values': {
-                    'Alpha': model.pvalues.get('const', 1),
-                    'Beta': model.pvalues.get('mkt_rf', 1),
-                    'Size': model.pvalues.get('smb', 1),
-                    'Value': model.pvalues.get('hml', 1),
-                    'Quality': model.pvalues.get('rmw', 1),
-                    'Investment': model.pvalues.get('cma', 1),
+                    'Alpha': 1.0, # 個別集計の場合、全体のAlpha有意性は出せないためデフォルト
+                    'Beta': agg_p_beta
                 }
             }
-            return results
+
         except Exception as e:
             print(f"Regression Error: {e}")
             return None
 
     # =========================================================================
-    # 【NEW】加重平均スコアリングロジック (特性分解・棒グラフ用)
+    # 加重平均スコアリングロジック (特性分解・棒グラフ用)
     # =========================================================================
     @staticmethod
     def calculate_weighted_factor_contributions(df_port_scored):
         """
         各銘柄の「回帰前（固有）ファクタースコア（Value Z, Quality Z等）」に対して、
         ポートフォリオ内のウェイトを掛け合わせた「加重平均寄与度」を算出する。
-        目的: 棒グラフで「どの銘柄がポートフォリオの特性を押し上げているか」を可視化するため。
         """
         factors = ['Beta_Z', 'Value_Z', 'Size_Z', 'Quality_Z', 'Investment_Z']
         df_out = df_port_scored.copy()
@@ -138,12 +210,10 @@ class QuantEngine:
         for f in factors:
             if f in df_out.columns:
                 contrib_col = f"{f}_Contrib"
-                # ウェイト × 固有Zスコア = その銘柄のファクターへの寄与
                 df_out[contrib_col] = df_out[f].fillna(0) * df_out['Weight']
             else:
                 df_out[f"{f}_Contrib"] = 0.0
                 
-        # ポートフォリオ全体の加重平均スコア（サマリー用）
         portfolio_summary = {}
         for f in factors:
             contrib_col = f"{f}_Contrib"
@@ -160,7 +230,6 @@ class QuantEngine:
         時系列データからBetaを計算（Rm-Rfの市場プレミアム対応版）
         ※行列演算（Vectorized）によりforループのボトルネックを解消
         """
-        # 1. df_fund救済
         if not isinstance(df_fund, pd.DataFrame):
             try:
                 df = pd.DataFrame(df_fund)
@@ -171,51 +240,49 @@ class QuantEngine:
         else:
             df = df_fund.copy()
 
-        # 2. df_hist救済
         if not isinstance(df_hist, pd.DataFrame) or df_hist.empty:
             if 'Beta_Raw' not in df.columns: df['Beta_Raw'] = np.nan
             return df
 
-        # 計算ロジック
         try:
-            rets = df_hist.pct_change().dropna()
+            rets = df_hist.pct_change().dropna(how='all') # 全てNaNの行だけ落とす
         except Exception:
             df['Beta_Raw'] = np.nan
             return df
         
         betas = {}
 
-        # Rm と Rf を使った理論的Betaの計算ルート（行列演算化）
         if df_market is not None and not df_market.empty and 'Rm' in df_market.columns and 'Rf' in df_market.columns:
             try:
-                rm_ret = df_market['Rm'].pct_change().dropna()
+                # df_market にすでにリターンが入っている想定 (月次なら Rm はリターン)
+                # 念のためチェック
+                if df_market['Rm'].max() > 10.0: # 価格だと判断
+                    rm_ret = df_market['Rm'].pct_change().dropna()
+                else:
+                    rm_ret = df_market['Rm'].dropna()
+
                 rf_daily = df_market['Rf'].reindex(rm_ret.index).ffill()
                 market_premium = rm_ret - rf_daily
                 
-                # 全銘柄一括でインデックスを揃える
-                aligned_data = pd.concat([rets, market_premium.rename('MarketPremium'), rf_daily.rename('Rf')], axis=1, join='inner').dropna()
+                aligned_data = pd.concat([rets, market_premium.rename('MarketPremium'), rf_daily.rename('Rf')], axis=1, join='inner').dropna(subset=['MarketPremium', 'Rf'])
                 
                 if not aligned_data.empty:
                     market_prem_aligned = aligned_data['MarketPremium']
                     bench_var = market_prem_aligned.var()
 
                     if bench_var > 1e-8:
-                        # 全銘柄の超過リターンを一括計算
                         rf_aligned = aligned_data['Rf']
                         asset_premiums = aligned_data[rets.columns].sub(rf_aligned, axis=0)
                         
-                        # 行列演算による共分散の一括計算
                         covariances = asset_premiums.cov(market_prem_aligned)
                         betas = (covariances / bench_var).to_dict()
                         
-                        # 【妥当性チェック】 ベータが完全に「1.0」や「0.0」に張り付く場合は除外
                         for k in list(betas.keys()):
                             if abs(betas[k] - 1.0) < 1e-6 or abs(betas[k]) < 1e-6:
                                 betas[k] = np.nan
             except Exception:
                 df_market = None 
 
-        # df_marketがない場合のフォールバック（行列演算化）
         if df_market is None or df_market.empty:
             if benchmark_ticker not in rets.columns:
                 if "1306.T" in rets.columns:
@@ -233,7 +300,6 @@ class QuantEngine:
                 covariances = rets.cov(bench_ret)
                 betas = (covariances / bench_var).to_dict()
                 
-                # 【妥当性チェック】 対象がベンチマーク自身でないのにベータが「1.0」に張り付く場合は除外
                 for k in list(betas.keys()):
                     if k != benchmark_ticker:
                         if abs(betas[k] - 1.0) < 1e-6 or abs(betas[k]) < 1e-6:
@@ -249,22 +315,18 @@ class QuantEngine:
     def calculate_portfolio_weights(df, user_weights_provided=False):
         df_out = df.copy()
         
-        # 【動的な銘柄除外】 Beta_Raw が計算不能 (NaN) になった銘柄を「死んだ銘柄」としてマークする
         valid_mask = pd.Series(True, index=df_out.index)
         if 'Beta_Raw' in df_out.columns:
             valid_mask = df_out['Beta_Raw'].notna()
         
         if user_weights_provided and 'Weight' in df_out.columns:
             df_out['Weight'] = pd.to_numeric(df_out['Weight'], errors='coerce').fillna(0)
-            
-            # 死んだ銘柄のウェイトを強制的に0にする
             df_out.loc[~valid_mask, 'Weight'] = 0.0
             
             valid_weights_count = (df_out['Weight'] > 0).sum()
             total_weight = df_out['Weight'].sum()
             
             if total_weight > 0 and valid_weights_count > 0:
-                # 残った健全な銘柄だけで合計が1(100%)になるように再配分(リウェイト)
                 df_out['Weight'] = df_out['Weight'] / total_weight
                 return df_out
             else:
@@ -272,21 +334,18 @@ class QuantEngine:
         
         if 'MarketCap' in df_out.columns:
             valid_mc = pd.to_numeric(df_out['MarketCap'], errors='coerce').fillna(0)
-            # 死んだ銘柄は時価総額0として扱い、ウェイト計算から排除
             valid_mc.loc[~valid_mask] = 0.0
             mc_sum = valid_mc.sum()
             
             if mc_sum > 0:
                 df_out['Weight'] = valid_mc / mc_sum
             else:
-                # すべての時価総額が不明だが、有効な銘柄が残っている場合は等金額配分
                 valid_count = valid_mask.sum()
                 if valid_count > 0:
                     df_out['Weight'] = np.where(valid_mask, 1.0 / valid_count, 0.0)
                 else:
                     df_out['Weight'] = 1.0 / len(df_out)
         else:
-            # 時価総額情報がない場合も、有効な銘柄だけで等金額配分
             valid_count = valid_mask.sum()
             if valid_count > 0:
                 df_out['Weight'] = np.where(valid_mask, 1.0 / valid_count, 0.0)
@@ -296,7 +355,7 @@ class QuantEngine:
         return df_out
 
     # =========================================================================
-    # ファクター相関行列の算出 (変更なし)
+    # ファクター相関行列の算出
     # =========================================================================
     @staticmethod
     def calculate_factor_correlation(df):
@@ -310,14 +369,12 @@ class QuantEngine:
 
     @staticmethod
     def process_raw_factors(df):
-        # Value (PBR逆数の対数化)
         if 'PBR' in df.columns:
             clipped_pbr = pd.to_numeric(df['PBR'], errors='coerce').clip(lower=0.1, upper=100.0)
             df['Value_Raw'] = clipped_pbr.apply(
                 lambda x: np.log(1/x) if (pd.notnull(x) and x > 0) else np.nan
             )
         
-        # Size (時価総額対数)
         if 'Size_Raw' in df.columns:
             raw_size = pd.to_numeric(df['Size_Raw'], errors='coerce')
             clipped_size = raw_size.clip(lower=1e8)
@@ -326,11 +383,9 @@ class QuantEngine:
             )
             df['MarketCap'] = raw_size
         
-        # Quality (ROE)
         if 'ROE' in df.columns:
             df['Quality_Raw'] = pd.to_numeric(df['ROE'], errors='coerce').clip(lower=-2.0, upper=2.0)
         
-        # Investment (資産成長率)
         try:
             if 'Growth' in df.columns:
                 df['Investment_Raw'] = pd.to_numeric(df['Growth'], errors='coerce').clip(lower=-1.0, upper=3.0)
@@ -343,7 +398,6 @@ class QuantEngine:
 
     @staticmethod
     def calculate_orthogonalization(df, x_col, y_col):
-        """直交化メソッド (変更なし)"""
         df_out = df.copy()
         params = {'slope': 0, 'intercept': 0, 'r_squared': 0}
         col_name = f"{y_col}_Orthogonal"
@@ -379,15 +433,9 @@ class QuantEngine:
 
     @staticmethod
     def compute_z_scores(df_target, stats, ortho_pairs=None):
-        """
-        Zスコア計算 
-        ortho_pairs: 直交化したいペアのリスト。例: [('Quality', 'Investment'), ('Value', 'Size')]
-                     Noneの場合は後方互換性のため stats 内のパラメータから推論します。
-        """
         df = df_target.copy()
         r_squared_map = {} 
         
-        # 動的直交化の適用
         if ortho_pairs is None:
             ortho_pairs = [('Quality', 'Investment')] if isinstance(stats, dict) and 'ortho_slope' in stats else []
 
@@ -396,7 +444,6 @@ class QuantEngine:
             predictor_col = f"{predictor_factor}_Raw"
             pair_key = f"ortho_{target_factor}_{predictor_factor}"
             
-            # statsから傾き・切片を取得（存在しない場合はクロスセクションで簡易計算）
             if isinstance(stats, dict) and pair_key in stats:
                 slope = stats[pair_key].get('slope', 0)
                 intercept = stats[pair_key].get('intercept', 0)
@@ -442,7 +489,6 @@ class QuantEngine:
             'Beta': ['Beta_Raw_Orthogonal', 'Beta_Raw']
         }
 
-        # 各ファクターについて処理
         for f in factors:
             z_col = f"{f}_Z"
             
@@ -462,7 +508,6 @@ class QuantEngine:
 
             numeric_series = pd.to_numeric(df[target_col], errors='coerce').replace([np.inf, -np.inf], np.nan)
 
-            # 【追加バリデーション】ユニバースが極端に少ない場合のガードレール
             valid_count = numeric_series.notna().sum()
             if valid_count < 3:
                 df[z_col] = 0.0
@@ -481,7 +526,6 @@ class QuantEngine:
                 df[z_col] = 0.0
                 continue
 
-            # 【ガードレール】分母（sigma）に最小閾値（0.01）を設け、Zスコアの異常な爆発を防ぐ
             sigma = max(sigma, 0.01)
 
             def calc_z(val):
@@ -508,13 +552,10 @@ class QuantEngine:
         return df, r_squared_map
 
     # =========================================================================
-    # 特性ベータ（Sensitivity Beta）の逆算ロジック (既存維持)
+    # 特性ベータ（Sensitivity Beta）の逆算ロジック
     # =========================================================================
     @staticmethod
     def calculate_sensitivity_beta(df, market_sensitivities='dynamic'):
-        """
-        Zスコアからファクター感応度を加重平均し、特性ベータ（Sensitivity Beta）を算出。
-        """
         df_out = df.copy()
 
         if market_sensitivities == 'dynamic':
@@ -551,10 +592,6 @@ class QuantEngine:
 
     @staticmethod
     def generate_insights(z_scores):
-        """
-        インサイト生成 (5ファクター対応版)
-        出力テキストを純粋な英語（絵文字・全角文字なし）に統一。
-        """
         insights = []
         
         z_size = z_scores.get('Size', 0)
@@ -562,23 +599,19 @@ class QuantEngine:
         z_qual = z_scores.get('Quality', 0)
         z_inv  = z_scores.get('Investment', 0)
 
-        # 1. Size
         if z_size < -0.7:
             insights.append("Large Cap Focus: High allocation to large-cap stocks with stable financial foundations, providing resilience against market volatility.")
         elif z_size > 0.7:
             insights.append("Small Cap Effect: Weighted towards smaller market capitalization stocks, offering potential to outperform the market average.")
         
-        # 2. Value
         if z_val > 0.7:
             insights.append("Value Investing: Consists of stocks trading at a discount to their book value, potentially limiting downside risk.")
         elif z_val < -0.7:
             insights.append("Growth Tilt: Includes stocks with high future growth expectations, typically trading at premium valuations.")
 
-        # 3. Quality
         if z_qual > 0.7:
             insights.append("High Quality: Dominated by high-quality companies characterized by strong profitability (ROE) and operational efficiency.")
 
-        # 4. Investment
         if z_inv > 0.7:
             insights.append("Conservative Management: Companies maintaining disciplined asset growth and lean operations (CMA effect).")
         elif z_inv < -0.7:
