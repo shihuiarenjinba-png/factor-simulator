@@ -6,22 +6,22 @@ import streamlit as st
 
 class Visualizer:
     """
-    【修正版 V18.1】可視化・グラフ生成モジュール
+    【修正版 V18.2】可視化・グラフ生成モジュール (長期・月次データ最適化版)
     多変量回帰分析結果（マクロ視点）のレーダーチャートと、
     銘柄固有スコアの加重平均寄与度（ミクロ視点）の棒グラフを統合したプロ仕様。
-    インポート漏れを解消し、描画の安定性を向上。
+    グラフ内に分析期間を明示し、月次データの大きなスケール変動にも対応。
     """
 
     @staticmethod
-    def plot_radar_chart(portfolio_z_scores, title_suffix=""):
+    def plot_radar_chart(portfolio_z_scores, title_suffix="", period_text=""):
         """
-        ポートフォリオの5ファクター・エクスポージャー（Zスコア）をレーダーチャートで描画。
-        （Kenneth French 5-Factorの回帰ベータをZスコア化したものを想定）
+        ポートフォリオの5ファクター・エクスポージャー（ZスコアまたはBeta）をレーダーチャートで描画。
         
         Parameters:
         portfolio_z_scores (dict or pd.Series): 各ファクターのZスコア
             想定キー: 'Beta', 'Value', 'Size', 'Quality', 'Investment'
-        title_suffix (str): タイトルに追加する補足テキスト (R^2など)
+        title_suffix (str): タイトルに追加する補足テキスト (Adj R^2, N数など)
+        period_text (str): グラフ内に明示する分析期間 (例: "1990/01 - 2025/12")
         """
         # グラフ上の表示カテゴリ名
         display_categories = ['Market Beta', 'Value (HML)', 'Size (SMB)', 'Quality (RMW)', 'Investment (CMA)']
@@ -59,13 +59,18 @@ class Visualizer:
             fillcolor='rgba(255, 75, 75, 0.4)',
             marker=dict(size=8),
             text=hover_texts_closed,
-            hovertemplate="%{text}<br>スコア: %{r:.2f}<extra></extra>"
+            hovertemplate="%{text}<br>スコア: %{r:.3f}<extra></extra>"
         ))
 
-        # 【修正】スケールの動的調整の安定化（NaNが含まれる場合のクラッシュ防止）
+        # 【修正】月次ベータの変動幅拡大に対応したスケールの動的調整
         safe_values = np.nan_to_num(values, nan=0.0) # NaNを0に変換
         max_val = max([abs(v) for v in safe_values])
-        dynamic_range = max(3.0, float(np.ceil(max_val * 1.2)))
+        
+        # 月次データは値が大きくなりやすいため、上限の余裕を20%から30%へ拡大し、最小目盛りを1.5に設定
+        dynamic_range = max(1.5, float(np.ceil(max_val * 1.3)))
+
+        # 【追加】分析期間をサブタイトルとして挿入
+        period_html = f"<br><span style='font-size:12px; color:gray;'>分析期間: {period_text}</span>" if period_text else ""
 
         fig.update_layout(
             polar=dict(
@@ -74,7 +79,7 @@ class Visualizer:
                     range=[-dynamic_range, dynamic_range],
                     tickmode='linear',
                     tick0=0,
-                    dtick=1,
+                    dtick=round(dynamic_range/3, 1), # 目盛り幅を動的に設定
                     gridcolor='lightgrey'
                 ),
                 angularaxis=dict(
@@ -84,10 +89,10 @@ class Visualizer:
             ),
             showlegend=False,
             title=dict(
-                text=f"多変量回帰 5ファクター・エクスポージャー {title_suffix}",
+                text=f"多変量回帰 5ファクター・エクスポージャー {title_suffix}{period_html}",
                 font=dict(size=16, color='black')
             ),
-            margin=dict(l=60, r=60, t=60, b=40),
+            margin=dict(l=60, r=60, t=80, b=40), # タイトル複数行化のため上部マージンを拡張
             paper_bgcolor='white',
             plot_bgcolor='white'
         )
@@ -96,7 +101,7 @@ class Visualizer:
     @staticmethod
     def plot_contribution_bar_chart(df_portfolio):
         """
-        【重要修正】回帰前（固有）データの「加重平均寄与度」を積み上げ棒グラフで可視化。
+        回帰前（固有）データの「加重平均寄与度」を積み上げ棒グラフで可視化。
         ポートフォリオ全体がなぜそのファクター特性を持っているのかを、構成銘柄の積み上げで説明する。
         
         Parameters:
@@ -165,7 +170,7 @@ class Visualizer:
             y='Contribution', 
             color='Ticker',
             custom_data=['Hover_Text'],
-            title="銘柄固有スコアの加重平均寄与度分解",
+            title="構成銘柄ごとの加重平均寄与度 (Intrinsic Z-Scores)",
             labels={'Contribution': 'ポートフォリオへの寄与 (固有Zスコア × ウェイト)', 'Factor': 'ファクター'},
             barmode='relative',
             color_discrete_sequence=px.colors.qualitative.Bold 
@@ -181,7 +186,7 @@ class Visualizer:
             xaxis_title="",
             yaxis_title="加重平均スコア",
             legend_title="構成銘柄",
-            margin=dict(l=40, r=40, t=60, b=40),
+            margin=dict(l=40, r=40, t=80, b=40),
             paper_bgcolor='white',
             plot_bgcolor='rgba(245, 245, 245, 1)' # ドラッグ(マイナス側)を際立たせる背景
         )
