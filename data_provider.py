@@ -15,11 +15,11 @@ from urllib3.util.retry import Retry
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 9.1: ファクターCSV直接読込＆429ログ強化版)
-    - Kenneth French 5-FactorデータをZIP解凍なしで直接CSVとしてパースし、ゴミ行を自動除去。
-    - 取得したファクター数値を100で割り、小数表記(リターン)に変換。
-    - yfinance呼び出しの前後にログ(print)を配置し、429エラーの発生箇所を100%特定可能に。
-    - 429 Error 回避のための直列処理＆Sleep制限は継続。
+    【Module 1】データ取得プロバイダー (Ver. 9.2: ファクター取得徹底強化版)
+    - Kenneth French 5-Factorデータを pandas_datareader 経由で取得 (Japan_5_Factors_Daily指定)
+    - 取得したファクター数値を100で割り、小数表記(リターン)へ強制変換。
+    - インデックスの時刻・タイムゾーンを完全排除し、線形補間でわずかな欠損を修復。
+    - yfinance呼び出しの前後にログ(print)を配置し、429エラーの発生箇所を特定可能に。
     """
     
     # ローカルデータベースのパス
@@ -124,14 +124,15 @@ class DataProvider:
             return pd.DataFrame()
 
     # =========================================================================
-    # Kenneth French 5-Factor データ取得メソッド (CSV直接パース版)
+    # Kenneth French 5-Factor データ取得メソッド (pandas_datareader徹底対策版)
     # =========================================================================
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
     def fetch_ken_french_5factors(start_date, end_date=None):
         """
         Kenneth R. French Data Library から日本市場の5ファクター(日次)を取得する。
-        CSVファイルの不要なヘッダー・フッターを動的に削除し、%表記を小数に変換する。
+        pandas_datareaderを使用してJapan_5_Factors_Dailyを確実に取得し、
+        スケール統一・インデックス正規化・欠損値補完を行う。
         """
         DataProvider._init_db()
         
@@ -151,77 +152,58 @@ class DataProvider:
         except Exception:
             pass
 
-        # 2. オンラインからCSVを取得 (ZIPではなく直接CSVを想定したURL)
-        url = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Japan_5_Factors_Daily_CSV.zip" 
-        # ※URL自体はZIPを指していますが、もしサイト側が直接CSVを返す仕様に変更していても対応できるように実装します
-        
-        session = DataProvider._create_session()
-        
+        # 2. pandas_datareaderによるオンライン取得
+        dataset_name = "Japan_5_Factors_Daily"
         try:
-            print("[Factor] Kenneth Frenchデータ取得開始...")
-            response = session.get(url, timeout=45)
-            response.raise_for_status()
+            import pandas_datareader.data as web
+            print(f"[Factor] Kenneth Frenchデータ ({dataset_name}) 取得開始...")
             
-            content = response.content
-            # ZIPかCSV(テキスト)かを判定してテキストデータを取り出す
-            import zipfile
-            if zipfile.is_zipfile(io.BytesIO(content)):
-                with zipfile.ZipFile(io.BytesIO(content)) as z:
-                    csv_filename = z.namelist()[0]
-                    with z.open(csv_filename) as f:
-                        raw_text = f.read().decode('utf-8')
-            else:
-                raw_text = content.decode('utf-8')
-
-            # 3. テキストデータの整形（ゴミ行の排除）
-            lines = raw_text.splitlines()
+            if not end_date:
+                end_date = datetime.date.today().strftime('%Y-%m-%d')
+                
+            ff_dict = web.DataReader(dataset_name, 'famafrench', start=start_date, end=end_date)
+            if not ff_dict:
+                print(f"[Factor Error] {dataset_name} の取得結果が空です。")
+                return pd.DataFrame()
             
-            start_idx = 0
-            # "Mkt-RF" などのヘッダー行を探す
-            for i, line in enumerate(lines):
-                if "Mkt-RF" in line or "SMB" in line:
-                    start_idx = i
-                    break
+            ff_data = ff_dict[0]
             
-            end_idx = len(lines)
-            # データ行が終わる場所（空行やテキストだけの行）を探す
-            for i in range(start_idx + 1, len(lines)):
-                if not lines[i].strip() or "," not in lines[i]:
-                    end_idx = i
-                    break
-            
-            # 抽出した行をPandasに読ませる
-            data_body = io.StringIO('\n'.join(lines[start_idx:end_idx]))
-            df = pd.read_csv(data_body, index_col=0)
-            
-            # 4. 前処理
-            # Indexを日付型に変換 (例: '19900702' -> '1990-07-02')
-            df.index = pd.to_datetime(df.index.astype(str), format='%Y%m%d', errors='coerce')
-            df = df.dropna()
-            df.index = df.index.normalize()
-            
-            # カラム名を正規化
-            df.columns = [c.strip().upper() for c in df.columns]
+            # カラム名の正規化
+            ff_data.columns = [c.strip().upper() for c in ff_data.columns]
             rename_map = {'MKT-RF': 'mkt_rf', 'SMB': 'smb', 'HML': 'hml', 'RMW': 'rmw', 'CMA': 'cma', 'RF': 'rf'}
-            df = df[[c for c in df.columns if c in rename_map.keys()]]
-            df.rename(columns=rename_map, inplace=True)
             
-            # 【重要】%表記を小数表記(リターン)に変換
-            df = df.astype(float) / 100.0
+            # 必要なカラムのみ抽出してリネーム
+            ff_data = ff_data[[c for c in ff_data.columns if c in rename_map.keys()]]
+            ff_data.rename(columns=rename_map, inplace=True)
             
-            # 5. DBに保存
+            # 【重要修正1】%表記を小数表記(リターン)に変換
+            if ff_data.max().max() > 0.5:
+                ff_data = ff_data.astype(float) / 100.0
+                
+            # 【重要修正2】インデックスの正規化 (PeriodIndex -> Timestamp, normalize, timezone削除)
+            if isinstance(ff_data.index, pd.PeriodIndex):
+                ff_data.index = ff_data.index.to_timestamp()
+            
+            ff_data.index = pd.to_datetime(ff_data.index).normalize()
+            
+            if ff_data.index.tz is not None:
+                ff_data.index = ff_data.index.tz_localize(None)
+                
+            # 【重要修正3】欠損値補完 (interpolate)
+            ff_data = ff_data.interpolate(method='linear').ffill().bfill()
+            
+            # DBに保存
+            ff_data.index.name = 'date'
             with sqlite3.connect(DataProvider.DB_PATH) as conn:
-                df_to_save = df.reset_index()
+                df_to_save = ff_data.reset_index()
                 df_to_save['date'] = df_to_save['date'].dt.strftime('%Y-%m-%d')
                 df_to_save.to_sql('ff5_factors', conn, if_exists='replace', index=False)
 
             print("[Factor] Kenneth Frenchデータ取得・整形完了")
-            df_filtered = df.loc[start_date:end_date] if end_date else df.loc[start_date:]
-            return df_filtered
+            return ff_data
             
-        except requests.exceptions.Timeout:
-            print("[Factor Error] タイムアウト(45秒)")
-            st.error("⚠️ Fama-Frenchデータの取得がタイムアウトしました(45秒)。通信環境を確認してください。")
+        except ImportError:
+            st.error("⚠️ `pandas_datareader` モジュールが見つかりません。`requirements.txt`に `pandas-datareader` が含まれているか確認してください。")
             return pd.DataFrame()
         except Exception as e:
             print(f"[Factor Error] 取得に失敗: {e}")
