@@ -38,21 +38,21 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Factor Simulator V18.1 - 5-Factor Regression Analysis")
+st.title("Factor Simulator V18.2 - 5-Factor Regression Analysis")
 st.markdown("Kenneth R. French の日本市場5ファクターに基づく厳密な時系列回帰分析と、銘柄ごとの加重平均寄与度を可視化します。")
 
 # ---------------------------------------------------------
 # キャッシュラッパー & 詳細進捗表示
 # ---------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_cached_market_data(tickers):
+def get_cached_market_data(tickers, days=730):
     """
-    【重要修正】yfinance由来のデータ（株価・財務）のみをここで取得。
-    ファクターデータ(Fama-French)はエラー切り分けのためこの関数の外で取得する。
+    yfinance由来のデータ（株価・財務）のみをここで取得。
+    【修正】日数を引数で受け取り、ファクターデータと期間を厳密に一致させる。
     """
     df_fund = DataProvider.fetch_fundamentals(tickers)
-    df_hist = DataProvider.fetch_historical_prices(tickers, days=365*2)
-    df_market = DataProvider.fetch_market_rates(days=365*2)
+    df_hist = DataProvider.fetch_historical_prices(tickers, days=days)
+    df_market = DataProvider.fetch_market_rates(days=days)
     
     return df_fund, df_hist, df_market
 
@@ -85,6 +85,11 @@ run_button = st.sidebar.button("回帰分析を実行", type="primary")
 if run_button:
     progress_bar = st.progress(0, text="[1/5] 初期化中...")
     
+    # 【重要修正1】日付定義の共通化。ここで決めた日付を全てに使い回す。
+    lookback_days = 365 * 2
+    global_end_date = datetime.date.today()
+    global_start_date = global_end_date - datetime.timedelta(days=lookback_days)
+    
     # --- Step 0: 入力サニタイズ ---
     sanitized_port = unicodedata.normalize('NFKC', port_input)
     raw_codes = re.findall(r'\b\d{4}\b', sanitized_port)
@@ -111,23 +116,23 @@ if run_button:
     # --- Step B: データ取得 (Fama-French含む) ---
     progress_bar.progress(20, text=f"[3/5] 市場データ(株価・財務)の取得中... (最大1分程度)")
     
-    # 1. yfinanceからのデータ取得
-    df_all_fund, df_hist, df_market = get_cached_market_data(all_target_tickers)
+    # 1. yfinanceからのデータ取得 (共通のlookback_daysを使用)
+    df_all_fund, df_hist, df_market = get_cached_market_data(all_target_tickers, days=lookback_days)
     
     if df_all_fund.empty or df_hist.empty:
-        # yfinanceが原因のエラーであることがここで確定する
-        st.error("❌ 株価・財務データの取得に失敗しました。Yahoo Financeの制限（429エラー）の可能性があります。10分ほど時間を置いて再試行してください。")
+        # 【重要修正2】429エラー時の具体的な回避策を提示
+        st.error("❌ 株価・財務データの取得に失敗しました。Yahoo Financeの制限（429エラー）の可能性があります。\n\n**【回避策】分析するポートフォリオ銘柄数を減らすか、10分ほど時間を置いてから再試行してください。**")
         st.stop()
 
     progress_bar.progress(40, text=f"[3/5] マクロファクターデータの同期中...")
     
-    # 2. 【重要修正】ケネス・フレンチデータの独立取得
-    end_date = datetime.date.today().strftime('%Y-%m-%d')
-    start_date = (datetime.date.today() - datetime.timedelta(days=365*2)).strftime('%Y-%m-%d')
-    df_ff5 = DataProvider.fetch_ken_french_5factors(start_date=start_date, end_date=end_date)
+    # 2. ケネス・フレンチデータの独立取得 (共通のstart/end_dateを使用)
+    df_ff5 = DataProvider.fetch_ken_french_5factors(
+        start_date=global_start_date.strftime('%Y-%m-%d'), 
+        end_date=global_end_date.strftime('%Y-%m-%d')
+    )
 
     if df_ff5.empty:
-        # ファクターデータが原因のエラーであることがここで確定する
         st.warning("⚠️ ケネス・フレンチの5ファクターデータの取得に失敗しました。サイトの仕様変更または一時的なアクセス制限の可能性があります。")
 
     # --- 取得結果のレポート ---
@@ -151,14 +156,13 @@ if run_button:
     else:
         df_port_initial = QuantEngine.calculate_portfolio_weights(df_port_initial, user_weights_provided=False)
 
-    # --- Step D: 【重要】時系列多変量回帰分析の実行 ---
+    # --- Step D: 時系列多変量回帰分析の実行 ---
     progress_bar.progress(60, text="[4/5] 時系列多変量回帰分析 (Time-series Regression) 実行中...")
     
     regression_results = None
     if not df_ff5.empty:
         regression_results = QuantEngine.run_5factor_regression(df_hist, df_port_initial[['Ticker', 'Weight']], df_ff5)
     
-    # 回帰結果がない場合のフォールバック用
     portfolio_z_radar = {}
     regression_success = False
 
@@ -207,7 +211,8 @@ if run_button:
 
     col1, col2 = st.columns([1, 1])
     with col1:
-        suffix = f"(R²={regression_results['R_squared']:.2f})" if regression_success else "(Fallback)"
+        # 【重要修正3】回帰分析失敗時のグラフタイトルを明確に変更
+        suffix = f"(R²={regression_results['R_squared']:.2f})" if regression_success else "(推定不能：参考値)"
         fig_radar = Visualizer.plot_radar_chart(portfolio_z_radar, title_suffix=suffix)
         st.plotly_chart(fig_radar, use_container_width=True)
     with col2:
