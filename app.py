@@ -2,10 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import re  # 正規表現モジュール
-import unicodedata  # サニタイズ用
+import re
+import unicodedata
 import time
-import datetime  # 日付処理用のライブラリ
+import datetime
+import io
 
 # カスタムモジュールの読み込み
 try:
@@ -32,14 +33,13 @@ st.markdown("""
         text-align: center;
         box-shadow: 2px 2px 5px rgba(0,0,0,0.05);
     }
-    .metric-value { font-size: 24px; font-weight: bold; color: #333; }
-    .metric-label { font-size: 14px; color: #666; margin-top: 5px; }
     .summary-box { background-color: #e8f4f8; padding: 15px; border-radius: 8px; border-left: 5px solid #1f77b4; margin-bottom: 20px;}
     .warning-box { background-color: #fff3f3; padding: 15px; border-radius: 8px; border-left: 5px solid #ff4b4b; margin-bottom: 20px;}
+    .success-box { background-color: #e6ffed; padding: 10px; border-radius: 5px; border-left: 5px solid #28a745; margin-bottom: 10px; font-size: 0.9em;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Factor Simulator V19.0 - Long-term Monthly Regression")
+st.title("Factor Simulator V20.0 - Robust UI & Engine")
 st.markdown("Kenneth R. French の日本市場5ファクターに基づく厳密な月次時系列回帰分析と、銘柄ごとの加重平均寄与度を可視化します。")
 
 # ---------------------------------------------------------
@@ -47,54 +47,89 @@ st.markdown("Kenneth R. French の日本市場5ファクターに基づく厳密
 # ---------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_cached_market_data(tickers, days=730):
-    """
-    【修正】月次分析に合わせ、履歴データは _monthly メソッドを呼び出す
-    """
     df_fund = DataProvider.fetch_fundamentals(tickers)
     df_hist = DataProvider.fetch_historical_prices_monthly(tickers, days=days)
-    df_market = DataProvider.fetch_market_rates(days=days) # 内側で月次処理済み
-    
+    df_market = DataProvider.fetch_market_rates(days=days)
     return df_fund, df_hist, df_market
 
 # ---------------------------------------------------------
-# 1. サイドバー: 入力
+# 1. サイドバー: UIの整理とCSV即時反映
 # ---------------------------------------------------------
 st.sidebar.header("📊 分析設定")
 
-# 【新規】動的期間選択
-analysis_mode = st.sidebar.radio(
-    "分析期間の設定 (Monthly Data)", 
-    ["直近指定期間", "利用可能な最大期間 (Max Historical)"],
-    help="「最大期間」を選ぶと1990年以降のデータを全て使用し、精度の高い回帰分析を行います。"
-)
+# エキスパンダー1: 基本設定
+with st.sidebar.expander("⚙️ 基本設定 (期間・ベンチマーク)", expanded=True):
+    analysis_mode = st.radio(
+        "分析期間の設定 (Monthly Data)", 
+        ["直近指定期間", "利用可能な最大期間 (Max Historical)"],
+        help="「最大期間」を選ぶと1990年以降のデータを全て使用します。"
+    )
+    lookback_years = st.slider("直近指定期間 (年)", 1, 10, 5) if analysis_mode == "直近指定期間" else 30
+    bench_mode = st.radio("ベンチマークユニバース", ("TOPIX Core 30", "Nikkei 225"))
 
-lookback_years = st.sidebar.slider("直近指定期間 (年)", 1, 10, 5) if analysis_mode == "直近指定期間" else 30
-
-port_input = st.sidebar.text_area(
-    "ポートフォリオ銘柄 (カンマまたは改行区切り)",
-    value="7203, 8306, 9984, 6758, 8035",
-    help="証券コード（4桁）を入力してください。"
-)
-
-weight_input = st.sidebar.text_area(
-    "ウェイト入力 (カンマ区切り・空欄で自動配分)",
-    value="",
-    help="銘柄と同じ順番で数値を入力してください。空欄時は等金額または時価総額加重になります。"
-)
+# エキスパンダー2: ポートフォリオ入力
+with st.sidebar.expander("📁 ポートフォリオ入力", expanded=True):
+    input_method = st.radio("入力方法", ["手入力 (テキスト)", "CSV/Excel アップロード"])
+    
+    port_tickers = []
+    weight_list = []
+    
+    if input_method == "手入力 (テキスト)":
+        port_input = st.text_area("銘柄コード (カンマまたは改行区切り)", value="7203, 8306, 9984, 6758, 8035")
+        weight_input = st.text_area("ウェイト (空欄で時価総額加重)", value="", help="銘柄と同じ順番で数値を入力。")
+        
+        # サニタイズ
+        sanitized_port = unicodedata.normalize('NFKC', port_input)
+        raw_codes = re.findall(r'\b\d{4}\b', sanitized_port)
+        port_tickers = [f"{code}.T" for code in list(dict.fromkeys(raw_codes))]
+        
+        clean_w_str = unicodedata.normalize('NFKC', weight_input).replace(" ", "").replace("\n", "")
+        if clean_w_str:
+            sanitized_w = re.sub(r'[^0-9.,]', '', clean_w_str)
+            if sanitized_w:
+                try: weight_list = [float(w) for w in sanitized_w.split(',') if w]
+                except: pass 
+                
+    else:
+        # CSV即時反映ロジック
+        uploaded_file = st.file_uploader("構成銘柄ファイルを選択", type=['csv', 'xlsx', 'xls'])
+        if uploaded_file is not None:
+            try:
+                if uploaded_file.name.endswith('.csv'):
+                    df_up = pd.read_csv(uploaded_file)
+                else:
+                    df_up = pd.read_excel(uploaded_file)
+                
+                # ティッカー列の探索
+                ticker_col = next((c for c in df_up.columns if 'コード' in c or 'Ticker' in c or '銘柄' in c), None)
+                if ticker_col:
+                    raw_codes = df_up[ticker_col].astype(str).str.extract(r'(\d{4})')[0].dropna().tolist()
+                    port_tickers = [f"{code}.T" for code in list(dict.fromkeys(raw_codes))]
+                    
+                    # ウェイト列の探索
+                    weight_col = next((c for c in df_up.columns if c in ['Weight', 'ウェイト', '比率', '割合']), None)
+                    if weight_col:
+                        weight_list = pd.to_numeric(df_up[weight_col], errors='coerce').fillna(0).tolist()[:len(port_tickers)]
+                        st.markdown(f"<div class='success-box'>✅ <b>{len(port_tickers)}</b> 銘柄とウェイト情報を認識しました。</div>", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"<div class='success-box'>✅ <b>{len(port_tickers)}</b> 銘柄を認識しました。<br><small>※ウェイト列がないため、時価総額加重で計算します。</small></div>", unsafe_allow_html=True)
+                else:
+                    st.error("ファイル内に銘柄コードを示す列が見つかりません。")
+            except Exception as e:
+                st.error(f"ファイルの読み込みに失敗しました: {e}")
 
 st.sidebar.markdown("---")
-bench_mode = st.sidebar.radio("ベンチマークユニバース", ("TOPIX Core 30", "Nikkei 225"))
-uploaded_file = st.sidebar.file_uploader("公式構成銘柄ファイル (CSV/Excel)", type=['csv', 'xlsx', 'xls'])
-
-run_button = st.sidebar.button("回帰分析を実行", type="primary")
+run_button = st.sidebar.button("🚀 回帰分析を実行", type="primary", use_container_width=True)
 
 # ---------------------------------------------------------
 # 2. メイン処理ロジック
 # ---------------------------------------------------------
 if run_button:
-    progress_bar = st.progress(0, text="[1/5] 初期化中...")
-    
-    # 日付の動的計算
+    if not port_tickers:
+        st.error("有効な銘柄コードが見つかりません。設定を確認してください。")
+        st.stop()
+
+    # --- 日付設定 ---
     global_end_date = datetime.date.today()
     if analysis_mode == "利用可能な最大期間 (Max Historical)":
         global_start_date = datetime.date(1990, 1, 1)
@@ -102,75 +137,66 @@ if run_button:
     else:
         lookback_days = 365 * lookback_years
         global_start_date = global_end_date - datetime.timedelta(days=lookback_days)
-    
-    # --- Step 0: 入力サニタイズ ---
-    sanitized_port = unicodedata.normalize('NFKC', port_input)
-    raw_codes = re.findall(r'\b\d{4}\b', sanitized_port)
-    port_tickers = [f"{code}.T" for code in list(dict.fromkeys(raw_codes))]
-    
-    if not port_tickers:
-        st.error("有効な銘柄コードが見つかりませんでした。")
-        st.stop()
 
-    clean_w_str = unicodedata.normalize('NFKC', weight_input).replace(" ", "").replace("\n", "")
-    weight_list = []
-    if clean_w_str:
-        sanitized_w = re.sub(r'[^0-9.,]', '', clean_w_str)
-        if sanitized_w:
-            try: weight_list = [float(w) for w in sanitized_w.split(',') if w]
-            except: pass 
-
-    # --- Step A: ユニバース準備 ---
-    progress_bar.progress(10, text="[2/5] ユニバース（比較基準）の準備中...")
-    custom_list = MarketMonitor.load_tickers_from_file(uploaded_file) if uploaded_file else None
-    bench_tickers = MarketMonitor.get_latest_tickers(bench_mode, custom_list)
+    # --- 処理状況の可視化 (プログレスバー細分化) ---
+    progress_bar = st.progress(0, text="[1/5] 分析の準備中...")
+    
+    progress_bar.progress(10, text="[2/5] ユニバース（ベンチマーク）データを展開中...")
+    bench_tickers = MarketMonitor.get_latest_tickers(bench_mode)
     all_target_tickers = list(set(bench_tickers + port_tickers))
 
-    # --- Step B: データ取得 ---
-    progress_bar.progress(20, text=f"[3/5] 市場データ(株価・財務)の取得中...")
+    progress_bar.progress(20, text=f"[3/5] 市場データ(株価・財務)を取得中... (対象: {len(all_target_tickers)}銘柄)")
     
-    df_all_fund, df_hist, df_market = get_cached_market_data(all_target_tickers, days=lookback_days)
-    
-    if df_all_fund.empty or df_hist.empty:
-        st.error("❌ 株価・財務データの取得に失敗しました。Yahoo Financeの制限（429エラー）の可能性があります。\n\n**【回避策】分析するポートフォリオ銘柄数を減らすか、10分ほど時間を置いてから再試行してください。**")
+    # データ取得実行 (エラーハンドリング付き)
+    try:
+        df_all_fund, df_hist, df_market = get_cached_market_data(all_target_tickers, days=lookback_days)
+    except Exception as e:
+        st.error(f"❌ データ取得中に致命的なエラーが発生しました: {e}")
         st.stop()
 
-    progress_bar.progress(40, text=f"[3/5] マクロファクターデータの同期中...")
-    
+    if df_all_fund.empty or df_hist.empty:
+        st.error("❌ 株価・財務データの取得に失敗しました。Yahoo Financeの制限（429エラー）の可能性があります。\n\n**【回避策】10分ほど時間を置いてから再試行してください。**")
+        st.stop()
+
+    progress_bar.progress(50, text="[3/5] マクロファクターデータを同期中...")
     df_ff5 = DataProvider.fetch_ken_french_5factors(
         start_date=global_start_date.strftime('%Y-%m-%d'), 
         end_date=global_end_date.strftime('%Y-%m-%d')
     )
 
     if df_ff5.empty:
-        st.warning("⚠️ ケネス・フレンチの5ファクターデータの取得に失敗しました。ローカルCSVまたはオンライン接続を確認してください。")
+        st.warning("⚠️ ケネス・フレンチの5ファクターデータの取得に失敗しました。参考値のみで計算を続行します。")
 
+    # --- 欠落データのパージと部分成功の許容 ---
     fetched_tickers = df_all_fund['Ticker'].tolist()
     missing_api = [t for t in port_tickers if t not in fetched_tickers]
     port_tickers_valid = [t for t in port_tickers if t not in missing_api]
 
     if missing_api:
-        st.warning(f"⚠️ 以下の銘柄は株価取得エラーのため除外されました: {', '.join(missing_api)}")
+        st.warning(f"⚠️ 以下の銘柄はAPI制限等のため取得できず、除外して計算を続行します: {', '.join(missing_api)}")
 
     if not port_tickers_valid:
-        st.error("計算可能な銘柄がありません。")
+        st.error("計算可能なポートフォリオ銘柄が一つもありません。処理を中止します。")
         st.stop()
 
-    # --- Step C: ウェイト計算 ---
+    # --- ウェイト計算 (時価総額加重フォールバック対応) ---
+    progress_bar.progress(60, text="[4/5] ポートフォリオ・ウェイトを計算中...")
     df_port_initial = df_all_fund[df_all_fund['Ticker'].isin(port_tickers_valid)].copy()
+    
     if weight_list and len(weight_list) == len(port_tickers):
-        weight_map = dict(zip(port_tickers, weight_list))
+        # 欠落した銘柄分を抜いてウェイトマップを作成
+        valid_weight_list = [w for t, w in zip(port_tickers, weight_list) if t in port_tickers_valid]
+        weight_map = dict(zip(port_tickers_valid, valid_weight_list))
         df_port_initial['Weight'] = df_port_initial['Ticker'].map(weight_map)
         df_port_initial = QuantEngine.calculate_portfolio_weights(df_port_initial, user_weights_provided=True)
     else:
+        # CSV等でウェイト指定がない場合は自動的に時価総額加重(MCW)
         df_port_initial = QuantEngine.calculate_portfolio_weights(df_port_initial, user_weights_provided=False)
 
-    # --- Step D: 二段構え 時系列多変量回帰分析 ---
-    progress_bar.progress(60, text="[4/5] 月次多変量回帰分析 (二段構え) 実行中...")
-    
+    # --- 回帰分析実行 ---
+    progress_bar.progress(70, text="[4/5] 月次多変量回帰分析 (Time-series Regression) を実行中...")
     regression_results = None
     if not df_ff5.empty:
-        # 月次分析の最低サンプル数は「24ヶ月」に設定
         regression_results = QuantEngine.run_5factor_regression(df_hist, df_port_initial[['Ticker', 'Weight']], df_ff5, min_n_obs=24)
     
     portfolio_z_radar = {}
@@ -188,27 +214,23 @@ if run_button:
     else:
         portfolio_z_radar = {'Beta': 1.0, 'Value': 0, 'Size': 0, 'Quality': 0, 'Investment': 0}
 
-    # --- Step E: スコア計算 ---
-    progress_bar.progress(80, text="[5/5] 固有スコアと寄与度の計算中...")
+    # --- スコア・寄与度計算 ---
+    progress_bar.progress(85, text="[5/5] 銘柄固有スコアと加重平均寄与度を計算中...")
     df_bench = df_all_fund[df_all_fund['Ticker'].isin(bench_tickers)]
     market_stats, _ = UniverseManager.generate_market_stats(df_bench)
 
     df_port_proc = QuantEngine.process_raw_factors(df_port_initial)
     df_port_scored, _ = QuantEngine.compute_z_scores(df_port_proc, market_stats)
-    
-    # --- Step F: 寄与度計算 ---
     df_port_scored, _ = QuantEngine.calculate_weighted_factor_contributions(df_port_scored)
 
-    progress_bar.progress(100, text="分析完了！")
-    time.sleep(0.4)
+    progress_bar.progress(100, text="✨ 分析完了！")
+    time.sleep(0.5)
     progress_bar.empty()
 
     # ---------------------------------------------------------
-    # 3. 分析結果の表示 UI (フィードバックの高度化)
+    # 3. 分析結果の表示 UI
     # ---------------------------------------------------------
-    
     if regression_success:
-        # QuantEngineから返ってくる各種指標を展開
         adj_r2 = regression_results.get('Adjusted_R_squared', 0)
         n_obs = regression_results.get('N_Observations', 'Unknown')
         method = regression_results.get('Method', 'Unknown')
@@ -216,7 +238,6 @@ if run_button:
         
         mode_text = "全期間 (1990~)" if analysis_mode == "利用可能な最大期間 (Max Historical)" else f"直近 {lookback_years} 年間"
         
-        # 専門的フィードバックの可視化
         st.markdown(f"""
         <div class="summary-box">
             <h4>📈 回帰分析サマリー ({mode_text} / 月次ベース)</h4>
@@ -242,10 +263,10 @@ if run_button:
 
     col1, col2 = st.columns([1, 1])
     with col1:
-        # グラフのタイトルに Adj R2 と N数 を明示
         suffix = f"(Adj R²={regression_results.get('Adjusted_R_squared', 0):.2f}, N={regression_results.get('N_Observations', 0)})" if regression_success else "(推定不能：参考値)"
-        fig_radar = Visualizer.plot_radar_chart(portfolio_z_radar, title_suffix=suffix)
-        st.plotly_chart(fig_radar, use_container_width=True) # visualizerの仕様に合わせておく
+        p_text = f"{global_start_date.strftime('%Y/%m')} - {global_end_date.strftime('%Y/%m')}"
+        fig_radar = Visualizer.plot_radar_chart(portfolio_z_radar, title_suffix=suffix, period_text=p_text)
+        st.plotly_chart(fig_radar, use_container_width=True)
     with col2:
         fig_bar = Visualizer.plot_contribution_bar_chart(df_port_scored)
         st.plotly_chart(fig_bar, use_container_width=True)
