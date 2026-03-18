@@ -15,10 +15,11 @@ from urllib3.util.retry import Retry
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 10.1: 429 Error回避＆永続キャッシュ強化版)
+    【Module 1】データ取得プロバイダー (Ver. 10.2: 429 Error回避＆安定取得特化版)
     - 429 Too Many Requests 対策として、指数バックオフ(Exponential Backoff)とUAローテーションを導入。
     - 財務データ(Fundamentals)をSQLiteに永続化し、APIの呼び出し回数を劇的に削減。
-    - チャンク取得の最適化と、各リクエスト間の優しいスリープ処理を実装。
+    - チャンク取得の最適化(サイズ5)と、各リクエスト間の優しいスリープ処理を実装。
+    - ハングアップ防止のためのタイムアウト設定を明記。
     """
     
     DB_PATH = "market_data.db"
@@ -253,7 +254,7 @@ class DataProvider:
         result_df = pd.DataFrame()
 
         if missing_tickers_for_api:
-            chunk_size = 5  # 【修正】リクエスト回数を減らすためチャンクを5に拡大
+            chunk_size = 5  # 【修正】リクエスト回数を減らすためチャンクを5に設定
             print(f"--- yfinance 履歴データ取得開始 (全{len(missing_tickers_for_api)}銘柄, チャンクサイズ:{chunk_size}) ---")
             
             for i in range(0, len(missing_tickers_for_api), chunk_size):
@@ -263,10 +264,12 @@ class DataProvider:
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        time.sleep(1.0 + random.uniform(0, 1)) # アクセス前にランダムな間隔を空ける
-                        fresh_session = DataProvider._create_session() # 毎回新しいUAでセッション作成
+                        # 429回避のため、毎回少し待つ
+                        time.sleep(1.0 + random.uniform(0, 1)) 
+                        fresh_session = DataProvider._create_session()
                         
                         print(f"[yfinance] チャンク取得中: {chunk} ...")
+                        # timeoutを明示的に設定してハングアップ防止
                         df = yf.download(
                             chunk, start=start_d, end=end_d,
                             progress=False, group_by='ticker', auto_adjust=True,
@@ -390,10 +393,11 @@ class DataProvider:
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
+                        # ループによる過剰リクエストを防ぐためスリープ
                         time.sleep(0.5 + random.uniform(0, 1))
                         session = DataProvider._create_session()
                         tk = yf.Ticker(ticker, session=session)
-                        info = tk.info or {}
+                        info = tk.info or {} # ここで通信が発生
                         
                         mktCap = info.get('marketCap', np.nan)
                         pbr = info.get('priceToBook', np.nan)
@@ -500,6 +504,7 @@ class DataProvider:
         for attempt in range(max_retries):
             try:
                 session = DataProvider._create_session()
+                # timeoutを設定
                 rm_df = yf.download("^N225", start=start_d, end=end_d, session=session, progress=False, threads=False, timeout=30)
                 if not rm_df.empty:
                     if isinstance(rm_df.columns, pd.MultiIndex):
