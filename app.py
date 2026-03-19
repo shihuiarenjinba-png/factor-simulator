@@ -46,15 +46,27 @@ st.markdown("Kenneth R. French の日本市場5ファクターに基づく厳密
 # ---------------------------------------------------------
 # キャッシュラッパー
 # ---------------------------------------------------------
+# 【修正①】ベンチマーク銘柄は24時間キャッシュ（毎回225銘柄を取得しない）
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_cached_benchmark_fundamentals(bench_tickers_tuple):
+    """
+    ベンチマーク銘柄の財務データを24時間キャッシュ。
+    リスト→タプル変換でキャッシュキーを安定化。
+    """
+    bench_tickers = list(bench_tickers_tuple)
+    return DataProvider.fetch_fundamentals(bench_tickers)
+
+# 【修正①】ポートフォリオ銘柄は1時間キャッシュ（少数なので速い）
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_cached_market_data(tickers, days=730):
+def get_cached_portfolio_data(port_tickers_tuple, days=730):
     """
-    【修正】月次分析に合わせ、履歴データは _monthly メソッドを呼び出す
+    ポートフォリオ銘柄のデータのみ取得。
+    月次分析に合わせ、履歴データは _monthly メソッドを呼び出す。
     """
-    df_fund = DataProvider.fetch_fundamentals(tickers)
-    df_hist = DataProvider.fetch_historical_prices_monthly(tickers, days=days)
-    df_market = DataProvider.fetch_market_rates(days=days) # 内側で月次処理済み
-    
+    port_tickers = list(port_tickers_tuple)
+    df_fund = DataProvider.fetch_fundamentals(port_tickers)
+    df_hist = DataProvider.fetch_historical_prices_monthly(port_tickers, days=days)
+    df_market = DataProvider.fetch_market_rates(days=days)  # 内側で月次処理済み
     return df_fund, df_hist, df_market
 
 # ---------------------------------------------------------
@@ -156,20 +168,37 @@ if run_button:
     progress_bar.progress(10, text="[2/5] ユニバース（比較基準）の準備中...")
     custom_list = MarketMonitor.load_tickers_from_file(uploaded_file) if uploaded_file and 'uploaded_file' in locals() else None
     bench_tickers = MarketMonitor.get_latest_tickers(bench_mode, custom_list)
-    all_target_tickers = list(set(bench_tickers + port_tickers))
 
-    # --- Step B: データ取得 (例外処理の強化) ---
-    progress_bar.progress(20, text=f"[3/5] 市場データ(株価・財務)の取得中... (対象: {len(all_target_tickers)}銘柄)")
+    # 【修正①】ベンチマーク財務データは24時間キャッシュから取得
+    # タプルに変換してキャッシュキーを安定化（リストはハッシュ不可のため）
+    progress_bar.progress(15, text="[2/5] ベンチマーク統計データの取得中（キャッシュ利用）...")
+    df_all_fund_bench = get_cached_benchmark_fundamentals(tuple(sorted(bench_tickers)))
+
+    # --- Step B: ポートフォリオのデータ取得のみ実行（件数が少ない） ---
+    progress_bar.progress(20, text=f"[3/5] ポートフォリオデータ(株価・財務)の取得中... (対象: {len(port_tickers)}銘柄)")
     
     try:
-        df_all_fund, df_hist, df_market = get_cached_market_data(all_target_tickers, days=lookback_days)
+        # 【修正①】ポートフォリオ銘柄のみ取得（旧: all_target_tickers=ベンチ+ポートで225銘柄以上）
+        df_port_fund, df_hist, df_market = get_cached_portfolio_data(
+            tuple(sorted(port_tickers)), days=lookback_days
+        )
     except Exception as e:
         st.error(f"❌ データ取得中に致命的なエラーが発生しました: {e}")
         st.stop()
     
-    if df_all_fund.empty or df_hist.empty:
+    if df_port_fund.empty or df_hist.empty:
         st.error("❌ 株価・財務データの取得に失敗しました。Yahoo Financeの制限（429エラー）の可能性があります。\n\n**【回避策】分析するポートフォリオ銘柄数を減らすか、10分ほど時間を置いてから再試行してください。**")
         st.stop()
+
+    # 【修正①】ベンチマーク財務データとポートフォリオ財務データを結合
+    # ベンチ取得に失敗してもポートフォリオ分析は継続できるようフェールセーフ
+    if not df_all_fund_bench.empty:
+        all_tickers_in_bench = df_all_fund_bench['Ticker'].tolist() if 'Ticker' in df_all_fund_bench.columns else []
+        port_only_fund = df_port_fund[~df_port_fund['Ticker'].isin(all_tickers_in_bench)] if 'Ticker' in df_port_fund.columns else df_port_fund
+        df_all_fund = pd.concat([df_all_fund_bench, port_only_fund], ignore_index=True)
+    else:
+        # ベンチマーク取得失敗時はポートフォリオデータのみで続行
+        df_all_fund = df_port_fund
 
     progress_bar.progress(40, text=f"[3/5] マクロファクターデータの同期中...")
     
@@ -182,7 +211,7 @@ if run_button:
         st.warning("⚠️ ケネス・フレンチの5ファクターデータの取得に失敗しました。ローカルCSVまたはオンライン接続を確認してください。")
 
     # --- 欠落銘柄のパージ ---
-    fetched_tickers = df_all_fund['Ticker'].tolist()
+    fetched_tickers = df_port_fund['Ticker'].tolist() if 'Ticker' in df_port_fund.columns else []
     missing_api = [t for t in port_tickers if t not in fetched_tickers]
     port_tickers_valid = [t for t in port_tickers if t not in missing_api]
 
@@ -231,6 +260,7 @@ if run_button:
 
     # --- Step E: スコア計算 ---
     progress_bar.progress(80, text="[5/5] 固有スコアと寄与度の計算中...")
+    # 【修正①】ベンチマーク統計はベンチマーク銘柄のデータから算出（変更なし）
     df_bench = df_all_fund[df_all_fund['Ticker'].isin(bench_tickers)]
     market_stats, _ = UniverseManager.generate_market_stats(df_bench)
 
@@ -294,7 +324,7 @@ if run_button:
         except TypeError:
             fig_radar = Visualizer.plot_radar_chart(portfolio_z_radar, title_suffix=suffix)
             
-        st.plotly_chart(fig_radar, use_container_width=True) # visualizerの仕様に合わせておく
+        st.plotly_chart(fig_radar, use_container_width=True)
     with col2:
         fig_bar = Visualizer.plot_contribution_bar_chart(df_port_scored)
         st.plotly_chart(fig_bar, use_container_width=True)
