@@ -27,6 +27,7 @@ class QuantEngine:
     【最重要修正 V18.0】回帰分析の目的変数を純粋なリターンから「超過リターン(Ri - Rf)」に厳密化
     【最重要修正 V18.1】ファクター同期の厳格化 (Inner Joinと正規化の徹底)、サンプル数バリデーション強化
     【最重要修正 V19.0】二段構え回帰(共通期間一括 vs 個別加重平均)の実装、Adj R2とN数の出力強化
+    【最重要修正 V19.1】自動ウェイト計算(時価総額加重)の機能強化とフェールセーフ実装
     """
     
     # =========================================================================
@@ -166,7 +167,7 @@ class QuantEngine:
             agg_quality = (df_res['Quality'] * df_res['Weight']).sum()
             agg_invest = (df_res['Investment'] * df_res['Weight']).sum()
             
-            # R2とp値も目安として加重平均 (厳密な意味は薄れるが、ポートフォリオの平均的な当てはまり度として提示)
+            # R2とp値も目安として加重平均
             agg_r2 = (df_res['R_squared'] * df_res['Weight']).sum()
             agg_adj_r2 = (df_res['Adjusted_R_squared'] * df_res['Weight']).sum()
             agg_p_beta = (df_res['p_Beta'] * df_res['Weight']).sum()
@@ -183,7 +184,7 @@ class QuantEngine:
                 'R_squared': agg_r2,
                 'Adjusted_R_squared': agg_adj_r2,
                 'p_values': {
-                    'Alpha': 1.0, # 個別集計の場合、全体のAlpha有意性は出せないためデフォルト
+                    'Alpha': 1.0, 
                     'Beta': agg_p_beta
                 }
             }
@@ -254,8 +255,6 @@ class QuantEngine:
 
         if df_market is not None and not df_market.empty and 'Rm' in df_market.columns and 'Rf' in df_market.columns:
             try:
-                # df_market にすでにリターンが入っている想定 (月次なら Rm はリターン)
-                # 念のためチェック
                 if df_market['Rm'].max() > 10.0: # 価格だと判断
                     rm_ret = df_market['Rm'].pct_change().dropna()
                 else:
@@ -309,19 +308,25 @@ class QuantEngine:
         return df
 
     # =========================================================================
-    # スマート・ウェイト・エンジン (動的リウェイト機能搭載)
+    # 【強化】スマート・ウェイト・エンジン (時価総額加重の自動計算)
     # =========================================================================
     @staticmethod
     def calculate_portfolio_weights(df, user_weights_provided=False):
+        """
+        ウェイトが指定されていない場合、自動的に時価総額加重(Market Cap Weighting)を行う。
+        死んだ銘柄(Beta算出不可等)はウェイトから除外し、残りの銘柄で100%になるよう再配分する。
+        """
         df_out = df.copy()
         
+        # 1. 有効な銘柄のマスクを作成 (Betaが計算できているか)
         valid_mask = pd.Series(True, index=df_out.index)
         if 'Beta_Raw' in df_out.columns:
             valid_mask = df_out['Beta_Raw'].notna()
         
+        # 2. ユーザーがウェイトを指定した場合 (手入力 or CSVに列あり)
         if user_weights_provided and 'Weight' in df_out.columns:
             df_out['Weight'] = pd.to_numeric(df_out['Weight'], errors='coerce').fillna(0)
-            df_out.loc[~valid_mask, 'Weight'] = 0.0
+            df_out.loc[~valid_mask, 'Weight'] = 0.0 # 無効な銘柄はウェイト0
             
             valid_weights_count = (df_out['Weight'] > 0).sum()
             total_weight = df_out['Weight'].sum()
@@ -329,23 +334,27 @@ class QuantEngine:
             if total_weight > 0 and valid_weights_count > 0:
                 df_out['Weight'] = df_out['Weight'] / total_weight
                 return df_out
-            else:
-                pass
         
+        # 3. ウェイト未指定の場合 -> 【強化】時価総額加重(MCW)の自動計算
         if 'MarketCap' in df_out.columns:
+            # 時価総額を数値化し、NaNは0とする
             valid_mc = pd.to_numeric(df_out['MarketCap'], errors='coerce').fillna(0)
-            valid_mc.loc[~valid_mask] = 0.0
+            # 無効な銘柄(計算エラーや上場廃止等)の時価総額を強制的に0にする
+            valid_mc.loc[~valid_mask] = 0.0 
             mc_sum = valid_mc.sum()
             
             if mc_sum > 0:
+                # 生き残っている銘柄の時価総額で加重平均ウェイトを算出
                 df_out['Weight'] = valid_mc / mc_sum
             else:
+                # 時価総額データが全て取れなかった場合のフェールセーフ (等金額加重)
                 valid_count = valid_mask.sum()
                 if valid_count > 0:
                     df_out['Weight'] = np.where(valid_mask, 1.0 / valid_count, 0.0)
                 else:
                     df_out['Weight'] = 1.0 / len(df_out)
         else:
+            # MarketCapカラム自体が存在しない場合のフェールセーフ (等金額加重)
             valid_count = valid_mask.sum()
             if valid_count > 0:
                 df_out['Weight'] = np.where(valid_mask, 1.0 / valid_count, 0.0)
