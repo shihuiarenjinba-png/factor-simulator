@@ -35,6 +35,7 @@ class MarketMonitor:
         """
         ユーザーがアップロードした構成銘柄リスト(CSV/Excel)を読み込む。
         特定の列名に依存せず、全データから「4桁の数字」を自動スキャンして抽出する。
+        【修正】ウェイト列の有無も自動判定し、存在しない場合は「時価総額加重フラグ」として機能させる。
         """
         try:
             if uploaded_file.name.endswith('.csv'):
@@ -46,6 +47,7 @@ class MarketMonitor:
             
             best_tickers = []
             max_matches = 0
+            ticker_col_name = None
             
             # 全ての列をスキャンし、4桁の数字が最も多く含まれる列を特定する
             for col in df.columns:
@@ -63,14 +65,56 @@ class MarketMonitor:
                 if len(unique_tickers) > max_matches:
                     max_matches = len(unique_tickers)
                     best_tickers = unique_tickers
-                    
-            if best_tickers:
-                return best_tickers
+                    ticker_col_name = col
+            
+            # ベンチマーク取得などの内部利用の場合は単なるリストを返す（後方互換性）
+            return best_tickers
                 
         except Exception as e:
             st.warning(f"ファイルのパース中にエラーが発生しました: {e}")
             
         return None
+
+    @staticmethod
+    def extract_portfolio_from_file(uploaded_file):
+        """
+        【新規】app.pyのメイン処理向け。銘柄リストとウェイト（もしあれば）を同時に抽出する。
+        戻り値: (tickers_list, weight_list)
+        ※ weight_list が None の場合、app.py/quant_engine は「時価総額加重」を行うよう動く。
+        """
+        if uploaded_file is None:
+            return [], None
+            
+        try:
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+            elif uploaded_file.name.endswith(('.xls', '.xlsx')):
+                df = pd.read_excel(uploaded_file)
+            else:
+                return [], None
+                
+            # 1. 銘柄コード列の特定
+            ticker_col = next((c for c in df.columns if 'コード' in c or 'Ticker' in c or '銘柄' in c), None)
+            if not ticker_col:
+                # 明示的な名前がなければ正規表現スキャンフォールバック
+                return MarketMonitor.load_tickers_from_file(uploaded_file), None
+                
+            raw_codes = df[ticker_col].astype(str).str.extract(r'(\d{4})')[0].dropna().tolist()
+            port_tickers = [f"{code}.T" for code in list(dict.fromkeys(raw_codes))]
+            
+            # 2. ウェイト列の特定
+            weight_col = next((c for c in df.columns if c in ['Weight', 'ウェイト', '比率', '割合']), None)
+            weight_list = None
+            
+            if weight_col:
+                # 抽出した銘柄数に合わせてウェイトも切り出す
+                weight_list = pd.to_numeric(df[weight_col], errors='coerce').fillna(0).tolist()[:len(port_tickers)]
+                
+            return port_tickers, weight_list
+            
+        except Exception as e:
+            st.warning(f"ポートフォリオファイルの読み込みに失敗しました: {e}")
+            return [], None
 
     @staticmethod
     @st.cache_data(ttl=86400)
