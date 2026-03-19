@@ -13,13 +13,18 @@ import io
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# 【修正②】yfinance は 0.2.61 以上を推奨。requirements.txtを yfinance>=0.2.61 に変更してください。
+# 古いバージョン(0.2.54)はYahoo Finance APIの仕様変更により429エラーが頻発します。
+
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 10.2: 429 Error回避＆安定取得特化版)
+    【Module 1】データ取得プロバイダー (Ver. 10.3: 429 Error回避＆安定取得特化版)
     - 429 Too Many Requests 対策として、指数バックオフ(Exponential Backoff)とUAローテーションを導入。
     - 財務データ(Fundamentals)をSQLiteに永続化し、APIの呼び出し回数を劇的に削減。
     - チャンク取得の最適化(サイズ5)と、各リクエスト間の優しいスリープ処理を実装。
     - ハングアップ防止のためのタイムアウト設定を明記。
+    【修正②】fetch_fundamentals のキャッシュキー安定化（ソート＋重複排除）。
+    【修正②】SQLiteキャッシュ有効期限を3日→7日に延長（財務データは週次で十分）。
     """
     
     DB_PATH = "market_data.db"
@@ -69,7 +74,7 @@ class DataProvider:
                     mkt_rf REAL, smb REAL, hml REAL, rmw REAL, cma REAL, rf REAL
                 )
             """)
-            # 【新規】財務データ(Fundamentals)キャッシュ用テーブル (429対策の要)
+            # 財務データ(Fundamentals)キャッシュ用テーブル (429対策の要)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS fundamentals_cache (
                     ticker TEXT PRIMARY KEY,
@@ -131,7 +136,7 @@ class DataProvider:
     @staticmethod
     def _create_session():
         session = requests.Session()
-        # 【新規】User-Agentのローテーションでスクレイピング判定を回避
+        # User-Agentのローテーションでスクレイピング判定を回避
         user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -254,13 +259,13 @@ class DataProvider:
         result_df = pd.DataFrame()
 
         if missing_tickers_for_api:
-            chunk_size = 5  # 【修正】リクエスト回数を減らすためチャンクを5に設定
+            chunk_size = 5  # リクエスト回数を減らすためチャンクを5に設定
             print(f"--- yfinance 履歴データ取得開始 (全{len(missing_tickers_for_api)}銘柄, チャンクサイズ:{chunk_size}) ---")
             
             for i in range(0, len(missing_tickers_for_api), chunk_size):
                 chunk = missing_tickers_for_api[i:i + chunk_size]
                 
-                # 【新規】指数バックオフによるリトライ処理
+                # 指数バックオフによるリトライ処理
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
@@ -349,7 +354,11 @@ class DataProvider:
     @staticmethod
     @st.cache_data(ttl=3600, show_spinner=False)
     def fetch_fundamentals(tickers):
-        unique_tickers = list(set([DataProvider._normalize_ticker(t) for t in tickers if pd.notna(t)]))
+        # 【修正②】ソート＋重複排除でキャッシュキーを安定化
+        # リストの順序が異なっても同じ銘柄セットなら確実にキャッシュが効く
+        unique_tickers = sorted(list(set([
+            DataProvider._normalize_ticker(t) for t in tickers if pd.notna(t)
+        ])))
         unique_tickers = [t for t in unique_tickers if t]
         if not unique_tickers: return pd.DataFrame()
 
@@ -357,12 +366,12 @@ class DataProvider:
         cached_data = []
         tickers_to_fetch = []
 
-        # 1. DBから直近3日以内のキャッシュを取得
+        # 1. DBから直近7日以内のキャッシュを取得
+        # 【修正②】3日→7日に延長（財務データは週次で十分。API呼び出し頻度を削減）
         try:
             with sqlite3.connect(DataProvider.DB_PATH) as conn:
                 ticker_list_str = "','".join(unique_tickers)
-                # 3日以内のデータがあればそれを採用
-                query = f"SELECT * FROM fundamentals_cache WHERE ticker IN ('{ticker_list_str}') AND datetime(last_updated) >= datetime('now', '-3 days')"
+                query = f"SELECT * FROM fundamentals_cache WHERE ticker IN ('{ticker_list_str}') AND datetime(last_updated) >= datetime('now', '-7 days')"
                 df_cache = pd.read_sql(query, conn)
                 
             if not df_cache.empty:
@@ -397,7 +406,7 @@ class DataProvider:
                         time.sleep(0.5 + random.uniform(0, 1))
                         session = DataProvider._create_session()
                         tk = yf.Ticker(ticker, session=session)
-                        info = tk.info or {} # ここで通信が発生
+                        info = tk.info or {}  # ここで通信が発生
                         
                         mktCap = info.get('marketCap', np.nan)
                         pbr = info.get('priceToBook', np.nan)
@@ -414,7 +423,7 @@ class DataProvider:
                             'Growth': info.get('revenueGrowth', info.get('earningsGrowth', np.nan))
                         }
                         valid_api_data.append(res)
-                        break # 成功したらリトライループを抜ける
+                        break  # 成功したらリトライループを抜ける
                     except Exception as e:
                         err_msg = str(e).lower()
                         if "429" in err_msg or "too many" in err_msg:
