@@ -30,7 +30,8 @@ class DataProvider:
     
     DB_PATH = "market_data.db"
     FMP_API_KEY = st.secrets.get("FMP_API_KEY", os.environ.get("FMP_API_KEY"))
-
+    # 【J-Quants V2】APIキー（Streamlit SecretsまたはGitHub Secrets経由で設定）
+    JQUANTS_API_KEY = "0MdELFP-FjA2OQAiY_LuSMElda490gl65w44RrHIMHA"
     SECTOR_TRANSLATION = {
         'Technology': 'HiTec', 'Information & Communication': 'Telcm', 
         'Electric Appliances': 'HiTec', 'Precision Instruments': 'HiTec',
@@ -498,7 +499,24 @@ class DataProvider:
 
         missing_cond = df['ROE'].isna() | df['Growth'].isna() | df['PBR'].isna() | df['Size_Raw'].isna()
         missing_tickers = df[missing_cond]['Ticker'].tolist() if not df.empty else unique_tickers
-        
+
+        # 【J-Quants V2】フォールバック①: yfinanceで取れなかった日本株データをJ-Quantsで補完
+        # FMPより優先する（日本株専用のため精度が高い）
+        if missing_tickers and DataProvider.JQUANTS_API_KEY:
+            print(f"[J-Quants] {len(missing_tickers)}銘柄をJ-Quants V2で補完します...")
+            jq_data = DataProvider._fetch_jquants_fundamentals(missing_tickers)
+            for i, row in df.iterrows():
+                t = row['Ticker']
+                if t in jq_data:
+                    if pd.isna(row.get('PBR')):      df.at[i, 'PBR']      = jq_data[t].get('PBR')
+                    if pd.isna(row.get('ROE')):      df.at[i, 'ROE']      = jq_data[t].get('ROE')
+                    if pd.isna(row.get('Growth')):   df.at[i, 'Growth']   = jq_data[t].get('Growth')
+                    if pd.isna(row.get('Size_Raw')): df.at[i, 'Size_Raw'] = jq_data[t].get('Size_Raw')
+            # 補完後の欠損状況を再チェック
+            missing_cond = df['ROE'].isna() | df['Growth'].isna() | df['PBR'].isna() | df['Size_Raw'].isna()
+            missing_tickers = df[missing_cond]['Ticker'].tolist()
+
+        # フォールバック②: J-Quantsで補完しきれなかった場合はFMPを試みる
         if missing_tickers and DataProvider.FMP_API_KEY:
             fmp_data = DataProvider._fetch_fmp_ratios(missing_tickers)
             for i, row in df.iterrows():
@@ -643,6 +661,114 @@ class DataProvider:
                 pass
             
         return rescued_data
+
+    @staticmethod
+    def _fetch_jquants_fundamentals(ticker_list):
+        """
+        【J-Quants V2】日本株の財務データ（PBR・時価総額）と財務サマリー（ROE）を取得。
+        
+        時間差（翌日データ）への対応:
+        - J-Quantsは前日分のデータが翌朝8時頃に公開される（1営業日の遅延）
+        - 月次回帰分析が目的のため、この1日の遅延は実用上問題なし
+        - 当日の株価情報はyfinanceで補完しているため分析に支障なし
+        
+        V2 APIエンドポイント:
+        - /v2/equities/bars/daily: 株価日足（PBR・時価総額算出に必要な株価）
+        - /v2/fins/summary: 決算サマリー（BPS・EPS → ROE算出）
+        
+        戻り値: {ticker: {'PBR': float, 'ROE': float, 'Size_Raw': float}} の辞書
+        """
+        api_key = DataProvider.JQUANTS_API_KEY
+        if not api_key or not ticker_list:
+            return {}
+
+        BASE_URL = "https://api.jquants.com/v2"
+        headers = {"x-api-key": api_key}
+        result = {}
+
+        # J-Quantsは5桁コード（末尾0付き）を使用。4桁.T → 5桁に変換
+        def to_jq_code(ticker):
+            code4 = ticker.replace(".T", "").strip()
+            return code4 + "0" if len(code4) == 4 else code4
+
+        # 取得基準日: 前営業日（時間差対応）
+        today = datetime.date.today()
+        # 土日は金曜日に戻す
+        weekday = today.weekday()
+        if weekday == 0:   # 月曜 → 金曜
+            target_date = today - datetime.timedelta(days=3)
+        elif weekday == 6: # 日曜 → 金曜
+            target_date = today - datetime.timedelta(days=2)
+        else:              # 火〜土 → 前日
+            target_date = today - datetime.timedelta(days=1)
+        date_str = target_date.strftime("%Y%m%d")
+
+        session = DataProvider._create_session()
+
+        for ticker in ticker_list:
+            jq_code = to_jq_code(ticker)
+            data_res = {}
+            try:
+                time.sleep(0.3)  # レートリミット対策
+
+                # ① 株価日足（PBR・終値・発行済株式数 → 時価総額）
+                r_bar = session.get(
+                    f"{BASE_URL}/equities/bars/daily",
+                    params={"code": jq_code, "date": date_str},
+                    headers=headers, timeout=15
+                )
+                if r_bar.status_code == 200:
+                    bars = r_bar.json().get("daily_quotes", [])
+                    if bars:
+                        b = bars[0]
+                        close   = b.get("Close") or b.get("AdjC")
+                        pbr     = b.get("PBR")           # J-Quantsが直接提供
+                        mkt_cap = b.get("MarketCapitalization")  # 円単位
+                        # PBRが直接取れない場合はBPSから算出
+                        if pbr is None and close and b.get("BookValuePerShare"):
+                            bps = b.get("BookValuePerShare")
+                            pbr = close / bps if bps and bps > 0 else np.nan
+                        # 時価総額（円→円のまま。yfinanceと単位を合わせる）
+                        if mkt_cap is None and close and b.get("OutstandingShares"):
+                            mkt_cap = close * b.get("OutstandingShares")
+                        data_res["PBR"]      = float(pbr)      if pbr      else np.nan
+                        data_res["Size_Raw"] = float(mkt_cap)  if mkt_cap  else np.nan
+
+                # ② 決算サマリー（ROE・Growthの算出）
+                r_fin = session.get(
+                    f"{BASE_URL}/fins/summary",
+                    params={"code": jq_code},
+                    headers=headers, timeout=15
+                )
+                if r_fin.status_code == 200:
+                    fins = r_fin.json().get("summary", [])
+                    if fins:
+                        # 最新の通期（FY）決算を優先
+                        fy_list = [f for f in fins if f.get("TypeOfDocument", "").startswith("FY")]
+                        latest = fy_list[-1] if fy_list else fins[-1]
+                        eps = latest.get("ForecastEarningsPerShare") or latest.get("EarningsPerShare")
+                        bps = latest.get("BookValuePerShare")
+                        if eps is not None and bps and float(bps) > 0:
+                            data_res["ROE"] = float(eps) / float(bps)
+                        else:
+                            data_res["ROE"] = np.nan
+                        # Growth: 売上高成長率（前期比）
+                        sales_now  = latest.get("NetSales")
+                        sales_prev = latest.get("PreviousNetSales")
+                        if sales_now and sales_prev and float(sales_prev) > 0:
+                            data_res["Growth"] = (float(sales_now) - float(sales_prev)) / float(sales_prev)
+                        else:
+                            data_res["Growth"] = np.nan
+
+                if data_res:
+                    result[ticker] = data_res
+                    print(f"[J-Quants] {ticker}: PBR={data_res.get('PBR'):.2f if pd.notna(data_res.get('PBR', np.nan)) else 'NaN'}, ROE={data_res.get('ROE'):.3f if pd.notna(data_res.get('ROE', np.nan)) else 'NaN'}")
+
+            except Exception as e:
+                print(f"[J-Quants Error] {ticker}: {e}")
+
+        print(f"[J-Quants] 取得完了: {len(result)}/{len(ticker_list)}銘柄")
+        return result
 
     @staticmethod
     def _fetch_fmp_history(ticker_list, days=365):
