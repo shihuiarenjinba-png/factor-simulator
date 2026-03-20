@@ -340,10 +340,10 @@ if run_button:
         except TypeError:
             fig_radar = Visualizer.plot_radar_chart(portfolio_z_radar, title_suffix=suffix)
             
-        st.plotly_chart(fig_radar, use_container_width=True)
+        st.plotly_chart(fig_radar, width='stretch')
     with col2:
         fig_bar = Visualizer.plot_contribution_bar_chart(df_port_scored)
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_bar, width='stretch')
 
     # ---------------------------------------------------------
     # 4. 動的ソート機能付き 詳細データテーブル
@@ -384,6 +384,6 @@ if run_button:
     st.dataframe(
         df_display.style.format(format_dict)
                         .background_gradient(subset=[c for c in df_display.columns if '寄与' in c], cmap='RdBu', vmin=-0.5, vmax=0.5),
-        use_container_width=True,
+        width='stretch',
         hide_index=True
     )
