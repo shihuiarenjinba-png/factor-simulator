@@ -31,7 +31,8 @@ class DataProvider:
     DB_PATH = "market_data.db"
     FMP_API_KEY = st.secrets.get("FMP_API_KEY", os.environ.get("FMP_API_KEY"))
     # 【J-Quants V2】APIキー（Streamlit SecretsまたはGitHub Secrets経由で設定）
-    JQUANTS_API_KEY = "0MdELFP-FjA2OQAiY_LuSMElda490gl65w44RrHIMHA"
+    JQUANTS_API_KEY = st.secrets.get("JQUANTS_API_KEY", os.environ.get("JQUANTS_API_KEY"))
+
     SECTOR_TRANSLATION = {
         'Technology': 'HiTec', 'Information & Communication': 'Telcm', 
         'Electric Appliances': 'HiTec', 'Precision Instruments': 'HiTec',
@@ -663,56 +664,131 @@ class DataProvider:
         return rescued_data
 
     @staticmethod
+    @staticmethod
     def _fetch_jquants_fundamentals(ticker_list):
         """
-        【J-Quants V2】日本株の財務データ（PBR・時価総額）と財務サマリー（ROE）を取得。
-        
-        時間差（翌日データ）への対応:
-        - J-Quantsは前日分のデータが翌朝8時頃に公開される（1営業日の遅延）
-        - 月次回帰分析が目的のため、この1日の遅延は実用上問題なし
-        - 当日の株価情報はyfinanceで補完しているため分析に支障なし
-        
-        V2 APIエンドポイント:
-        - /v2/equities/bars/daily: 株価日足（PBR・時価総額算出に必要な株価）
-        - /v2/fins/summary: 決算サマリー（BPS・EPS → ROE算出）
-        
-        戻り値: {ticker: {'PBR': float, 'ROE': float, 'Size_Raw': float}} の辞書
+        【J-Quants V2 正式実装】日本株の財務データを取得。
+
+        仕様（公式ドキュメント準拠）:
+        - /v2/equities/bars/daily: 株価日足（Close・AdjOutstandingShares → 時価総額算出）
+        - /v2/fins/summary:        決算サマリー（BPS・EPS → PBR・ROE算出）
+        - PBRは株価日足には含まれないため Close ÷ BPS で算出
+        - 時間差（翌営業日公開）: 月次分析のため実用上問題なし
+
+        戻り値: {ticker: {'PBR': float, 'ROE': float, 'Size_Raw': float, 'Growth': float}}
         """
         api_key = DataProvider.JQUANTS_API_KEY
         if not api_key or not ticker_list:
             return {}
 
-        BASE_URL = "https://api.jquants.com/v2"
-        headers = {"x-api-key": api_key}
+        # 公式クライアントがあれば使用、なければ直接APIにフォールバック
+        try:
+            import jquantsapi
+            cli = jquantsapi.ClientV2(api_key=api_key)
+            return DataProvider._fetch_jquants_with_client(cli, ticker_list)
+        except ImportError:
+            print("[J-Quants] jquants-api-client 未インストール → 直接APIで取得")
+            return DataProvider._fetch_jquants_direct(ticker_list, api_key)
+        except Exception as e:
+            print(f"[J-Quants] クライアントエラー({e}) → 直接APIにフォールバック")
+            return DataProvider._fetch_jquants_direct(ticker_list, api_key)
+
+    @staticmethod
+    def _jq_prev_business_day():
+        """前営業日の日付文字列(YYYYMMDD)を返す"""
+        today = datetime.date.today()
+        offset = {0: 3, 5: 1, 6: 2}.get(today.weekday(), 1)  # 月:3, 土:1, 日:2, 他:1
+        return (today - datetime.timedelta(days=offset)).strftime("%Y%m%d")
+
+    @staticmethod
+    def _jq_to_code(ticker):
+        """4桁.T → 5桁コード（末尾0付き）に変換"""
+        c = ticker.replace(".T", "").strip()
+        return c + "0" if len(c) == 4 else c
+
+    @staticmethod
+    def _jq_from_code(jq_code, ticker_list):
+        """5桁コード → 元のtickerに逆変換"""
+        c4 = jq_code[:-1] if jq_code.endswith("0") and len(jq_code) == 5 else jq_code
+        return next((t for t in ticker_list if t.replace(".T", "") == c4), c4 + ".T")
+
+    @staticmethod
+    def _fetch_jquants_with_client(cli, ticker_list):
+        """
+        公式 jquantsapi.ClientV2 を使った取得（並列化版）
+        ThreadPoolExecutorで銘柄ごとに並列取得し、逐次ループより大幅に高速化。
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        date_str = DataProvider._jq_prev_business_day()
         result = {}
 
-        # J-Quantsは5桁コード（末尾0付き）を使用。4桁.T → 5桁に変換
-        def to_jq_code(ticker):
-            code4 = ticker.replace(".T", "").strip()
-            return code4 + "0" if len(code4) == 4 else code4
-
-        # 取得基準日: 前営業日（時間差対応）
-        today = datetime.date.today()
-        # 土日は金曜日に戻す
-        weekday = today.weekday()
-        if weekday == 0:   # 月曜 → 金曜
-            target_date = today - datetime.timedelta(days=3)
-        elif weekday == 6: # 日曜 → 金曜
-            target_date = today - datetime.timedelta(days=2)
-        else:              # 火〜土 → 前日
-            target_date = today - datetime.timedelta(days=1)
-        date_str = target_date.strftime("%Y%m%d")
-
-        session = DataProvider._create_session()
-
-        for ticker in ticker_list:
-            jq_code = to_jq_code(ticker)
-            data_res = {}
+        def fetch_one(ticker):
+            jq_code = DataProvider._jq_to_code(ticker)
+            data_res = {"PBR": np.nan, "ROE": np.nan, "Size_Raw": np.nan, "Growth": np.nan}
             try:
-                time.sleep(0.3)  # レートリミット対策
+                close = np.nan
+                df_bar = cli.get_eq_bars_daily(code=jq_code, date_yyyymmdd=date_str)
+                if df_bar is not None and not df_bar.empty:
+                    row = df_bar.iloc[-1]
+                    close  = row.get("Close") or row.get("AdjC")
+                    shares = row.get("AdjOutstandingShares") or row.get("OutstandingShares")
+                    if close and shares:
+                        data_res["Size_Raw"] = float(close) * float(shares)
+                    close = float(close) if close else np.nan
 
-                # ① 株価日足（PBR・終値・発行済株式数 → 時価総額）
-                r_bar = session.get(
+                df_fin = cli.get_fin_summary(code=jq_code)
+                if df_fin is not None and not df_fin.empty:
+                    if "TypeOfDocument" in df_fin.columns:
+                        fy = df_fin[df_fin["TypeOfDocument"].str.startswith("FY", na=False)]
+                        latest = fy.iloc[-1] if not fy.empty else df_fin.iloc[-1]
+                    else:
+                        latest = df_fin.iloc[-1]
+                    bps = latest.get("BookValuePerShare")
+                    eps = latest.get("EarningsPerShare") or latest.get("ForecastEarningsPerShare")
+                    ns  = latest.get("NetSales")
+                    pns = latest.get("PreviousNetSales") or latest.get("LastYearNetSales")
+                    if pd.notna(close) and bps and float(bps) > 0:
+                        data_res["PBR"] = float(close) / float(bps)
+                    if eps and bps and float(bps) > 0:
+                        data_res["ROE"] = float(eps) / float(bps)
+                    if ns and pns and float(pns) > 0:
+                        data_res["Growth"] = (float(ns) - float(pns)) / float(pns)
+            except Exception as e:
+                print(f"[J-Quants] {ticker}: {e}")
+            return ticker, data_res
+
+        # 最大5並列（J-Quantsのレートリミットを考慮）
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(fetch_one, t): t for t in ticker_list}
+            for future in as_completed(futures):
+                ticker, data_res = future.result()
+                result[ticker] = data_res
+                pbr_str = f"{data_res['PBR']:.2f}" if pd.notna(data_res["PBR"]) else "NaN"
+                print(f"[J-Quants✓] {ticker}: PBR={pbr_str}")
+
+        print(f"[J-Quants] 公式クライアント完了: {len(result)}/{len(ticker_list)}銘柄")
+        return result
+
+    @staticmethod
+    def _fetch_jquants_direct(ticker_list, api_key):
+        """
+        公式クライアント未インストール時の直接API呼び出し（並列化版）
+        ThreadPoolExecutorで銘柄ごとに並列取得。
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        BASE_URL = "https://api.jquants.com/v2"
+        headers  = {"x-api-key": api_key}
+        result   = {}
+        date_str = DataProvider._jq_prev_business_day()
+
+        def fetch_one(ticker):
+            # スレッドごとに独立したセッションを使用
+            sess = DataProvider._create_session()
+            jq_code = DataProvider._jq_to_code(ticker)
+            data_res = {"PBR": np.nan, "ROE": np.nan, "Size_Raw": np.nan, "Growth": np.nan}
+            try:
+                close = np.nan
+                r_bar = sess.get(
                     f"{BASE_URL}/equities/bars/daily",
                     params={"code": jq_code, "date": date_str},
                     headers=headers, timeout=15
@@ -720,22 +796,16 @@ class DataProvider:
                 if r_bar.status_code == 200:
                     bars = r_bar.json().get("daily_quotes", [])
                     if bars:
-                        b = bars[0]
-                        close   = b.get("Close") or b.get("AdjC")
-                        pbr     = b.get("PBR")           # J-Quantsが直接提供
-                        mkt_cap = b.get("MarketCapitalization")  # 円単位
-                        # PBRが直接取れない場合はBPSから算出
-                        if pbr is None and close and b.get("BookValuePerShare"):
-                            bps = b.get("BookValuePerShare")
-                            pbr = close / bps if bps and bps > 0 else np.nan
-                        # 時価総額（円→円のまま。yfinanceと単位を合わせる）
-                        if mkt_cap is None and close and b.get("OutstandingShares"):
-                            mkt_cap = close * b.get("OutstandingShares")
-                        data_res["PBR"]      = float(pbr)      if pbr      else np.nan
-                        data_res["Size_Raw"] = float(mkt_cap)  if mkt_cap  else np.nan
+                        b      = bars[0]
+                        close  = b.get("Close") or b.get("AdjC")
+                        shares = b.get("AdjOutstandingShares") or b.get("OutstandingShares")
+                        if close and shares:
+                            data_res["Size_Raw"] = float(close) * float(shares)
+                        close = float(close) if close else np.nan
+                elif r_bar.status_code == 403:
+                    print(f"[J-Quants] 認証失敗(403) {ticker}: APIキーを確認")
 
-                # ② 決算サマリー（ROE・Growthの算出）
-                r_fin = session.get(
+                r_fin = sess.get(
                     f"{BASE_URL}/fins/summary",
                     params={"code": jq_code},
                     headers=headers, timeout=15
@@ -743,34 +813,35 @@ class DataProvider:
                 if r_fin.status_code == 200:
                     fins = r_fin.json().get("summary", [])
                     if fins:
-                        # 最新の通期（FY）決算を優先
-                        fy_list = [f for f in fins if f.get("TypeOfDocument", "").startswith("FY")]
-                        latest = fy_list[-1] if fy_list else fins[-1]
-                        eps = latest.get("ForecastEarningsPerShare") or latest.get("EarningsPerShare")
+                        latest = fins[-1]
                         bps = latest.get("BookValuePerShare")
-                        if eps is not None and bps and float(bps) > 0:
+                        eps = latest.get("EarningsPerShare") or latest.get("ForecastEarningsPerShare")
+                        ns  = latest.get("NetSales")
+                        pns = latest.get("PreviousNetSales") or latest.get("LastYearNetSales")
+                        if pd.notna(close) and bps and float(bps) > 0:
+                            data_res["PBR"] = float(close) / float(bps)
+                        if eps and bps and float(bps) > 0:
                             data_res["ROE"] = float(eps) / float(bps)
-                        else:
-                            data_res["ROE"] = np.nan
-                        # Growth: 売上高成長率（前期比）
-                        sales_now  = latest.get("NetSales")
-                        sales_prev = latest.get("PreviousNetSales")
-                        if sales_now and sales_prev and float(sales_prev) > 0:
-                            data_res["Growth"] = (float(sales_now) - float(sales_prev)) / float(sales_prev)
-                        else:
-                            data_res["Growth"] = np.nan
-
-                if data_res:
-                    result[ticker] = data_res
-                    print(f"[J-Quants] {ticker}: PBR={data_res.get('PBR'):.2f if pd.notna(data_res.get('PBR', np.nan)) else 'NaN'}, ROE={data_res.get('ROE'):.3f if pd.notna(data_res.get('ROE', np.nan)) else 'NaN'}")
-
+                        if ns and pns and float(pns) > 0:
+                            data_res["Growth"] = (float(ns) - float(pns)) / float(pns)
+                elif r_fin.status_code == 403:
+                    print(f"[J-Quants] 認証失敗(403) {ticker}: APIキーを確認")
             except Exception as e:
-                print(f"[J-Quants Error] {ticker}: {e}")
+                print(f"[J-Quants Direct Error] {ticker}: {e}")
+            return ticker, data_res
 
-        print(f"[J-Quants] 取得完了: {len(result)}/{len(ticker_list)}銘柄")
+        # 最大5並列（レートリミット考慮）
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(fetch_one, t): t for t in ticker_list}
+            for future in as_completed(futures):
+                ticker, data_res = future.result()
+                result[ticker] = data_res
+                pbr_str = f"{data_res['PBR']:.2f}" if pd.notna(data_res["PBR"]) else "NaN"
+                print(f"[J-Quants✓] {ticker}: PBR={pbr_str}")
+
+        print(f"[J-Quants Direct] 完了: {len(result)}/{len(ticker_list)}銘柄")
         return result
 
-    @staticmethod
     def _fetch_fmp_history(ticker_list, days=365):
         api_key = DataProvider.FMP_API_KEY
         if not api_key or not ticker_list: return pd.DataFrame()
