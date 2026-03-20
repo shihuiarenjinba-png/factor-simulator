@@ -154,6 +154,7 @@ class DataProvider:
         csv_path = "Japan_5_Factors.csv"
         df_ff = pd.DataFrame()
 
+        # 【優先①】リポジトリ同梱のCSVから読み込み（最も安定）
         if os.path.exists(csv_path):
             try:
                 df_ff = pd.read_csv(csv_path, skiprows=6, index_col=0)
@@ -163,10 +164,55 @@ class DataProvider:
             except Exception as e:
                 print(f"[Factor Error] CSV読み込み失敗: {e}")
 
+        # 【優先②】フレンチのサーバーからZIPを直接ダウンロード
+        # （Streamlit CloudはURLopen経由でアクセス可能な場合がある）
+        if df_ff.empty:
+            try:
+                import urllib.request
+                import zipfile
+                zip_url = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Japan_5_Factors_CSV.zip"
+                print(f"[Factor] ZIPダウンロード試行: {zip_url}")
+                req = urllib.request.Request(
+                    zip_url,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; research-app)"}
+                )
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    zip_bytes = io.BytesIO(resp.read())
+                with zipfile.ZipFile(zip_bytes) as zf:
+                    fname = next((n for n in zf.namelist() if n.upper().endswith('.CSV')), None)
+                    if fname:
+                        with zf.open(fname) as f:
+                            raw = f.read().decode('utf-8', errors='ignore')
+                        # skiprows=6相当の処理
+                        lines = raw.splitlines()
+                        # ヘッダー行（列名を含む行）を探す
+                        header_idx = next(
+                            (i for i, l in enumerate(lines) if 'Mkt-RF' in l or 'MKT-RF' in l.upper()),
+                            6
+                        )
+                        csv_content = "\n".join(lines[header_idx:])
+                        df_ff = pd.read_csv(io.StringIO(csv_content), index_col=0)
+                        df_ff.index = pd.to_datetime(
+                            df_ff.index.astype(str).str.strip(),
+                            format='%Y%m', errors='coerce'
+                        )
+                        df_ff = df_ff.dropna(how='all')
+                        print("[Factor] ZIPダウンロードから読み込み成功")
+                        # 次回起動のためにローカルキャッシュとして保存
+                        try:
+                            with open(csv_path, 'w') as out:
+                                out.write("\n".join(lines))
+                            print(f"[Factor] {csv_path} にキャッシュ保存しました")
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"[Factor Error] ZIPダウンロード失敗: {e}")
+
+        # 【優先③】pandas_datareader経由（環境によってはアクセス可能）
         if df_ff.empty:
             try:
                 import pandas_datareader.data as web
-                dataset_name = "Japan_5_Factors" 
+                dataset_name = "Japan_5_Factors"
                 print(f"[Factor] pandas_datareaderより {dataset_name} の取得開始...")
                 ff_dict = web.DataReader(dataset_name, 'famafrench', start="1990-01-01")
                 df_ff = ff_dict[0]
@@ -176,7 +222,7 @@ class DataProvider:
             except Exception as e:
                 print(f"[Factor Error] オンライン取得失敗: {e}")
 
-        if df_ff.empty: 
+        if df_ff.empty:
             return pd.DataFrame()
 
         df_ff.columns = [str(c).strip().upper() for c in df_ff.columns]
