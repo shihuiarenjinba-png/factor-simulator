@@ -70,11 +70,11 @@ def get_cached_portfolio_data(port_tickers_tuple, days=730):
     return df_fund, df_hist, df_market
 
 # ---------------------------------------------------------
-# 1. サイドバー: 入力 (st.expanderで整理)
+# 1. サイドバー: 入力
 # ---------------------------------------------------------
 st.sidebar.header("📊 分析設定")
 
-# 【新規】基本設定をエキスパンダー化
+# ── 基本設定 ──────────────────────────────────────────────
 with st.sidebar.expander("⚙️ 基本設定 (期間・ベンチマーク)", expanded=True):
     analysis_mode = st.radio(
         "分析期間の設定 (Monthly Data)", 
@@ -84,79 +84,102 @@ with st.sidebar.expander("⚙️ 基本設定 (期間・ベンチマーク)", ex
     lookback_years = st.slider("直近指定期間 (年)", 1, 10, 5) if analysis_mode == "直近指定期間" else 30
     bench_mode = st.radio("ベンチマークユニバース", ("TOPIX Core 30", "Nikkei 225"))
 
-# 【新規】ポートフォリオ入力をエキスパンダー化し、CSV即時反映を実装
+# ── session_state の初期化 ────────────────────────────────
+# ポートフォリオテーブルの初期値（デフォルト5銘柄）
+if "portfolio_df" not in st.session_state:
+    st.session_state.portfolio_df = pd.DataFrame({
+        "コード": ["7203", "8306", "9984", "6758", "8035"],
+        "ウェイト": [20.0, 20.0, 20.0, 20.0, 20.0]
+    })
+
+# ── ポートフォリオ入力 ────────────────────────────────────
 with st.sidebar.expander("📁 ポートフォリオ入力", expanded=True):
-    input_method = st.radio("入力方法", ["手入力 (テキスト)", "CSV/Excel アップロード"])
-    
-    port_tickers = []
-    weight_list = []
-    uploaded_file = None
-    
-    if input_method == "手入力 (テキスト)":
-        port_input = st.text_area(
-            "銘柄コード (カンマまたは改行区切り)",
-            value="7203, 8306, 9984, 6758, 8035",
-            help="証券コード（4桁）を入力してください。"
-        )
-        weight_input = st.text_area(
-            "ウェイト入力 (空欄で時価総額加重)",
-            value="",
-            help="銘柄と同じ順番で数値を入力してください。"
-        )
-        # 手入力時のサニタイズ
-        sanitized_port = unicodedata.normalize('NFKC', port_input)
-        raw_codes = re.findall(r'\b\d{4}\b', sanitized_port)
-        port_tickers = [f"{code}.T" for code in list(dict.fromkeys(raw_codes))]
-        
-        clean_w_str = unicodedata.normalize('NFKC', weight_input).replace(" ", "").replace("\n", "")
-        if clean_w_str:
-            sanitized_w = re.sub(r'[^0-9.,]', '', clean_w_str)
-            if sanitized_w:
-                try: weight_list = [float(w) for w in sanitized_w.split(',') if w]
-                except: pass 
+
+    # CSVアップロード（アップロードしたらテーブルに即反映）
+    uploaded_file = st.file_uploader(
+        "CSVをアップロード（任意）",
+        type=["csv", "xlsx", "xls"],
+        help="アップロードすると下のテーブルに自動反映されます。"
+    )
+
+    if uploaded_file is not None:
+        try:
+            if uploaded_file.name.endswith(".csv"):
+                df_up = pd.read_csv(uploaded_file, encoding="utf-8-sig")
+            else:
+                df_up = pd.read_excel(uploaded_file)
+
+            # ティッカー列の自動検出
+            ticker_col = next((c for c in df_up.columns if any(k in c for k in [
+                "コード", "Ticker", "ticker", "銘柄", "ティッカー", "Symbol", "symbol", "Code", "code"
+            ])), None)
+            if not ticker_col:
+                best_col, best_count = None, 0
+                for c in df_up.columns:
+                    cnt = df_up[c].astype(str).str.contains(r"\b\d{4}\b").sum()
+                    if cnt > best_count:
+                        best_count, best_col = cnt, c
+                if best_count > 0:
+                    ticker_col = best_col
+
+            # ウェイト列の自動検出
+            weight_col = next((c for c in df_up.columns if any(k in c for k in [
+                "Weight", "weight", "ウェイト", "比率", "割合", "保有", "Ratio", "ratio", "%"
+            ])), None)
+
+            if ticker_col:
+                raw_codes = df_up[ticker_col].astype(str).str.extract(r"(\d{4})")[0].dropna().tolist()
+                codes = list(dict.fromkeys(raw_codes))  # 重複排除・順序保持
+                if weight_col:
+                    weights = pd.to_numeric(df_up[weight_col], errors="coerce").fillna(0).tolist()[:len(codes)]
+                else:
+                    weights = [round(100.0 / len(codes), 1)] * len(codes)
+
+                # テーブルに反映（session_stateを上書き）
+                st.session_state.portfolio_df = pd.DataFrame({
+                    "コード": codes,
+                    "ウェイト": [float(w) for w in weights]
+                })
+                st.success(f"✅ {len(codes)} 銘柄を読み込みました。")
+            else:
+                st.error("銘柄コード列が見つかりません。")
+        except Exception as e:
+            st.error(f"読み込み失敗: {e}")
+
+    # テーブル直接編集（CSVがなくてもここで追加・削除・編集可能）
+    edited_df = st.data_editor(
+        st.session_state.portfolio_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "コード":   st.column_config.TextColumn("証券コード (4桁)", help="例: 7203"),
+            "ウェイト": st.column_config.NumberColumn("ウェイト", min_value=0.0, format="%.1f", help="合計が100になるよう設定"),
+        }
+    )
+
+    # 編集内容を session_state に即座に反映
+    st.session_state.portfolio_df = edited_df
+
+    # ウェイト合計を表示（参考情報）
+    total_w = edited_df["ウェイト"].sum() if "ウェイト" in edited_df.columns else 0
+    if abs(total_w - 100.0) > 0.5:
+        st.caption(f"⚠️ ウェイト合計: {total_w:.1f}（分析時に自動正規化されます）")
     else:
-        # CSVアップロード時の即時反映ロジック
-        uploaded_file = st.file_uploader("構成銘柄ファイルを選択", type=['csv', 'xlsx', 'xls'])
-        if uploaded_file is not None:
-            try:
-                if uploaded_file.name.endswith('.csv'):
-                    # 【修正】BOM付きUTF-8（utf-8-sig）で読み込み、列名の﻿を除去
-                    df_up = pd.read_csv(uploaded_file, encoding='utf-8-sig')
-                else:
-                    df_up = pd.read_excel(uploaded_file)
-                
-                # 【修正】ティッカー列の探索キーワードを拡充（日本語列名・ティッカー列に対応）
-                ticker_col = next((c for c in df_up.columns if any(k in c for k in [
-                    'コード', 'Ticker', 'ticker', '銘柄', 'ティッカー', 'Symbol', 'symbol', 'Code', 'code'
-                ])), None)
+        st.caption(f"✅ ウェイト合計: {total_w:.1f}")
 
-                # 明示的な列が見つからない場合、4桁数字が最も多い列を自動検出
-                if not ticker_col:
-                    best_col, best_count = None, 0
-                    for c in df_up.columns:
-                        count = df_up[c].astype(str).str.contains(r'\b\d{4}\b').sum()
-                        if count > best_count:
-                            best_count, best_col = count, c
-                    if best_count > 0:
-                        ticker_col = best_col
+# ── テーブルからポートフォリオを組み立て ─────────────────
+port_tickers = []
+weight_list  = []
+uploaded_file_ref = None  # 後続処理との互換性のため
 
-                if ticker_col:
-                    raw_codes = df_up[ticker_col].astype(str).str.extract(r'(\d{4})')[0].dropna().tolist()
-                    port_tickers = [f"{code}.T" for code in list(dict.fromkeys(raw_codes))]
-                    
-                    # 【修正】ウェイト列の探索キーワードを拡充（'Weight (%)'・'保有割合'などに対応）
-                    weight_col = next((c for c in df_up.columns if any(k in c for k in [
-                        'Weight', 'weight', 'ウェイト', '比率', '割合', '保有', 'Ratio', 'ratio', '%'
-                    ])), None)
-                    if weight_col:
-                        weight_list = pd.to_numeric(df_up[weight_col], errors='coerce').fillna(0).tolist()[:len(port_tickers)]
-                        st.markdown(f"<div class='success-box'>✅ <b>{len(port_tickers)}</b> 銘柄とウェイト情報を認識しました。</div>", unsafe_allow_html=True)
-                    else:
-                        st.markdown(f"<div class='success-box'>✅ <b>{len(port_tickers)}</b> 銘柄を認識しました。<br><small>※ウェイト列がないため、時価総額加重で計算します。</small></div>", unsafe_allow_html=True)
-                else:
-                    st.error("ファイル内に銘柄コードを示す列が見つかりません。")
-            except Exception as e:
-                st.error(f"ファイルの読み込みに失敗しました: {e}")
+for _, row in edited_df.dropna(subset=["コード"]).iterrows():
+    raw = str(row["コード"]).strip()
+    match = re.search(r"\b(\d{4})\b", unicodedata.normalize("NFKC", raw))
+    if match:
+        port_tickers.append(f"{match.group(1)}.T")
+        w = row.get("ウェイト", 0)
+        weight_list.append(float(w) if pd.notna(w) else 0.0)
 
 st.sidebar.markdown("---")
 run_button = st.sidebar.button("🚀 回帰分析を実行", type="primary", use_container_width=True)
@@ -182,7 +205,7 @@ if run_button:
 
     # --- Step A: ユニバース準備 ---
     progress_bar.progress(10, text="[2/5] ユニバース（比較基準）の準備中...")
-    custom_list = MarketMonitor.load_tickers_from_file(uploaded_file) if uploaded_file and 'uploaded_file' in locals() else None
+    custom_list = None  # data_editorベースに移行したためCSVファイル渡しは不要
     bench_tickers = MarketMonitor.get_latest_tickers(bench_mode, custom_list)
 
     # 【修正①】ベンチマーク財務データは24時間キャッシュから取得
