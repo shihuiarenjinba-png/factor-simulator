@@ -13,18 +13,19 @@ import io
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# 【修正②】yfinance は 0.2.61 以上を推奨。requirements.txtを yfinance>=0.2.61 に変更してください。
-# 古いバージョン(0.2.54)はYahoo Finance APIの仕様変更により429エラーが頻発します。
+# yfinance 1.2.0以降はcurl_cffiを内部使用するため、session引数は渡さない。
+# _create_session()はFMP APIなどのrequests通信にのみ使用する。
 
 class DataProvider:
     """
-    【Module 1】データ取得プロバイダー (Ver. 10.3: 429 Error回避＆安定取得特化版)
-    - 429 Too Many Requests 対策として、指数バックオフ(Exponential Backoff)とUAローテーションを導入。
+    【Module 1】データ取得プロバイダー (Ver. 10.4: yfinance 1.2.0対応版)
+    - yfinance 1.2.0以降はcurl_cffiを使用するため、yf.download/yf.Tickerへのsession引数を全廃。
+    - _create_session()はFMP APIへのrequests通信専用に限定。
     - 財務データ(Fundamentals)をSQLiteに永続化し、APIの呼び出し回数を劇的に削減。
     - チャンク取得の最適化(サイズ5)と、各リクエスト間の優しいスリープ処理を実装。
-    - ハングアップ防止のためのタイムアウト設定を明記。
     【修正②】fetch_fundamentals のキャッシュキー安定化（ソート＋重複排除）。
     【修正②】SQLiteキャッシュ有効期限を3日→7日に延長（財務データは週次で十分）。
+    【修正③】yfinance 1.2.0対応: yf.download/yf.Tickerからsession引数を完全削除。
     """
     
     DB_PATH = "market_data.db"
@@ -58,7 +59,6 @@ class DataProvider:
     def _init_db():
         """SQLiteデータベースとテーブルの初期化"""
         with sqlite3.connect(DataProvider.DB_PATH) as conn:
-            # 履歴データ用テーブル
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS historical_prices (
                     ticker TEXT,
@@ -67,14 +67,12 @@ class DataProvider:
                     PRIMARY KEY (ticker, date)
                 )
             """)
-            # ファクターデータ用テーブル
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS ff5_factors (
                     date TEXT PRIMARY KEY,
                     mkt_rf REAL, smb REAL, hml REAL, rmw REAL, cma REAL, rf REAL
                 )
             """)
-            # 財務データ(Fundamentals)キャッシュ用テーブル (429対策の要)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS fundamentals_cache (
                     ticker TEXT PRIMARY KEY,
@@ -131,25 +129,13 @@ class DataProvider:
             return pd.DataFrame()
 
     # =========================================================================
-    # 通信・セッション管理 (429 Error 回避の要)
+    # 通信・セッション管理
+    # 【修正③】yfinanceには渡さない。FMP APIなどのrequests通信専用。
     # =========================================================================
     @staticmethod
     def _create_session():
+        """FMP APIなどrequests通信専用セッション。yfinanceには使用しない。"""
         session = requests.Session()
-        # User-Agentのローテーションでスクレイピング判定を回避
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-        ]
-        session.headers.update({
-            "User-Agent": random.choice(user_agents),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-            "Connection": "keep-alive"
-        })
-        # リトライ設定の強化
         retries = Retry(
             total=5,
             backoff_factor=2.0,
@@ -205,7 +191,6 @@ class DataProvider:
         df_ff.index = pd.to_datetime(df_ff.index)
         df_ff = df_ff.resample('ME').last()
         df_ff.index = df_ff.index.normalize().tz_localize(None)
-
         df_ff = df_ff.interpolate(method='linear').ffill().bfill()
 
         start_ts = pd.to_datetime(start_date).replace(tzinfo=None)
@@ -218,7 +203,8 @@ class DataProvider:
         return df_ff
 
     # =========================================================================
-    # 株価履歴データ取得 (指数バックオフ対応版)
+    # 株価履歴データ取得
+    # 【修正③】yf.downloadからsession/threads引数を削除
     # =========================================================================
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
@@ -259,26 +245,22 @@ class DataProvider:
         result_df = pd.DataFrame()
 
         if missing_tickers_for_api:
-            chunk_size = 5  # リクエスト回数を減らすためチャンクを5に設定
+            chunk_size = 5
             print(f"--- yfinance 履歴データ取得開始 (全{len(missing_tickers_for_api)}銘柄, チャンクサイズ:{chunk_size}) ---")
             
             for i in range(0, len(missing_tickers_for_api), chunk_size):
                 chunk = missing_tickers_for_api[i:i + chunk_size]
                 
-                # 指数バックオフによるリトライ処理
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        # 429回避のため、毎回少し待つ
-                        time.sleep(1.0 + random.uniform(0, 1)) 
-                        fresh_session = DataProvider._create_session()
+                        time.sleep(1.0 + random.uniform(0, 1))
                         
                         print(f"[yfinance] チャンク取得中: {chunk} ...")
-                        # timeoutを明示的に設定してハングアップ防止
+                        # 【修正③】session/threads引数を削除。yfinance 1.2.0はcurl_cffiで自己管理。
                         df = yf.download(
                             chunk, start=start_d, end=end_d,
-                            progress=False, group_by='ticker', auto_adjust=True,
-                            session=fresh_session, threads=False, timeout=30
+                            progress=False, group_by='ticker', auto_adjust=True
                         )
                         
                         if not df.empty:
@@ -303,12 +285,10 @@ class DataProvider:
                                     result_df = chunk_result
                                 else:
                                     result_df = pd.concat([result_df, chunk_result], axis=1)
-                        # 成功したらリトライループを抜ける
                         break
                         
                     except Exception as e:
                         err_msg = str(e).lower()
-                        # 429エラーを検知した場合のみバックオフ待機
                         if "429" in err_msg or "too many" in err_msg:
                             wait_time = (2 ** attempt) + random.uniform(1, 3)
                             print(f"⚠️ [429 Error] 制限到達。{wait_time:.1f}秒待機して再試行({attempt+1}/{max_retries})")
@@ -349,13 +329,13 @@ class DataProvider:
         return final_df
 
     # =========================================================================
-    # 財務データ取得 (SQLite永続キャッシュによる429完全回避)
+    # 財務データ取得
+    # 【修正②③】キャッシュキー安定化 + yf.Tickerからsession引数を削除
     # =========================================================================
     @staticmethod
     @st.cache_data(ttl=3600, show_spinner=False)
     def fetch_fundamentals(tickers):
         # 【修正②】ソート＋重複排除でキャッシュキーを安定化
-        # リストの順序が異なっても同じ銘柄セットなら確実にキャッシュが効く
         unique_tickers = sorted(list(set([
             DataProvider._normalize_ticker(t) for t in tickers if pd.notna(t)
         ])))
@@ -367,7 +347,7 @@ class DataProvider:
         tickers_to_fetch = []
 
         # 1. DBから直近7日以内のキャッシュを取得
-        # 【修正②】3日→7日に延長（財務データは週次で十分。API呼び出し頻度を削減）
+        # 【修正②】3日→7日に延長
         try:
             with sqlite3.connect(DataProvider.DB_PATH) as conn:
                 ticker_list_str = "','".join(unique_tickers)
@@ -394,7 +374,7 @@ class DataProvider:
             print(f"Fundamentals DB Load Error: {e}")
             tickers_to_fetch = unique_tickers
 
-        # 2. キャッシュにない銘柄のみAPIで取得 (指数バックオフ搭載)
+        # 2. キャッシュにない銘柄のみAPIで取得
         valid_api_data = []
         if tickers_to_fetch:
             print(f"--- yfinance 財務データAPI取得開始 (全{len(tickers_to_fetch)}銘柄, DBキャッシュ利用) ---")
@@ -402,11 +382,10 @@ class DataProvider:
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        # ループによる過剰リクエストを防ぐためスリープ
                         time.sleep(0.5 + random.uniform(0, 1))
-                        session = DataProvider._create_session()
-                        tk = yf.Ticker(ticker, session=session)
-                        info = tk.info or {}  # ここで通信が発生
+                        # 【修正③】session引数を削除。yfinance 1.2.0はcurl_cffiで自己管理。
+                        tk = yf.Ticker(ticker)
+                        info = tk.info or {}
                         
                         mktCap = info.get('marketCap', np.nan)
                         pbr = info.get('priceToBook', np.nan)
@@ -423,7 +402,7 @@ class DataProvider:
                             'Growth': info.get('revenueGrowth', info.get('earningsGrowth', np.nan))
                         }
                         valid_api_data.append(res)
-                        break  # 成功したらリトライループを抜ける
+                        break
                     except Exception as e:
                         err_msg = str(e).lower()
                         if "429" in err_msg or "too many" in err_msg:
@@ -439,12 +418,10 @@ class DataProvider:
                             break
             print("--- yfinance 財務データ取得終了 ---")
 
-            # 取得したデータをDBに保存
             if valid_api_data:
                 try:
                     df_to_save = pd.DataFrame(valid_api_data)
                     df_to_save['last_updated'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    # DBのカラム名に合わせる
                     rename_cols = {
                         'Ticker': 'ticker', 'Name': 'name', 'Price': 'price', 
                         'Size_Raw': 'size_raw', 'PBR': 'pbr', 'ROE': 'roe', 
@@ -453,9 +430,8 @@ class DataProvider:
                     df_db = df_to_save.rename(columns=rename_cols)
                     
                     with sqlite3.connect(DataProvider.DB_PATH) as conn:
-                        # 既存のレコードがあれば上書き (INSERT OR REPLACE)
                         for _, row in df_db.iterrows():
-                            conn.execute(f"""
+                            conn.execute("""
                                 INSERT OR REPLACE INTO fundamentals_cache 
                                 (ticker, name, price, size_raw, pbr, roe, sector_raw, growth, last_updated) 
                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -500,7 +476,8 @@ class DataProvider:
         return df
 
     # =========================================================================
-    # マーケットデータ (Rm, Rf) の取得 (指数バックオフ対応版)
+    # マーケットデータ (Rm, Rf) の取得
+    # 【修正③】yf.downloadからsession/threads引数を削除
     # =========================================================================
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
@@ -512,10 +489,10 @@ class DataProvider:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                session = DataProvider._create_session()
-                # timeoutを設定
-                rm_df = yf.download("^N225", start=start_d, end=end_d, session=session, progress=False, threads=False, timeout=30)
+                # 【修正③】session/threads引数を削除
+                rm_df = yf.download("^N225", start=start_d, end=end_d, progress=False)
                 if not rm_df.empty:
+                    close = None
                     if isinstance(rm_df.columns, pd.MultiIndex):
                         if 'Close' in rm_df.columns.get_level_values(1):
                             close = rm_df.xs('Close', level=1, axis=1).squeeze()
@@ -525,7 +502,7 @@ class DataProvider:
                         if 'Close' in rm_df.columns:
                             close = rm_df['Close'].squeeze()
                     
-                    if not close.empty:
+                    if close is not None and not close.empty:
                         df_market_daily['Rm_Price'] = close
                 break
             except Exception as e:
