@@ -28,6 +28,7 @@ class QuantEngine:
     【最重要修正 V18.1】ファクター同期の厳格化 (Inner Joinと正規化の徹底)、サンプル数バリデーション強化
     【最重要修正 V19.0】二段構え回帰(共通期間一括 vs 個別加重平均)の実装、Adj R2とN数の出力強化
     【最重要修正 V19.1】自動ウェイト計算(時価総額加重)の機能強化とフェールセーフ実装
+    【修正 V19.2】process_raw_factors の SettingWithCopyWarning 対策 (.copy() + df.loc[] 使用)
     """
     
     # =========================================================================
@@ -98,7 +99,7 @@ class QuantEngine:
                         'Quality': model.params.get('rmw', 0),
                         'Investment': model.params.get('cma', 0),
                         'R_squared': model.rsquared,
-                        'Adjusted_R_squared': model.rsquared_adj, # 【重要】Adj R2を出力
+                        'Adjusted_R_squared': model.rsquared_adj,
                         'p_values': {
                             'Alpha': model.pvalues.get('const', 1),
                             'Beta': model.pvalues.get('mkt_rf', 1)
@@ -121,7 +122,7 @@ class QuantEngine:
                 
                 n_indiv_obs = len(aligned_indiv)
                 if n_indiv_obs < min_n_obs:
-                    continue # この銘柄はデータが少なすぎるため除外
+                    continue
                     
                 y_i = aligned_indiv['Ret'] - aligned_indiv['rf']
                 X_i = aligned_indiv[['mkt_rf', 'smb', 'hml', 'rmw', 'cma']]
@@ -152,14 +153,11 @@ class QuantEngine:
                 print("[Regression] 有効なデータを持つ銘柄が一つもありませんでした。")
                 return None
                 
-            # 加重平均の計算
             df_res = pd.DataFrame(indiv_results)
-            # ウェイトの再正規化 (除外された銘柄分を配分)
             df_res['Weight'] = df_res['Weight'] / df_res['Weight'].sum()
             
             avg_n_obs = int(total_n_obs / valid_count)
             
-            # 各指標の加重平均
             agg_alpha = (df_res['Alpha'] * df_res['Weight']).sum()
             agg_beta = (df_res['Beta'] * df_res['Weight']).sum()
             agg_size = (df_res['Size'] * df_res['Weight']).sum()
@@ -167,14 +165,13 @@ class QuantEngine:
             agg_quality = (df_res['Quality'] * df_res['Weight']).sum()
             agg_invest = (df_res['Investment'] * df_res['Weight']).sum()
             
-            # R2とp値も目安として加重平均
             agg_r2 = (df_res['R_squared'] * df_res['Weight']).sum()
             agg_adj_r2 = (df_res['Adjusted_R_squared'] * df_res['Weight']).sum()
             agg_p_beta = (df_res['p_Beta'] * df_res['Weight']).sum()
 
             return {
                 'Method': 'Individual Aggregation',
-                'N_Observations': avg_n_obs, # 平均の観察月数を返す
+                'N_Observations': avg_n_obs,
                 'Alpha': agg_alpha,
                 'Beta': agg_beta,
                 'Size': agg_size,
@@ -246,7 +243,7 @@ class QuantEngine:
             return df
 
         try:
-            rets = df_hist.pct_change().dropna(how='all') # 全てNaNの行だけ落とす
+            rets = df_hist.pct_change().dropna(how='all')
         except Exception:
             df['Beta_Raw'] = np.nan
             return df
@@ -255,7 +252,7 @@ class QuantEngine:
 
         if df_market is not None and not df_market.empty and 'Rm' in df_market.columns and 'Rf' in df_market.columns:
             try:
-                if df_market['Rm'].max() > 10.0: # 価格だと判断
+                if df_market['Rm'].max() > 10.0:
                     rm_ret = df_market['Rm'].pct_change().dropna()
                 else:
                     rm_ret = df_market['Rm'].dropna()
@@ -318,15 +315,13 @@ class QuantEngine:
         """
         df_out = df.copy()
         
-        # 1. 有効な銘柄のマスクを作成 (Betaが計算できているか)
         valid_mask = pd.Series(True, index=df_out.index)
         if 'Beta_Raw' in df_out.columns:
             valid_mask = df_out['Beta_Raw'].notna()
         
-        # 2. ユーザーがウェイトを指定した場合 (手入力 or CSVに列あり)
         if user_weights_provided and 'Weight' in df_out.columns:
             df_out['Weight'] = pd.to_numeric(df_out['Weight'], errors='coerce').fillna(0)
-            df_out.loc[~valid_mask, 'Weight'] = 0.0 # 無効な銘柄はウェイト0
+            df_out.loc[~valid_mask, 'Weight'] = 0.0
             
             valid_weights_count = (df_out['Weight'] > 0).sum()
             total_weight = df_out['Weight'].sum()
@@ -335,26 +330,20 @@ class QuantEngine:
                 df_out['Weight'] = df_out['Weight'] / total_weight
                 return df_out
         
-        # 3. ウェイト未指定の場合 -> 【強化】時価総額加重(MCW)の自動計算
         if 'MarketCap' in df_out.columns:
-            # 時価総額を数値化し、NaNは0とする
             valid_mc = pd.to_numeric(df_out['MarketCap'], errors='coerce').fillna(0)
-            # 無効な銘柄(計算エラーや上場廃止等)の時価総額を強制的に0にする
             valid_mc.loc[~valid_mask] = 0.0 
             mc_sum = valid_mc.sum()
             
             if mc_sum > 0:
-                # 生き残っている銘柄の時価総額で加重平均ウェイトを算出
                 df_out['Weight'] = valid_mc / mc_sum
             else:
-                # 時価総額データが全て取れなかった場合のフェールセーフ (等金額加重)
                 valid_count = valid_mask.sum()
                 if valid_count > 0:
                     df_out['Weight'] = np.where(valid_mask, 1.0 / valid_count, 0.0)
                 else:
                     df_out['Weight'] = 1.0 / len(df_out)
         else:
-            # MarketCapカラム自体が存在しない場合のフェールセーフ (等金額加重)
             valid_count = valid_mask.sum()
             if valid_count > 0:
                 df_out['Weight'] = np.where(valid_mask, 1.0 / valid_count, 0.0)
@@ -378,30 +367,32 @@ class QuantEngine:
 
     @staticmethod
     def process_raw_factors(df):
+        # 【修正 V19.2】SettingWithCopyWarning対策: .copy()でスライスのコピーを明示し、df.loc[]で代入
+        df = df.copy()
         if 'PBR' in df.columns:
             clipped_pbr = pd.to_numeric(df['PBR'], errors='coerce').clip(lower=0.1, upper=100.0)
-            df['Value_Raw'] = clipped_pbr.apply(
+            df.loc[:, 'Value_Raw'] = clipped_pbr.apply(
                 lambda x: np.log(1/x) if (pd.notnull(x) and x > 0) else np.nan
             )
         
         if 'Size_Raw' in df.columns:
             raw_size = pd.to_numeric(df['Size_Raw'], errors='coerce')
             clipped_size = raw_size.clip(lower=1e8)
-            df['Size_Log'] = clipped_size.apply(
+            df.loc[:, 'Size_Log'] = clipped_size.apply(
                 lambda x: np.log(x) if (pd.notnull(x) and x > 0) else np.nan
             )
-            df['MarketCap'] = raw_size
+            df.loc[:, 'MarketCap'] = raw_size
         
         if 'ROE' in df.columns:
-            df['Quality_Raw'] = pd.to_numeric(df['ROE'], errors='coerce').clip(lower=-2.0, upper=2.0)
+            df.loc[:, 'Quality_Raw'] = pd.to_numeric(df['ROE'], errors='coerce').clip(lower=-2.0, upper=2.0)
         
         try:
             if 'Growth' in df.columns:
-                df['Investment_Raw'] = pd.to_numeric(df['Growth'], errors='coerce').clip(lower=-1.0, upper=3.0)
+                df.loc[:, 'Investment_Raw'] = pd.to_numeric(df['Growth'], errors='coerce').clip(lower=-1.0, upper=3.0)
             else:
-                df['Investment_Raw'] = np.nan
+                df.loc[:, 'Investment_Raw'] = np.nan
         except Exception:
-            df['Investment_Raw'] = np.nan
+            df.loc[:, 'Investment_Raw'] = np.nan
             
         return df
 
