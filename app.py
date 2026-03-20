@@ -251,28 +251,65 @@ if run_button:
     else:
         df_port_initial = QuantEngine.calculate_portfolio_weights(df_port_initial, user_weights_provided=False)
 
-    # --- Step D: 二段構え 時系列多変量回帰分析 ---
-    progress_bar.progress(60, text="[4/5] 月次多変量回帰分析 (二段構え) 実行中...")
-    
+    # --- Step D: 二段構え 時系列多変量回帰分析 (ポートフォリオ + ベンチマーク) ---
+    progress_bar.progress(60, text="[4/5] 月次多変量回帰分析 (ポートフォリオ) 実行中...")
+
     regression_results = None
+    bench_regression_results = None
+
     if not df_ff5.empty:
-        # 月次分析の最低サンプル数は「24ヶ月」に設定
-        regression_results = QuantEngine.run_5factor_regression(df_hist, df_port_initial[['Ticker', 'Weight']], df_ff5, min_n_obs=24)
-    
+        # ポートフォリオの回帰
+        regression_results = QuantEngine.run_5factor_regression(
+            df_hist, df_port_initial[['Ticker', 'Weight']], df_ff5, min_n_obs=24
+        )
+
+        # ベンチマークの回帰（比較基準として）
+        # ベンチマーク銘柄の株価履歴をキャッシュ済みdf_histから使える銘柄のみ抽出
+        progress_bar.progress(65, text="[4/5] ベンチマーク回帰分析 (比較基準) 実行中...")
+        bench_tickers_in_hist = [t for t in bench_tickers if t in (df_hist.columns if not df_hist.empty else [])]
+        if bench_tickers_in_hist:
+            df_bench_weights = pd.DataFrame({
+                'Ticker': bench_tickers_in_hist,
+                'Weight': [1.0 / len(bench_tickers_in_hist)] * len(bench_tickers_in_hist)
+            })
+            bench_regression_results = QuantEngine.run_5factor_regression(
+                df_hist, df_bench_weights, df_ff5, min_n_obs=24
+            )
+            if bench_regression_results:
+                print(f"[Benchmark Regression] ベンチマーク回帰完了: {bench_mode}")
+
     portfolio_z_radar = {}
+    bench_z_radar = {}
+    relative_z_radar = {}
     regression_success = False
 
     if regression_results and regression_results.get('R_squared') is not None:
         regression_success = True
         portfolio_z_radar = {
-            'Beta': regression_results.get('Beta', 0),
-            'Size': regression_results.get('Size', 0),
-            'Value': regression_results.get('Value', 0),
-            'Quality': regression_results.get('Quality', 0),
+            'Beta':       regression_results.get('Beta', 0),
+            'Size':       regression_results.get('Size', 0),
+            'Value':      regression_results.get('Value', 0),
+            'Quality':    regression_results.get('Quality', 0),
             'Investment': regression_results.get('Investment', 0)
         }
     else:
         portfolio_z_radar = {'Beta': 1.0, 'Value': 0, 'Size': 0, 'Quality': 0, 'Investment': 0}
+
+    # ベンチマーク回帰結果の整理
+    if bench_regression_results and bench_regression_results.get('R_squared') is not None:
+        bench_z_radar = {
+            'Beta':       bench_regression_results.get('Beta', 1.0),
+            'Size':       bench_regression_results.get('Size', 0),
+            'Value':      bench_regression_results.get('Value', 0),
+            'Quality':    bench_regression_results.get('Quality', 0),
+            'Investment': bench_regression_results.get('Investment', 0)
+        }
+    else:
+        # ベンチマーク回帰が取れない場合はCAPMの理論値（市場ポートフォリオ）を使用
+        bench_z_radar = {'Beta': 1.0, 'Value': 0, 'Size': 0, 'Quality': 0, 'Investment': 0}
+
+    # ポートフォリオ vs ベンチマークの差分（超過エクスポージャー）
+    relative_z_radar = {k: portfolio_z_radar.get(k, 0) - bench_z_radar.get(k, 0) for k in portfolio_z_radar}
 
     # --- Step E: スコア計算 ---
     progress_bar.progress(80, text="[5/5] 固有スコアと寄与度の計算中...")
@@ -330,16 +367,21 @@ if run_button:
 
     col1, col2 = st.columns([1, 1])
     with col1:
-        # グラフのタイトルに Adj R2 と N数 を明示
         suffix = f"(Adj R²={regression_results.get('Adjusted_R_squared', 0):.2f}, N={regression_results.get('N_Observations', 0)})" if regression_success else "(推定不能：参考値)"
         p_text = f"{global_start_date.strftime('%Y/%m')} - {global_end_date.strftime('%Y/%m')}"
-        
-        # ※ Visualizer側で period_text 引数を受け取れるように改修されている前提
+
         try:
-            fig_radar = Visualizer.plot_radar_chart(portfolio_z_radar, title_suffix=suffix, period_text=p_text)
-        except TypeError:
-            fig_radar = Visualizer.plot_radar_chart(portfolio_z_radar, title_suffix=suffix)
-            
+            fig_radar = Visualizer.plot_radar_chart_vs_benchmark(
+                portfolio_z_radar, bench_z_radar, relative_z_radar,
+                bench_label=bench_mode, title_suffix=suffix, period_text=p_text
+            )
+        except Exception:
+            # Visualizerに新メソッドがない場合は既存メソッドにフォールバック
+            try:
+                fig_radar = Visualizer.plot_radar_chart(portfolio_z_radar, title_suffix=suffix, period_text=p_text)
+            except TypeError:
+                fig_radar = Visualizer.plot_radar_chart(portfolio_z_radar, title_suffix=suffix)
+
         st.plotly_chart(fig_radar, width='stretch')
     with col2:
         fig_bar = Visualizer.plot_contribution_bar_chart(df_port_scored)
