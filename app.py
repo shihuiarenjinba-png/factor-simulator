@@ -347,6 +347,9 @@ if run_button:
     progress_bar.progress(90, text="[5/5] 加重平均寄与度の集計中...")
     df_port_scored, _ = QuantEngine.calculate_weighted_factor_contributions(df_port_scored)
 
+    # 【並べ替え対応】分析結果をsession_stateに保存し、ボタンを押さなくても並べ替えが効くようにする
+    st.session_state["df_port_scored"] = df_port_scored
+
     progress_bar.progress(100, text="✨ 分析完了！")
     time.sleep(0.4)
     progress_bar.empty()
@@ -410,45 +413,53 @@ if run_button:
         fig_bar = Visualizer.plot_contribution_bar_chart(df_port_scored)
         st.plotly_chart(fig_bar, width='stretch')
 
-    # ---------------------------------------------------------
-    # 4. 動的ソート機能付き 詳細データテーブル
-    # ---------------------------------------------------------
+# ---------------------------------------------------------
+# 4. 詳細データテーブル（session_stateから読み出し・並べ替えはリアルタイム）
+# run_button ブロックの外に配置することで、selectbox/checkboxの操作だけで
+# 即座に並べ替えが反映される。ボタンを押し直す必要はない。
+# ---------------------------------------------------------
+if "df_port_scored" in st.session_state:
     st.markdown("---")
     st.subheader("📋 銘柄別 固有ファクタースコア & 加重平均寄与度")
-    
-    base_cols = ['Ticker', 'Weight', 'Name'] if 'Name' in df_port_scored.columns else ['Ticker', 'Weight']
-    score_cols = ['Value_Z', 'Quality_Z', 'Investment_Z', 'Size_Z']
-    contrib_cols = ['Value_Z_Contrib', 'Quality_Z_Contrib', 'Investment_Z_Contrib', 'Size_Z_Contrib']
-    
-    avail_cols = base_cols + [c for c in score_cols + contrib_cols if c in df_port_scored.columns]
-    df_display = df_port_scored[avail_cols].copy()
-    
+
+    df_port_scored = st.session_state["df_port_scored"]
+
     rename_dict = {
-        'Value_Z': 'Value (固有)', 'Quality_Z': 'Quality (固有)', 
+        'Value_Z': 'Value (固有)', 'Quality_Z': 'Quality (固有)',
         'Investment_Z': 'Investment (Asset Growth) (固有)', 'Size_Z': 'Size (固有)',
-        'Value_Z_Contrib': 'Value (寄与)', 'Quality_Z_Contrib': 'Quality (寄与)', 
+        'Value_Z_Contrib': 'Value (寄与)', 'Quality_Z_Contrib': 'Quality (寄与)',
         'Investment_Z_Contrib': 'Investment (Asset Growth) (寄与)', 'Size_Z_Contrib': 'Size (寄与)',
         'Weight': 'ウェイト'
     }
+
+    base_cols  = ['Ticker', 'Weight', 'Name'] if 'Name' in df_port_scored.columns else ['Ticker', 'Weight']
+    score_cols  = ['Value_Z', 'Quality_Z', 'Investment_Z', 'Size_Z']
+    contrib_cols = ['Value_Z_Contrib', 'Quality_Z_Contrib', 'Investment_Z_Contrib', 'Size_Z_Contrib']
+
+    avail_cols = base_cols + [c for c in score_cols + contrib_cols if c in df_port_scored.columns]
+    df_display = df_port_scored[avail_cols].copy()
     df_display.rename(columns=rename_dict, inplace=True)
-    
+
     sort_options = ['ウェイト'] + [v for v in rename_dict.values() if v in df_display.columns]
-    
+
     col_sort1, col_sort2 = st.columns([1, 3])
     with col_sort1:
-        sort_by = st.selectbox("並べ替え基準", options=sort_options, index=0)
+        sort_by = st.selectbox("並べ替え基準", options=sort_options, index=0, key="sort_by_key")
     with col_sort2:
-        st.markdown("<br>", unsafe_allow_html=True) 
-        sort_asc = st.checkbox("昇順で並べ替え", value=False)
-    
+        st.markdown("<br>", unsafe_allow_html=True)
+        sort_asc = st.checkbox("昇順で並べ替え", value=False, key="sort_asc_key")
+
     if sort_by in df_display.columns:
         df_display = df_display.sort_values(by=sort_by, ascending=sort_asc)
-    
+
     format_dict = {col: "{:.2f}" for col in df_display.columns if col not in ['Ticker', 'Name']}
-    
+
     st.dataframe(
         df_display.style.format(format_dict)
-                        .background_gradient(subset=[c for c in df_display.columns if '寄与' in c], cmap='RdBu', vmin=-0.5, vmax=0.5),
+                        .background_gradient(
+                            subset=[c for c in df_display.columns if '寄与' in c],
+                            cmap='RdBu', vmin=-0.5, vmax=0.5
+                        ),
         width='stretch',
         hide_index=True
     )
