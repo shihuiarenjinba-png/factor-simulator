@@ -120,18 +120,34 @@ with st.sidebar.expander("📁 ポートフォリオ入力", expanded=True):
         if uploaded_file is not None:
             try:
                 if uploaded_file.name.endswith('.csv'):
-                    df_up = pd.read_csv(uploaded_file)
+                    # 【修正】BOM付きUTF-8（utf-8-sig）で読み込み、列名の﻿を除去
+                    df_up = pd.read_csv(uploaded_file, encoding='utf-8-sig')
                 else:
                     df_up = pd.read_excel(uploaded_file)
                 
-                # ティッカー列の探索
-                ticker_col = next((c for c in df_up.columns if 'コード' in c or 'Ticker' in c or '銘柄' in c), None)
+                # 【修正】ティッカー列の探索キーワードを拡充（日本語列名・ティッカー列に対応）
+                ticker_col = next((c for c in df_up.columns if any(k in c for k in [
+                    'コード', 'Ticker', 'ticker', '銘柄', 'ティッカー', 'Symbol', 'symbol', 'Code', 'code'
+                ])), None)
+
+                # 明示的な列が見つからない場合、4桁数字が最も多い列を自動検出
+                if not ticker_col:
+                    best_col, best_count = None, 0
+                    for c in df_up.columns:
+                        count = df_up[c].astype(str).str.contains(r'\b\d{4}\b').sum()
+                        if count > best_count:
+                            best_count, best_col = count, c
+                    if best_count > 0:
+                        ticker_col = best_col
+
                 if ticker_col:
                     raw_codes = df_up[ticker_col].astype(str).str.extract(r'(\d{4})')[0].dropna().tolist()
                     port_tickers = [f"{code}.T" for code in list(dict.fromkeys(raw_codes))]
                     
-                    # ウェイト列の探索
-                    weight_col = next((c for c in df_up.columns if c in ['Weight', 'ウェイト', '比率', '割合']), None)
+                    # 【修正】ウェイト列の探索キーワードを拡充（'Weight (%)'・'保有割合'などに対応）
+                    weight_col = next((c for c in df_up.columns if any(k in c for k in [
+                        'Weight', 'weight', 'ウェイト', '比率', '割合', '保有', 'Ratio', 'ratio', '%'
+                    ])), None)
                     if weight_col:
                         weight_list = pd.to_numeric(df_up[weight_col], errors='coerce').fillna(0).tolist()[:len(port_tickers)]
                         st.markdown(f"<div class='success-box'>✅ <b>{len(port_tickers)}</b> 銘柄とウェイト情報を認識しました。</div>", unsafe_allow_html=True)
