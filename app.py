@@ -421,24 +421,57 @@ if run_button:
 if "df_port_scored" in st.session_state:
     st.markdown("---")
     st.subheader("📋 銘柄別 固有ファクタースコア & 加重平均寄与度")
+    st.caption("Zスコア = ベンチマーク（市場）平均からの乖離。(+1.00σ) = 市場平均より1標準偏差高い")
 
     df_port_scored = st.session_state["df_port_scored"]
 
     rename_dict = {
         'Value_Z': 'Value (固有)', 'Quality_Z': 'Quality (固有)',
-        'Investment_Z': 'Investment (Asset Growth) (固有)', 'Size_Z': 'Size (固有)',
+        'Investment_Z': 'Investment (固有)', 'Size_Z': 'Size (固有)',
         'Value_Z_Contrib': 'Value (寄与)', 'Quality_Z_Contrib': 'Quality (寄与)',
-        'Investment_Z_Contrib': 'Investment (Asset Growth) (寄与)', 'Size_Z_Contrib': 'Size (寄与)',
+        'Investment_Z_Contrib': 'Investment (寄与)', 'Size_Z_Contrib': 'Size (寄与)',
         'Weight': 'ウェイト'
     }
 
-    base_cols  = ['Ticker', 'Weight', 'Name'] if 'Name' in df_port_scored.columns else ['Ticker', 'Weight']
-    score_cols  = ['Value_Z', 'Quality_Z', 'Investment_Z', 'Size_Z']
+    base_cols    = ['Ticker', 'Weight', 'Name'] if 'Name' in df_port_scored.columns else ['Ticker', 'Weight']
+    score_cols   = ['Value_Z', 'Quality_Z', 'Investment_Z', 'Size_Z']
     contrib_cols = ['Value_Z_Contrib', 'Quality_Z_Contrib', 'Investment_Z_Contrib', 'Size_Z_Contrib']
 
     avail_cols = base_cols + [c for c in score_cols + contrib_cols if c in df_port_scored.columns]
     df_display = df_port_scored[avail_cols].copy()
     df_display.rename(columns=rename_dict, inplace=True)
+
+    # ── 市場乖離ラベルをZスコア列の隣にかっこ書きで追加 ──────────────
+    # Zスコア列に対してそれぞれ「スコア (乖離ラベル)」の文字列列を生成
+    def deviation_label(z):
+        """Zスコアを +Xσ 形式の乖離ラベルに変換"""
+        if pd.isna(z):
+            return "(-)"
+        sign = "+" if z >= 0 else ""
+        if abs(z) >= 2.0:
+            level = "★★"   # 市場から大きく乖離
+        elif abs(z) >= 1.0:
+            level = "★"    # やや乖離
+        else:
+            level = ""
+        return f"({sign}{z:.2f}σ{level})"
+
+    # Zスコア列ごとに「数値 (乖離)」の表示列を追加
+    z_display_cols = {}
+    for orig_col, display_name in rename_dict.items():
+        if orig_col in score_cols and display_name in df_display.columns:
+            label_col = display_name + " 乖離"
+            df_display[label_col] = df_port_scored[orig_col].apply(deviation_label)
+            z_display_cols[display_name] = label_col
+
+    # 表示順を整理：スコア列の直後に乖離列を挿入
+    ordered_cols = []
+    for col in df_display.columns:
+        if col not in z_display_cols.values():  # 乖離列は後でinsert
+            ordered_cols.append(col)
+            if col in z_display_cols:
+                ordered_cols.append(z_display_cols[col])
+    df_display = df_display[ordered_cols]
 
     sort_options = ['ウェイト'] + [v for v in rename_dict.values() if v in df_display.columns]
 
@@ -452,12 +485,17 @@ if "df_port_scored" in st.session_state:
     if sort_by in df_display.columns:
         df_display = df_display.sort_values(by=sort_by, ascending=sort_asc)
 
-    format_dict = {col: "{:.2f}" for col in df_display.columns if col not in ['Ticker', 'Name']}
+    # 数値列のみフォーマット（文字列の乖離列はスキップ）
+    format_dict = {
+        col: "{:.2f}" for col in df_display.columns
+        if col not in ['Ticker', 'Name'] and col not in z_display_cols.values()
+        and pd.api.types.is_numeric_dtype(df_display[col])
+    }
 
     st.dataframe(
         df_display.style.format(format_dict)
                         .background_gradient(
-                            subset=[c for c in df_display.columns if '寄与' in c],
+                            subset=[c for c in df_display.columns if '寄与' in c and c not in z_display_cols.values()],
                             cmap='RdBu', vmin=-0.5, vmax=0.5
                         ),
         width='stretch',
