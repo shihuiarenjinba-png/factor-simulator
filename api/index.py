@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import io
+import re
 from email.parser import BytesParser
 from email.policy import default
 from html import escape
@@ -142,12 +143,14 @@ def _bar_chart(exposures: dict[str, float]) -> str:
 def _normalize_codes(raw_codes: str) -> list[str]:
     codes = []
     for part in raw_codes.replace("\n", ",").split(","):
-        cleaned = part.strip()
+        cleaned = part.strip().upper()
         if not cleaned:
             continue
         if cleaned.endswith(".T"):
             codes.append(cleaned)
-        elif cleaned.isdigit() and len(cleaned) == 4:
+        elif re.fullmatch(r"\d{4}", cleaned):
+            codes.append(f"{cleaned}.T")
+        elif re.fullmatch(r"\d{3}[A-Z]", cleaned):
             codes.append(f"{cleaned}.T")
         else:
             codes.append(cleaned)
@@ -170,7 +173,23 @@ def _normalize_weights(raw_weights: str, count: int) -> list[float]:
     return [value / total for value in parsed]
 
 
-def _extract_portfolio_from_upload(filename: str, file_bytes: bytes) -> tuple[list[str], list[float] | None, pd.DataFrame]:
+def _normalize_uploaded_ticker(value: object) -> str | None:
+    text = str(value).strip().upper()
+    if not text or text in {"NAN", "NONE"}:
+        return None
+
+    matched = re.search(r"\b([0-9]{4}|[0-9]{3}[A-Z])(?:\.T)?\b", text)
+    if matched:
+        return f"{matched.group(1)}.T"
+
+    compact = re.sub(r"[^0-9A-Z]", "", text)
+    if re.fullmatch(r"(?:[0-9]{4}|[0-9]{3}[A-Z])T?", compact):
+        code = compact[:-1] if compact.endswith("T") else compact
+        return f"{code}.T"
+    return None
+
+
+def _extract_portfolio_from_upload(filename: str, file_bytes: bytes) -> tuple[list[str], list[float] | None, pd.DataFrame, dict[str, object]]:
     suffix = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
     if suffix == "csv":
         df_up = pd.read_csv(io.BytesIO(file_bytes), encoding="utf-8-sig")
@@ -193,21 +212,39 @@ def _extract_portfolio_from_upload(filename: str, file_bytes: bytes) -> tuple[li
     if ticker_col is None:
         raise ValueError("銘柄コード列が見つかりませんでした。")
 
-    raw_codes = df_up[ticker_col].astype(str).str.extract(r"(\d{4})")[0].dropna().tolist()
-    codes = [f"{code}.T" for code in list(dict.fromkeys(raw_codes))]
-    if not codes:
-        raise ValueError("4桁コードを読み取れませんでした。")
+    working = df_up.copy()
+    working["_normalized_ticker"] = working[ticker_col].map(_normalize_uploaded_ticker)
+    invalid_rows = int(working["_normalized_ticker"].isna().sum())
+    working = working.loc[working["_normalized_ticker"].notna()].copy()
+    if working.empty:
+        raise ValueError("有効なティッカーを読み取れませんでした。")
 
     weight_col = next((c for c in df_up.columns if any(k in str(c) for k in ["Weight", "weight", "ウェイト", "比率", "割合", "保有", "Ratio", "ratio", "%"])), None)
     weights: list[float] | None = None
     if weight_col:
-        raw_weights = pd.to_numeric(df_up[weight_col], errors="coerce").fillna(0.0).tolist()[: len(codes)]
-        if sum(raw_weights) > 0:
-            total = float(sum(raw_weights))
-            weights = [float(value) / total for value in raw_weights]
+        working["_raw_weight"] = pd.to_numeric(working[weight_col], errors="coerce").fillna(0.0)
+    else:
+        working["_raw_weight"] = 1.0
+
+    grouped = (
+        working.groupby("_normalized_ticker", as_index=False)
+        .agg(total_weight=("_raw_weight", "sum"))
+        .sort_values("total_weight", ascending=False)
+        .reset_index(drop=True)
+    )
+    codes = grouped["_normalized_ticker"].tolist()
+    if grouped["total_weight"].sum() > 0:
+        total = float(grouped["total_weight"].sum())
+        weights = [float(value) / total for value in grouped["total_weight"].tolist()]
 
     preview = df_up.head(12).copy()
-    return codes, weights, preview
+    meta = {
+        "input_rows": int(len(df_up)),
+        "parsed_rows": int(len(working)),
+        "invalid_rows": invalid_rows,
+        "unique_tickers": int(len(codes)),
+    }
+    return codes, weights, preview, meta
 
 
 def _build_demo_case(lookback_years: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
@@ -247,7 +284,7 @@ def _build_demo_case(lookback_years: int) -> tuple[pd.DataFrame, pd.DataFrame, p
     return hist_ret, weights, ff5, "デモポートフォリオ"
 
 
-def _build_live_case(raw_codes: str, raw_weights: str, lookback_years: int, upload_info: dict[str, object] | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str, pd.DataFrame | None]:
+def _build_live_case(raw_codes: str, raw_weights: str, lookback_years: int, upload_info: dict[str, object] | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str, pd.DataFrame | None, dict[str, object]]:
     preview = None
     if upload_info:
         tickers = upload_info["tickers"]
@@ -266,9 +303,32 @@ def _build_live_case(raw_codes: str, raw_weights: str, lookback_years: int, uplo
         raise ValueError("株価データの取得に失敗しました。時間を置いて再試行してください。")
     if ff5.empty:
         raise ValueError("5ファクターデータの取得に失敗しました。ネットワークかローカルCSVを確認してください。")
-    weight_df = pd.DataFrame({"Ticker": tickers, "Weight": weights})
-    label = ", ".join(tickers[:4]) + (" ..." if len(tickers) > 4 else "")
-    return hist_ret, weight_df, ff5, label, preview
+    full_weight_df = pd.DataFrame({"Ticker": tickers, "Weight": weights})
+    available_tickers = [ticker for ticker in tickers if ticker in hist_ret.columns]
+    missing_tickers = [ticker for ticker in tickers if ticker not in hist_ret.columns]
+    if not available_tickers:
+        raise ValueError("アップロード銘柄の価格データを取得できませんでした。上場廃止やコード不一致の可能性があります。")
+
+    weight_df = full_weight_df.loc[full_weight_df["Ticker"].isin(available_tickers)].copy()
+    available_weight_sum = float(weight_df["Weight"].sum()) if not weight_df.empty else 0.0
+    if available_weight_sum <= 0:
+        raise ValueError("分析に使える銘柄のウェイト合計が 0 になりました。")
+    weight_df["Weight"] = weight_df["Weight"] / available_weight_sum
+
+    effective_hist_ret = hist_ret.loc[:, available_tickers].copy()
+    label = ", ".join(available_tickers[:4]) + (" ..." if len(available_tickers) > 4 else "")
+    diagnostics = {
+        "requested_tickers": tickers,
+        "available_tickers": available_tickers,
+        "missing_tickers": missing_tickers,
+        "requested_count": len(tickers),
+        "available_count": len(available_tickers),
+        "missing_count": len(missing_tickers),
+        "coverage_ratio": available_weight_sum,
+        "input_rows": upload_info.get("input_rows") if upload_info else len(tickers),
+        "invalid_rows": upload_info.get("invalid_rows", 0) if upload_info else 0,
+    }
+    return effective_hist_ret, weight_df, ff5, label, preview, diagnostics
 
 
 def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) -> str:
@@ -280,7 +340,7 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
     upload_note = ""
     if "portfolio_file" in files and files["portfolio_file"].get("value"):
         try:
-            tickers, weights, preview = _extract_portfolio_from_upload(
+            tickers, weights, preview, upload_meta = _extract_portfolio_from_upload(
                 str(files["portfolio_file"]["filename"]),
                 files["portfolio_file"]["value"],
             )
@@ -291,6 +351,7 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
                 "tickers": tickers,
                 "weights": weights,
                 "preview": preview,
+                **upload_meta,
             }
             mode = "live"
             upload_note = f"アップロードファイル {files['portfolio_file']['filename']} を優先して解析しました。"
@@ -299,7 +360,7 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
 
     if mode == "live":
         try:
-            hist_ret, weight_df, ff5, label, preview = _build_live_case(raw_codes, raw_weights, lookback_years, upload_info=upload_info)
+            hist_ret, weight_df, ff5, label, preview, diagnostics = _build_live_case(raw_codes, raw_weights, lookback_years, upload_info=upload_info)
             note = "ライブデータで月次5ファクター回帰を実行しています。"
             result_source = "ライブ"
         except Exception as exc:
@@ -310,15 +371,38 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
             )
             preview = upload_info.get("preview") if upload_info else None
             result_source = "デモ代替"
+            diagnostics = {
+                "requested_tickers": upload_info.get("tickers", []) if upload_info else [],
+                "available_tickers": [],
+                "missing_tickers": upload_info.get("tickers", []) if upload_info else [],
+                "requested_count": len(upload_info.get("tickers", [])) if upload_info else 0,
+                "available_count": 0,
+                "missing_count": len(upload_info.get("tickers", [])) if upload_info else 0,
+                "coverage_ratio": 0.0,
+                "input_rows": upload_info.get("input_rows") if upload_info else 0,
+                "invalid_rows": upload_info.get("invalid_rows", 0) if upload_info else 0,
+            }
     else:
         hist_ret, weight_df, ff5, label = _build_demo_case(lookback_years)
         note = "デモデータで回帰ロジックを確認できます。"
         preview = upload_info.get("preview") if upload_info else None
         result_source = "デモ"
+        diagnostics = {
+            "requested_tickers": [],
+            "available_tickers": ["DEMO.T"],
+            "missing_tickers": [],
+            "requested_count": 1,
+            "available_count": 1,
+            "missing_count": 0,
+            "coverage_ratio": 1.0,
+            "input_rows": upload_info.get("input_rows") if upload_info else 0,
+            "invalid_rows": upload_info.get("invalid_rows", 0) if upload_info else 0,
+        }
 
     regression = QuantEngine.run_5factor_regression(hist_ret, weight_df, ff5)
     if regression is None:
         raise ValueError("回帰分析の実行に失敗しました。入力条件を見直してください。")
+    per_ticker_table = QuantEngine.build_individual_regression_table(hist_ret, weight_df, ff5)
 
     exposures = {
         "Alpha": float(regression.get("Alpha", 0.0)),
@@ -358,6 +442,9 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
         [
             ("分析対象", label),
             ("結果ソース", result_source),
+            ("要求銘柄数", str(diagnostics.get("requested_count", 0))),
+            ("分析採用数", str(diagnostics.get("available_count", 0))),
+            ("有効ウェイト比率", f"{float(diagnostics.get('coverage_ratio', 0.0)) * 100:.1f}%"),
             ("回帰方式", str(regression.get("Method", "-"))),
             ("サンプル数", str(regression.get("N_Observations", "-"))),
             ("決定係数 R²", f"{float(regression.get('R_squared', 0.0)):.3f}"),
@@ -386,6 +473,34 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
         )
 
     upload_note_html = f"<p class='note'>{escape(upload_note)}</p>" if upload_note else ""
+    diagnostics_bits = []
+    if diagnostics.get("input_rows"):
+        diagnostics_bits.append(f"入力行数 {int(diagnostics['input_rows'])}")
+    if diagnostics.get("invalid_rows"):
+        diagnostics_bits.append(f"未解釈行 {int(diagnostics['invalid_rows'])}")
+    if diagnostics.get("missing_count"):
+        diagnostics_bits.append(f"価格未取得 {int(diagnostics['missing_count'])}")
+    diagnostics_html = f"<p class='note'>{escape(' / '.join(diagnostics_bits))}</p>" if diagnostics_bits else ""
+
+    missing_html = ""
+    if diagnostics.get("missing_tickers"):
+        missing_df = pd.DataFrame({"Missing Ticker": diagnostics["missing_tickers"][:40]})
+        missing_html = (
+            "<div class='table-card'><h3>価格未取得・確認対象</h3>"
+            + _frame_to_html(missing_df, max_rows=40)
+            + "</div>"
+        )
+
+    per_ticker_html = ""
+    if per_ticker_table is not None and not per_ticker_table.empty:
+        per_ticker_html = (
+            "<div class='table-card'><h3>個別回帰のばらつき</h3>"
+            + _frame_to_html(
+                per_ticker_table[["Ticker", "Weight", "N", "R_squared", "Adjusted_R_squared", "Beta"]],
+                max_rows=30,
+            )
+            + "</div>"
+        )
 
     return f"""<!doctype html>
 <html lang="ja">
@@ -450,6 +565,7 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
       {form}
       {upload_note_html}
       <p class="note">{escape(note)}</p>
+      {diagnostics_html}
       {metrics}
       {preview_html}
       <div class="two-col">
@@ -465,9 +581,13 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
           <ul>{insights_html}</ul>
         </div>
         <div class="table-card">
-          <h3>使用ウェイト</h3>
+          <h3>分析に採用したウェイト</h3>
           {_frame_to_html(weight_df)}
         </div>
+      </div>
+      <div class="two-col">
+        {missing_html}
+        {per_ticker_html}
       </div>
     </section>
   </div>

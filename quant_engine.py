@@ -35,6 +35,63 @@ class QuantEngine:
     # 時系列多変量回帰分析 (二段構え: 共通期間一括 or 個別加重平均)
     # =========================================================================
     @staticmethod
+    def build_individual_regression_table(df_hist_ret, df_weights, df_ff5, min_n_obs=24):
+        if df_hist_ret.empty or df_ff5.empty or df_weights.empty or sm is None:
+            return pd.DataFrame()
+
+        try:
+            hist = df_hist_ret.copy()
+            ff5 = df_ff5.copy()
+
+            if hist.index.tz is not None:
+                hist.index = hist.index.tz_localize(None)
+            hist.index = pd.to_datetime(hist.index).normalize()
+
+            if ff5.index.tz is not None:
+                ff5.index = ff5.index.tz_localize(None)
+            ff5.index = pd.to_datetime(ff5.index).normalize()
+
+            valid_tickers = [t for t in df_weights['Ticker'] if t in hist.columns]
+            if not valid_tickers:
+                return pd.DataFrame()
+
+            weight_map = dict(zip(df_weights['Ticker'], df_weights['Weight']))
+            rows = []
+            for ticker in valid_tickers:
+                ticker_ret = hist[ticker].dropna()
+                aligned = pd.concat([ticker_ret.rename('Ret'), ff5], axis=1, join='inner').dropna()
+                n_obs = len(aligned)
+                if n_obs < min_n_obs:
+                    continue
+
+                y = aligned['Ret'] - aligned['rf']
+                X = aligned[['mkt_rf', 'smb', 'hml', 'rmw', 'cma']]
+                X = sm.add_constant(X)
+                try:
+                    model = sm.OLS(y, X).fit()
+                    rows.append(
+                        {
+                            'Ticker': ticker,
+                            'Weight': float(weight_map.get(ticker, 0.0)),
+                            'N': int(n_obs),
+                            'R_squared': float(model.rsquared),
+                            'Adjusted_R_squared': float(model.rsquared_adj),
+                            'Alpha': float(model.params.get('const', 0.0)),
+                            'Beta': float(model.params.get('mkt_rf', 0.0)),
+                        }
+                    )
+                except Exception:
+                    continue
+
+            if not rows:
+                return pd.DataFrame()
+
+            out = pd.DataFrame(rows).sort_values(['Weight', 'R_squared'], ascending=[False, False]).reset_index(drop=True)
+            return out
+        except Exception:
+            return pd.DataFrame()
+
+    @staticmethod
     def run_5factor_regression(df_hist_ret, df_weights, df_ff5, min_n_obs=24, force_individual=False):
         """
         df_hist_ret: 既にリターン化されたヒストリカルデータ (月次を想定)

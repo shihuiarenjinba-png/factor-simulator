@@ -356,7 +356,14 @@ class DataProvider:
         result_df = pd.DataFrame()
 
         if missing_tickers_for_api:
-            chunk_size = 5
+            if len(missing_tickers_for_api) >= 150:
+                chunk_size = 30
+            elif len(missing_tickers_for_api) >= 60:
+                chunk_size = 20
+            elif len(missing_tickers_for_api) >= 20:
+                chunk_size = 10
+            else:
+                chunk_size = 5
             print(f"--- yfinance 履歴データ取得開始 (全{len(missing_tickers_for_api)}銘柄, チャンクサイズ:{chunk_size}) ---")
             
             for i in range(0, len(missing_tickers_for_api), chunk_size):
@@ -365,7 +372,8 @@ class DataProvider:
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        time.sleep(1.0 + random.uniform(0, 1))
+                        base_sleep = 0.15 if len(missing_tickers_for_api) >= 60 else 0.5
+                        time.sleep(base_sleep + random.uniform(0, 0.3))
                         
                         print(f"[yfinance] チャンク取得中: {chunk} ...")
                         # 【修正③】session/threads引数を削除。yfinance 1.2.0はcurl_cffiで自己管理。
