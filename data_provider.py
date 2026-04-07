@@ -199,6 +199,20 @@ class DataProvider:
     # Kenneth French 5-Factor データ取得メソッド
     # =========================================================================
     @staticmethod
+    def _clean_factor_frame(df_ff):
+        if df_ff.empty:
+            return pd.DataFrame()
+
+        cleaned = df_ff.copy()
+        raw_index = pd.Index(cleaned.index.astype(str)).str.strip()
+        monthly_mask = raw_index.str.fullmatch(r"\d{6}")
+        cleaned = cleaned.loc[monthly_mask].copy()
+        cleaned.index = pd.to_datetime(raw_index[monthly_mask], format='%Y%m', errors='coerce')
+        cleaned = cleaned.loc[~cleaned.index.isna()].copy()
+        cleaned = cleaned.dropna(how='all')
+        return cleaned
+
+    @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
     def fetch_ken_french_5factors(start_date, end_date=None):
         bundled_csv_path = Path(__file__).resolve().with_name("Japan_5_Factors.csv")
@@ -211,8 +225,7 @@ class DataProvider:
                 continue
             try:
                 df_ff = pd.read_csv(csv_path, skiprows=6, index_col=0)
-                df_ff.index = pd.to_datetime(df_ff.index.astype(str), format='%Y%m', errors='coerce')
-                df_ff = df_ff.dropna(how='all')
+                df_ff = DataProvider._clean_factor_frame(df_ff)
                 print(f"[Factor] {csv_path} から読み込み成功")
                 break
             except Exception as e:
@@ -246,11 +259,7 @@ class DataProvider:
                         )
                         csv_content = "\n".join(lines[header_idx:])
                         df_ff = pd.read_csv(io.StringIO(csv_content), index_col=0)
-                        df_ff.index = pd.to_datetime(
-                            df_ff.index.astype(str).str.strip(),
-                            format='%Y%m', errors='coerce'
-                        )
-                        df_ff = df_ff.dropna(how='all')
+                        df_ff = DataProvider._clean_factor_frame(df_ff)
                         print("[Factor] ZIPダウンロードから読み込み成功")
                         # 次回起動のためにローカルキャッシュとして保存
                         try:
@@ -272,6 +281,7 @@ class DataProvider:
                 df_ff = ff_dict[0]
                 if isinstance(df_ff.index, pd.PeriodIndex):
                     df_ff.index = df_ff.index.to_timestamp(how='end')
+                df_ff = DataProvider._clean_factor_frame(df_ff)
                 print("[Factor] pandas_datareaderより取得成功")
             except Exception as e:
                 print(f"[Factor Error] オンライン取得失敗: {e}")
@@ -288,7 +298,8 @@ class DataProvider:
         if df_ff.max().max() > 0.5:
             df_ff = df_ff.astype(float) / 100.0
 
-        df_ff.index = pd.to_datetime(df_ff.index)
+        df_ff.index = pd.to_datetime(df_ff.index, errors='coerce')
+        df_ff = df_ff.loc[~df_ff.index.isna()].copy()
         df_ff = df_ff.resample('ME').last()
         df_ff.index = df_ff.index.normalize().tz_localize(None)
         df_ff = df_ff.interpolate(method='linear').ffill().bfill()
