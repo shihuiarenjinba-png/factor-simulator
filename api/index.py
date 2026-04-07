@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import io
+from email.parser import BytesParser
+from email.policy import default
 from html import escape
 from pathlib import Path
 import sys
@@ -50,6 +53,45 @@ def _get_float(
     if maximum is not None:
         value = min(maximum, value)
     return value
+
+
+def _parse_request(environ) -> tuple[dict[str, str], dict[str, dict[str, object]]]:
+    method = environ.get("REQUEST_METHOD", "GET").upper()
+    if method == "POST":
+        try:
+            params: dict[str, str] = {}
+            files: dict[str, dict[str, object]] = {}
+            content_type = environ.get("CONTENT_TYPE", "")
+            content_length = int(environ.get("CONTENT_LENGTH", "0") or "0")
+            body = environ["wsgi.input"].read(content_length) if content_length else environ["wsgi.input"].read()
+
+            if content_type.startswith("application/x-www-form-urlencoded"):
+                parsed = parse_qs(body.decode("utf-8", errors="ignore"), keep_blank_values=True)
+                return ({key: values[0] for key, values in parsed.items()}, {})
+
+            if content_type.startswith("multipart/form-data"):
+                header = f"Content-Type: {content_type}\nMIME-Version: 1.0\n\n".encode("utf-8")
+                message = BytesParser(policy=default).parsebytes(header + body)
+                for part in message.iter_parts():
+                    name = part.get_param("name", header="content-disposition")
+                    if not name:
+                        continue
+                    filename = part.get_filename()
+                    payload = part.get_payload(decode=True) or b""
+                    if filename:
+                        files[name] = {
+                            "filename": filename,
+                            "value": payload,
+                        }
+                    else:
+                        charset = part.get_content_charset() or "utf-8"
+                        params[name] = payload.decode(charset, errors="ignore")
+            return params, files
+        except Exception:
+            pass
+
+    parsed = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+    return ({key: values[0] for key, values in parsed.items()}, {})
 
 
 def _render_metrics(items: list[tuple[str, str]]) -> str:
@@ -128,6 +170,46 @@ def _normalize_weights(raw_weights: str, count: int) -> list[float]:
     return [value / total for value in parsed]
 
 
+def _extract_portfolio_from_upload(filename: str, file_bytes: bytes) -> tuple[list[str], list[float] | None, pd.DataFrame]:
+    suffix = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if suffix == "csv":
+        df_up = pd.read_csv(io.BytesIO(file_bytes), encoding="utf-8-sig")
+    elif suffix in {"xlsx", "xls"}:
+        df_up = pd.read_excel(io.BytesIO(file_bytes))
+    else:
+        raise ValueError("CSV または Excel ファイルを指定してください。")
+
+    ticker_col = next((c for c in df_up.columns if any(k in str(c) for k in ["コード", "Ticker", "ticker", "銘柄", "ティッカー", "Symbol", "symbol", "Code", "code"])), None)
+    if not ticker_col:
+        best_col = None
+        best_count = 0
+        for col in df_up.columns:
+            count = df_up[col].astype(str).str.contains(r"\b\d{4}\b", regex=True).sum()
+            if count > best_count:
+                best_count = int(count)
+                best_col = col
+        ticker_col = best_col if best_count > 0 else None
+
+    if ticker_col is None:
+        raise ValueError("銘柄コード列が見つかりませんでした。")
+
+    raw_codes = df_up[ticker_col].astype(str).str.extract(r"(\d{4})")[0].dropna().tolist()
+    codes = [f"{code}.T" for code in list(dict.fromkeys(raw_codes))]
+    if not codes:
+        raise ValueError("4桁コードを読み取れませんでした。")
+
+    weight_col = next((c for c in df_up.columns if any(k in str(c) for k in ["Weight", "weight", "ウェイト", "比率", "割合", "保有", "Ratio", "ratio", "%"])), None)
+    weights: list[float] | None = None
+    if weight_col:
+        raw_weights = pd.to_numeric(df_up[weight_col], errors="coerce").fillna(0.0).tolist()[: len(codes)]
+        if sum(raw_weights) > 0:
+            total = float(sum(raw_weights))
+            weights = [float(value) / total for value in raw_weights]
+
+    preview = df_up.head(12).copy()
+    return codes, weights, preview
+
+
 def _build_demo_case(lookback_years: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
     months = max(lookback_years * 12, 60)
     rng = np.random.default_rng(42)
@@ -165,12 +247,17 @@ def _build_demo_case(lookback_years: int) -> tuple[pd.DataFrame, pd.DataFrame, p
     return hist_ret, weights, ff5, "デモポートフォリオ"
 
 
-def _build_live_case(raw_codes: str, raw_weights: str, lookback_years: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
-    tickers = _normalize_codes(raw_codes)
+def _build_live_case(raw_codes: str, raw_weights: str, lookback_years: int, upload_info: dict[str, object] | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str, pd.DataFrame | None]:
+    preview = None
+    if upload_info:
+        tickers = upload_info["tickers"]
+        weights = upload_info["weights"] or [1.0 / len(tickers)] * len(tickers)
+        preview = upload_info.get("preview")
+    else:
+        tickers = _normalize_codes(raw_codes)
+        weights = _normalize_weights(raw_weights, len(tickers))
     if not tickers:
         raise ValueError("有効な銘柄コードがありません。例: 7203, 8306, 9984")
-
-    weights = _normalize_weights(raw_weights, len(tickers))
     start_date = (dt.date.today() - dt.timedelta(days=365 * lookback_years)).strftime("%Y-%m-%d")
     end_date = dt.date.today().strftime("%Y-%m-%d")
     hist_ret = DataProvider.fetch_historical_prices_monthly(tickers, days=365 * lookback_years)
@@ -181,26 +268,48 @@ def _build_live_case(raw_codes: str, raw_weights: str, lookback_years: int) -> t
         raise ValueError("5ファクターデータの取得に失敗しました。ネットワークかローカルCSVを確認してください。")
     weight_df = pd.DataFrame({"Ticker": tickers, "Weight": weights})
     label = ", ".join(tickers[:4]) + (" ..." if len(tickers) > 4 else "")
-    return hist_ret, weight_df, ff5, label
+    return hist_ret, weight_df, ff5, label, preview
 
 
-def _render_page(params: dict[str, list[str]]) -> str:
-    mode = _get_arg(params, "mode", "demo")
-    raw_codes = _get_arg(params, "codes", "7203, 8306, 9984")
-    raw_weights = _get_arg(params, "weights", "40, 30, 30")
-    lookback_years = _get_int(params, "lookback_years", 5, minimum=2, maximum=20)
+def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) -> str:
+    mode = params.get("mode", "demo")
+    raw_codes = params.get("codes", "7203, 8306, 9984")
+    raw_weights = params.get("weights", "40, 30, 30")
+    lookback_years = _get_int({k: [v] for k, v in params.items()}, "lookback_years", 5, minimum=2, maximum=20)
+    upload_info = None
+    upload_note = ""
+    if "portfolio_file" in files and files["portfolio_file"].get("value"):
+        try:
+            tickers, weights, preview = _extract_portfolio_from_upload(
+                str(files["portfolio_file"]["filename"]),
+                files["portfolio_file"]["value"],
+            )
+            raw_codes = ", ".join(ticker.replace(".T", "") for ticker in tickers)
+            if weights:
+                raw_weights = ", ".join(f"{weight * 100:.1f}" for weight in weights)
+            upload_info = {
+                "tickers": tickers,
+                "weights": weights,
+                "preview": preview,
+            }
+            mode = "live"
+            upload_note = f"アップロードファイル {files['portfolio_file']['filename']} を優先して解析しました。"
+        except Exception as exc:
+            upload_note = f"アップロードの解析に失敗したため手入力へ戻しました: {exc}"
 
     if mode == "live":
         try:
-            hist_ret, weight_df, ff5, label = _build_live_case(raw_codes, raw_weights, lookback_years)
+            hist_ret, weight_df, ff5, label, preview = _build_live_case(raw_codes, raw_weights, lookback_years, upload_info=upload_info)
             note = "ライブデータで月次5ファクター回帰を実行しています。"
         except Exception as exc:
             hist_ret, weight_df, ff5, label = _build_demo_case(lookback_years)
             note = f"ライブ取得に失敗したためデモへ切り替えました: {exc}"
             mode = "demo"
+            preview = upload_info.get("preview") if upload_info else None
     else:
         hist_ret, weight_df, ff5, label = _build_demo_case(lookback_years)
         note = "デモデータで回帰ロジックを確認できます。"
+        preview = upload_info.get("preview") if upload_info else None
 
     regression = QuantEngine.run_5factor_regression(hist_ret, weight_df, ff5)
     if regression is None:
@@ -217,7 +326,7 @@ def _render_page(params: dict[str, list[str]]) -> str:
     insights = QuantEngine.generate_insights(exposures)
 
     form = f"""
-    <form class="control-grid" method="get">
+    <form class="control-grid" method="post" enctype="multipart/form-data">
       <label>モード
         <select name="mode">
           <option value="demo" {'selected' if mode == 'demo' else ''}>Demo</option>
@@ -232,6 +341,9 @@ def _render_page(params: dict[str, list[str]]) -> str:
       </label>
       <label class="full">ウェイト
         <input name="weights" value="{escape(raw_weights)}" placeholder="40, 30, 30">
+      </label>
+      <label class="full">ポートフォリオCSV / Excel
+        <input name="portfolio_file" type="file" accept=".csv,.xlsx,.xls">
       </label>
       <div class="actions"><button type="submit">回帰分析を実行</button></div>
     </form>
@@ -258,6 +370,16 @@ def _render_page(params: dict[str, list[str]]) -> str:
         ]
     )
     insights_html = "".join(f"<li>{escape(item)}</li>" for item in insights)
+
+    preview_html = ""
+    if preview is not None and not preview.empty:
+        preview_html = (
+            "<div class='table-card'><h3>アップロード内容のプレビュー</h3>"
+            + _frame_to_html(preview)
+            + "</div>"
+        )
+
+    upload_note_html = f"<p class='note'>{escape(upload_note)}</p>" if upload_note else ""
 
     return f"""<!doctype html>
 <html lang="ja">
@@ -320,8 +442,10 @@ def _render_page(params: dict[str, list[str]]) -> str:
       <h2>ポートフォリオの5ファクター分析</h2>
       <p class="copy">日本株コードとウェイトを入れて、月次の Fama-French 5 Factor 回帰を実行します。まずは Demo でロジック確認、次に Live で実データ確認がおすすめです。</p>
       {form}
+      {upload_note_html}
       <p class="note">{escape(note)}</p>
       {metrics}
+      {preview_html}
       <div class="two-col">
         {_bar_chart(exposures)}
         <div class="table-card">
@@ -352,9 +476,9 @@ def app(environ, start_response):
         start_response("200 OK", [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))])
         return [body]
 
-    params = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+    params, files = _parse_request(environ)
     try:
-        html = _render_page(params)
+        html = _render_page(params, files)
         status = "200 OK"
     except Exception as exc:
         html = f"""<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>Factor Simulator Error</title></head>

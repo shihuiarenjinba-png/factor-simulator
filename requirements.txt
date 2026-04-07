@@ -4,3 +4,4 @@ yfinance>=0.2.61
 statsmodels
 requests
 scipy
+openpyxl
