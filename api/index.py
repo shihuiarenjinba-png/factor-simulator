@@ -173,6 +173,32 @@ def _normalize_weights(raw_weights: str, count: int) -> list[float]:
     return [value / total for value in parsed]
 
 
+def _trim_large_portfolio(tickers: list[str], weights: list[float], max_names: int = 140, target_coverage: float = 0.97) -> tuple[list[str], list[float], dict[str, object]]:
+    if len(tickers) <= max_names:
+        return tickers, weights, {"trimmed_count": 0, "trimmed_weight": 0.0}
+
+    rows = (
+        pd.DataFrame({"Ticker": tickers, "Weight": weights})
+        .sort_values("Weight", ascending=False)
+        .reset_index(drop=True)
+    )
+    rows["cum_weight"] = rows["Weight"].cumsum()
+    keep_count = int((rows["cum_weight"] < target_coverage).sum()) + 1
+    keep_count = min(max(keep_count, 1), max_names)
+
+    kept = rows.head(keep_count).copy()
+    trimmed = rows.iloc[keep_count:].copy()
+    kept_weight_sum = float(kept["Weight"].sum())
+    if kept_weight_sum > 0:
+        kept["Weight"] = kept["Weight"] / kept_weight_sum
+
+    meta = {
+        "trimmed_count": int(len(trimmed)),
+        "trimmed_weight": float(trimmed["Weight"].sum()) if not trimmed.empty else 0.0,
+    }
+    return kept["Ticker"].tolist(), kept["Weight"].tolist(), meta
+
+
 def _normalize_uploaded_ticker(value: object) -> str | None:
     text = str(value).strip().upper()
     if not text or text in {"NAN", "NONE"}:
@@ -295,6 +321,10 @@ def _build_live_case(raw_codes: str, raw_weights: str, lookback_years: int, uplo
         weights = _normalize_weights(raw_weights, len(tickers))
     if not tickers:
         raise ValueError("有効な銘柄コードがありません。例: 7203, 8306, 9984")
+    original_requested_tickers = list(tickers)
+    original_requested_count = len(tickers)
+    requested_weight_total = float(sum(weights)) if weights else 0.0
+    tickers, weights, trim_meta = _trim_large_portfolio(tickers, weights)
     start_date = (dt.date.today() - dt.timedelta(days=365 * lookback_years)).strftime("%Y-%m-%d")
     end_date = dt.date.today().strftime("%Y-%m-%d")
     hist_ret = DataProvider.fetch_historical_prices_monthly(tickers, days=365 * lookback_years)
@@ -318,15 +348,19 @@ def _build_live_case(raw_codes: str, raw_weights: str, lookback_years: int, uplo
     effective_hist_ret = hist_ret.loc[:, available_tickers].copy()
     label = ", ".join(available_tickers[:4]) + (" ..." if len(available_tickers) > 4 else "")
     diagnostics = {
-        "requested_tickers": tickers,
+        "requested_tickers": original_requested_tickers,
         "available_tickers": available_tickers,
         "missing_tickers": missing_tickers,
-        "requested_count": len(tickers),
+        "requested_count": original_requested_count,
         "available_count": len(available_tickers),
         "missing_count": len(missing_tickers),
         "coverage_ratio": available_weight_sum,
         "input_rows": upload_info.get("input_rows") if upload_info else len(tickers),
         "invalid_rows": upload_info.get("invalid_rows", 0) if upload_info else 0,
+        "trimmed_count": trim_meta["trimmed_count"],
+        "trimmed_weight": trim_meta["trimmed_weight"],
+        "analysis_count": len(tickers),
+        "requested_weight_total": requested_weight_total,
     }
     return effective_hist_ret, weight_df, ff5, label, preview, diagnostics
 
@@ -376,11 +410,14 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
                 "available_tickers": [],
                 "missing_tickers": upload_info.get("tickers", []) if upload_info else [],
                 "requested_count": len(upload_info.get("tickers", [])) if upload_info else 0,
+                "analysis_count": len(upload_info.get("tickers", [])) if upload_info else 0,
                 "available_count": 0,
                 "missing_count": len(upload_info.get("tickers", [])) if upload_info else 0,
                 "coverage_ratio": 0.0,
                 "input_rows": upload_info.get("input_rows") if upload_info else 0,
                 "invalid_rows": upload_info.get("invalid_rows", 0) if upload_info else 0,
+                "trimmed_count": 0,
+                "trimmed_weight": 0.0,
             }
     else:
         hist_ret, weight_df, ff5, label = _build_demo_case(lookback_years)
@@ -392,17 +429,60 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
             "available_tickers": ["DEMO.T"],
             "missing_tickers": [],
             "requested_count": 1,
+            "analysis_count": 1,
             "available_count": 1,
             "missing_count": 0,
             "coverage_ratio": 1.0,
             "input_rows": upload_info.get("input_rows") if upload_info else 0,
             "invalid_rows": upload_info.get("invalid_rows", 0) if upload_info else 0,
+            "trimmed_count": 0,
+            "trimmed_weight": 0.0,
         }
 
-    regression = QuantEngine.run_5factor_regression(hist_ret, weight_df, ff5)
+    regression = None
+    regression_floor = None
+    for candidate_floor in (24, 12, 6):
+        regression = QuantEngine.run_5factor_regression(hist_ret, weight_df, ff5, min_n_obs=candidate_floor)
+        if regression is not None:
+            regression_floor = candidate_floor
+            break
+
+    per_ticker_table = QuantEngine.build_individual_regression_table(
+        hist_ret,
+        weight_df,
+        ff5,
+        min_n_obs=regression_floor or 6,
+    )
+    if regression is None and per_ticker_table is not None and not per_ticker_table.empty:
+        top = per_ticker_table.sort_values(["Weight", "R_squared"], ascending=[False, False]).iloc[0]
+        regression = {
+            "Method": "Ticker Diagnostic",
+            "N_Observations": int(top.get("N", 0)),
+            "Alpha": float(top.get("Alpha", 0.0)),
+            "Beta": float(top.get("Beta", 0.0)),
+            "Size": 0.0,
+            "Value": 0.0,
+            "Quality": 0.0,
+            "Investment": 0.0,
+            "R_squared": float(top.get("R_squared", 0.0)),
+            "Adjusted_R_squared": float(top.get("Adjusted_R_squared", 0.0)),
+        }
+        note += " ポートフォリオ全体の回帰が不安定だったため、個別回帰の診断結果を併記しています。"
+
     if regression is None:
-        raise ValueError("回帰分析の実行に失敗しました。入力条件を見直してください。")
-    per_ticker_table = QuantEngine.build_individual_regression_table(hist_ret, weight_df, ff5)
+        regression = {
+            "Method": "Diagnostic only",
+            "N_Observations": 0,
+            "Alpha": 0.0,
+            "Beta": 0.0,
+            "Size": 0.0,
+            "Value": 0.0,
+            "Quality": 0.0,
+            "Investment": 0.0,
+            "R_squared": 0.0,
+            "Adjusted_R_squared": 0.0,
+        }
+        note += " 回帰は成立しませんでしたが、下に採用銘柄と欠落銘柄の診断を表示しています。"
 
     exposures = {
         "Alpha": float(regression.get("Alpha", 0.0)),
@@ -443,6 +523,7 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
             ("分析対象", label),
             ("結果ソース", result_source),
             ("要求銘柄数", str(diagnostics.get("requested_count", 0))),
+            ("計算対象数", str(diagnostics.get("analysis_count", diagnostics.get("requested_count", 0)))),
             ("分析採用数", str(diagnostics.get("available_count", 0))),
             ("有効ウェイト比率", f"{float(diagnostics.get('coverage_ratio', 0.0)) * 100:.1f}%"),
             ("回帰方式", str(regression.get("Method", "-"))),
@@ -480,6 +561,12 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
         diagnostics_bits.append(f"未解釈行 {int(diagnostics['invalid_rows'])}")
     if diagnostics.get("missing_count"):
         diagnostics_bits.append(f"価格未取得 {int(diagnostics['missing_count'])}")
+    if diagnostics.get("trimmed_count"):
+        diagnostics_bits.append(
+            f"尾部省略 {int(diagnostics['trimmed_count'])}銘柄 ({float(diagnostics.get('trimmed_weight', 0.0)) * 100:.1f}%)"
+        )
+    if regression_floor is not None:
+        diagnostics_bits.append(f"最小観測月数 {int(regression_floor)}")
     diagnostics_html = f"<p class='note'>{escape(' / '.join(diagnostics_bits))}</p>" if diagnostics_bits else ""
 
     missing_html = ""
