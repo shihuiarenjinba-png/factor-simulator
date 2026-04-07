@@ -5,10 +5,5 @@
       "source": "/(.*)",
       "destination": "/api/index"
     }
-  ],
-  "functions": {
-    "api/*.py": {
-      "excludeFiles": "{__pycache__/**,app.py,visualizer.py,requirements-local.txt}"
-    }
-  }
+  ]
 }
