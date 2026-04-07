@@ -301,15 +301,20 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
         try:
             hist_ret, weight_df, ff5, label, preview = _build_live_case(raw_codes, raw_weights, lookback_years, upload_info=upload_info)
             note = "ライブデータで月次5ファクター回帰を実行しています。"
+            result_source = "ライブ"
         except Exception as exc:
             hist_ret, weight_df, ff5, label = _build_demo_case(lookback_years)
-            note = f"ライブ取得に失敗したためデモへ切り替えました: {exc}"
-            mode = "demo"
+            note = (
+                "ライブ取得は失敗しました。選択はライブのまま保持し、下の結果のみデモで代替表示しています: "
+                f"{exc}"
+            )
             preview = upload_info.get("preview") if upload_info else None
+            result_source = "デモ代替"
     else:
         hist_ret, weight_df, ff5, label = _build_demo_case(lookback_years)
         note = "デモデータで回帰ロジックを確認できます。"
         preview = upload_info.get("preview") if upload_info else None
+        result_source = "デモ"
 
     regression = QuantEngine.run_5factor_regression(hist_ret, weight_df, ff5)
     if regression is None:
@@ -352,6 +357,7 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
     metrics = _render_metrics(
         [
             ("分析対象", label),
+            ("結果ソース", result_source),
             ("回帰方式", str(regression.get("Method", "-"))),
             ("サンプル数", str(regression.get("N_Observations", "-"))),
             ("決定係数 R²", f"{float(regression.get('R_squared', 0.0)):.3f}"),

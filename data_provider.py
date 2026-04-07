@@ -2,11 +2,13 @@ import os
 import sqlite3
 import datetime
 import time
+import tempfile
 import requests
 import random
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from pathlib import Path
 try:
     import streamlit as st
 except Exception:
@@ -59,7 +61,10 @@ class DataProvider:
     【修正③】yfinance 1.2.0対応: yf.download/yf.Tickerからsession引数を完全削除。
     """
     
-    DB_PATH = "market_data.db"
+    DB_PATH = os.environ.get(
+        "MARKET_DATA_DB_PATH",
+        str(Path(tempfile.gettempdir()) / "factor_simulator_market_data.db"),
+    )
     FMP_API_KEY = _secret_get("FMP_API_KEY")
     # 【J-Quants V2】APIキー（Streamlit SecretsまたはGitHub Secrets経由で設定）
     JQUANTS_API_KEY = _secret_get("JQUANTS_API_KEY")
@@ -89,9 +94,21 @@ class DataProvider:
     # SQLite データベース管理メソッド
     # =========================================================================
     @staticmethod
+    def _db_path():
+        db_path = Path(DataProvider.DB_PATH).expanduser()
+        if not db_path.is_absolute():
+            db_path = Path(tempfile.gettempdir()) / db_path
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        return db_path
+
+    @staticmethod
+    def _connect_db():
+        return sqlite3.connect(str(DataProvider._db_path()))
+
+    @staticmethod
     def _init_db():
         """SQLiteデータベースとテーブルの初期化"""
-        with sqlite3.connect(DataProvider.DB_PATH) as conn:
+        with DataProvider._connect_db() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS historical_prices (
                     ticker TEXT,
@@ -131,7 +148,7 @@ class DataProvider:
             long_df['date'] = pd.to_datetime(long_df['date']).dt.strftime('%Y-%m-%d')
             long_df = long_df.dropna(subset=['close'])
             
-            with sqlite3.connect(DataProvider.DB_PATH) as conn:
+            with DataProvider._connect_db() as conn:
                 long_df.to_sql('historical_prices', conn, if_exists='append', index=False)
                 conn.execute("""
                     DELETE FROM historical_prices 
@@ -152,7 +169,7 @@ class DataProvider:
             WHERE ticker IN ('{ticker_list}') AND date >= '{start_date}' AND date <= '{end_date}'
         """
         try:
-            with sqlite3.connect(DataProvider.DB_PATH) as conn:
+            with DataProvider._connect_db() as conn:
                 df = pd.read_sql(query, conn)
             if df.empty: return pd.DataFrame()
             df['date'] = pd.to_datetime(df['date'])
@@ -184,16 +201,20 @@ class DataProvider:
     @staticmethod
     @st.cache_data(ttl=86400, show_spinner=False)
     def fetch_ken_french_5factors(start_date, end_date=None):
-        csv_path = "Japan_5_Factors.csv"
+        bundled_csv_path = Path(__file__).resolve().with_name("Japan_5_Factors.csv")
+        cache_csv_path = DataProvider._db_path().with_name("Japan_5_Factors.csv")
         df_ff = pd.DataFrame()
 
         # 【優先①】リポジトリ同梱のCSVから読み込み（最も安定）
-        if os.path.exists(csv_path):
+        for csv_path in (bundled_csv_path, cache_csv_path):
+            if not csv_path.exists():
+                continue
             try:
                 df_ff = pd.read_csv(csv_path, skiprows=6, index_col=0)
                 df_ff.index = pd.to_datetime(df_ff.index.astype(str), format='%Y%m', errors='coerce')
                 df_ff = df_ff.dropna(how='all')
                 print(f"[Factor] {csv_path} から読み込み成功")
+                break
             except Exception as e:
                 print(f"[Factor Error] CSV読み込み失敗: {e}")
 
@@ -233,9 +254,9 @@ class DataProvider:
                         print("[Factor] ZIPダウンロードから読み込み成功")
                         # 次回起動のためにローカルキャッシュとして保存
                         try:
-                            with open(csv_path, 'w') as out:
+                            with open(cache_csv_path, 'w') as out:
                                 out.write("\n".join(lines))
-                            print(f"[Factor] {csv_path} にキャッシュ保存しました")
+                            print(f"[Factor] {cache_csv_path} にキャッシュ保存しました")
                         except Exception:
                             pass
             except Exception as e:
@@ -428,7 +449,7 @@ class DataProvider:
         # 1. DBから直近7日以内のキャッシュを取得
         # 【修正②】3日→7日に延長
         try:
-            with sqlite3.connect(DataProvider.DB_PATH) as conn:
+            with DataProvider._connect_db() as conn:
                 ticker_list_str = "','".join(unique_tickers)
                 query = f"SELECT * FROM fundamentals_cache WHERE ticker IN ('{ticker_list_str}') AND datetime(last_updated) >= datetime('now', '-7 days')"
                 df_cache = pd.read_sql(query, conn)
@@ -508,7 +529,7 @@ class DataProvider:
                     }
                     df_db = df_to_save.rename(columns=rename_cols)
                     
-                    with sqlite3.connect(DataProvider.DB_PATH) as conn:
+                    with DataProvider._connect_db() as conn:
                         for _, row in df_db.iterrows():
                             conn.execute("""
                                 INSERT OR REPLACE INTO fundamentals_cache 
