@@ -7,7 +7,38 @@ import random
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import streamlit as st
+try:
+    import streamlit as st
+except Exception:
+    class _FallbackStreamlit:
+        secrets = {}
+
+        @staticmethod
+        def cache_data(*args, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
+
+        @staticmethod
+        def warning(*args, **kwargs):
+            return None
+
+        @staticmethod
+        def error(*args, **kwargs):
+            return None
+
+        @staticmethod
+        def stop():
+            raise RuntimeError("Streamlit stop called outside Streamlit runtime.")
+
+    st = _FallbackStreamlit()
+
+
+def _secret_get(name):
+    try:
+        return st.secrets.get(name, os.environ.get(name))
+    except Exception:
+        return os.environ.get(name)
 import re
 import io
 from requests.adapters import HTTPAdapter
@@ -29,9 +60,9 @@ class DataProvider:
     """
     
     DB_PATH = "market_data.db"
-    FMP_API_KEY = st.secrets.get("FMP_API_KEY", os.environ.get("FMP_API_KEY"))
+    FMP_API_KEY = _secret_get("FMP_API_KEY")
     # 【J-Quants V2】APIキー（Streamlit SecretsまたはGitHub Secrets経由で設定）
-    JQUANTS_API_KEY = st.secrets.get("JQUANTS_API_KEY", os.environ.get("JQUANTS_API_KEY"))
+    JQUANTS_API_KEY = _secret_get("JQUANTS_API_KEY")
 
     SECTOR_TRANSLATION = {
         'Technology': 'HiTec', 'Information & Communication': 'Telcm', 
