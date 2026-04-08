@@ -173,7 +173,12 @@ def _normalize_weights(raw_weights: str, count: int) -> list[float]:
     return [value / total for value in parsed]
 
 
-def _trim_large_portfolio(tickers: list[str], weights: list[float], max_names: int = 140, target_coverage: float = 0.97) -> tuple[list[str], list[float], dict[str, object]]:
+def _trim_large_portfolio(tickers: list[str], weights: list[float], max_names: int = 260, target_coverage: float = 0.995) -> tuple[list[str], list[float], dict[str, object]]:
+    # 日経225のような代表バスケットは原則として丸ごと扱う。
+    # 以前は 140 銘柄 / 97% で自動省略していたため、指数らしい挙動が崩れやすかった。
+    if len(tickers) <= 225:
+        return tickers, weights, {"trimmed_count": 0, "trimmed_weight": 0.0}
+
     if len(tickers) <= max_names:
         return tickers, weights, {"trimmed_count": 0, "trimmed_weight": 0.0}
 
