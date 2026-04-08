@@ -555,6 +555,7 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
 
     upload_note_html = f"<p class='note'>{escape(upload_note)}</p>" if upload_note else ""
     diagnostics_bits = []
+    method_name = str(regression.get("Method", ""))
     if diagnostics.get("input_rows"):
         diagnostics_bits.append(f"入力行数 {int(diagnostics['input_rows'])}")
     if diagnostics.get("invalid_rows"):
@@ -567,7 +568,15 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
         )
     if regression_floor is not None:
         diagnostics_bits.append(f"最小観測月数 {int(regression_floor)}")
-    diagnostics_bits.append("観測月数は銘柄数ではなく月次リターンの本数です")
+    if method_name == "Individual Aggregation":
+        diagnostics_bits.append("現在の値は日経平均そのものの回帰ではなく、各銘柄の回帰係数をウェイト平均したものです")
+        diagnostics_bits.append("観測月数は個別銘柄の平均的な月次数であり、単一の共通ポートフォリオ系列ではありません")
+    elif method_name == "Portfolio Reweighted":
+        diagnostics_bits.append("月ごとに価格取得できた銘柄へウェイトを再配分して、ポートフォリオ系列を直接回帰しています")
+        if regression.get("Coverage_Average") is not None:
+            diagnostics_bits.append(f"平均月次カバレッジ {float(regression['Coverage_Average']) * 100:.1f}%")
+    else:
+        diagnostics_bits.append("観測月数は銘柄数ではなく月次リターンの本数です")
     diagnostics_html = f"<p class='note'>{escape(' / '.join(diagnostics_bits))}</p>" if diagnostics_bits else ""
 
     missing_html = ""

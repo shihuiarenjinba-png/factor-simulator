@@ -167,7 +167,55 @@ class QuantEngine:
                         }
                     }
                 else:
-                    print(f"[Regression] 共通期間が {n_obs} ヶ月しかありません。プランB(個別回帰)へ移行します。")
+                    print(f"[Regression] 共通期間が {n_obs} ヶ月しかありません。動的リウェイトのポートフォリオ回帰を試します。")
+
+                # -------------------------------------------------------------
+                # プランA-2: 月ごとの利用可能銘柄で再配分する一括回帰
+                # 大型バスケットでは全銘柄の完全共通期間が極端に短くなりやすいため、
+                # 各月で観測できた銘柄だけにウェイトを再配分してポートフォリオ系列を作る。
+                # -------------------------------------------------------------
+                partial_rets = df_hist_ret[valid_tickers].copy()
+                available_weight = partial_rets.notna().mul(w_series, axis=1).sum(axis=1)
+                weighted_sum = partial_rets.mul(w_series, axis=1).sum(axis=1, skipna=True)
+                coverage_floor = 0.80
+                port_ret_reweighted = (weighted_sum / available_weight).where(available_weight >= coverage_floor)
+                aligned_reweighted = pd.concat([port_ret_reweighted.rename('Port_Ret'), df_ff5], axis=1, join='inner').dropna()
+                n_reweighted_obs = len(aligned_reweighted)
+
+                if n_reweighted_obs >= min_n_obs:
+                    print(
+                        f"[Regression Plan A-2] 動的リウェイト回帰を実行します。"
+                        f"(有効期間={n_reweighted_obs}ヶ月, 月次カバレッジ下限={coverage_floor:.0%})"
+                    )
+                    y = aligned_reweighted['Port_Ret'] - aligned_reweighted['rf']
+                    X = aligned_reweighted[['mkt_rf', 'smb', 'hml', 'rmw', 'cma']]
+                    X = sm.add_constant(X)
+
+                    model = sm.OLS(y, X).fit()
+
+                    return {
+                        'Method': 'Portfolio Reweighted',
+                        'N_Observations': n_reweighted_obs,
+                        'Alpha': model.params.get('const', 0),
+                        'Beta': model.params.get('mkt_rf', 0),
+                        'Size': model.params.get('smb', 0),
+                        'Value': model.params.get('hml', 0),
+                        'Quality': model.params.get('rmw', 0),
+                        'Investment': model.params.get('cma', 0),
+                        'R_squared': model.rsquared,
+                        'Adjusted_R_squared': model.rsquared_adj,
+                        'p_values': {
+                            'Alpha': model.pvalues.get('const', 1),
+                            'Beta': model.pvalues.get('mkt_rf', 1)
+                        },
+                        'Coverage_Floor': coverage_floor,
+                        'Coverage_Average': float(available_weight.loc[aligned_reweighted.index].mean()),
+                    }
+
+                print(
+                    f"[Regression] 動的リウェイト回帰でも有効期間が {n_reweighted_obs} ヶ月です。"
+                    "プランB(個別回帰)へ移行します。"
+                )
 
             # -------------------------------------------------------------
             # プランB: 個別回帰の加重平均 (Individual Aggregation)
