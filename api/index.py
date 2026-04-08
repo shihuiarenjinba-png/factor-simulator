@@ -527,7 +527,7 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
             ("分析採用数", str(diagnostics.get("available_count", 0))),
             ("有効ウェイト比率", f"{float(diagnostics.get('coverage_ratio', 0.0)) * 100:.1f}%"),
             ("回帰方式", str(regression.get("Method", "-"))),
-            ("サンプル数", str(regression.get("N_Observations", "-"))),
+            ("観測月数", str(regression.get("N_Observations", "-"))),
             ("決定係数 R²", f"{float(regression.get('R_squared', 0.0)):.3f}"),
             ("調整済み R²", f"{float(regression.get('Adjusted_R_squared', 0.0)):.3f}"),
             ("Alpha", f"{float(regression.get('Alpha', 0.0)):.4f}"),
@@ -567,6 +567,7 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
         )
     if regression_floor is not None:
         diagnostics_bits.append(f"最小観測月数 {int(regression_floor)}")
+    diagnostics_bits.append("観測月数は銘柄数ではなく月次リターンの本数です")
     diagnostics_html = f"<p class='note'>{escape(' / '.join(diagnostics_bits))}</p>" if diagnostics_bits else ""
 
     missing_html = ""
@@ -580,12 +581,51 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
 
     per_ticker_html = ""
     if per_ticker_table is not None and not per_ticker_table.empty:
+        factor_tilt_table = per_ticker_table.copy()
+        factor_tilt_table["観測月数"] = factor_tilt_table["N"]
+        factor_tilt_table["Beta寄与"] = factor_tilt_table["Weight"] * factor_tilt_table["Beta"]
+        factor_tilt_table["Value寄与"] = factor_tilt_table["Weight"] * factor_tilt_table["Value"]
+        factor_tilt_table["Size寄与"] = factor_tilt_table["Weight"] * factor_tilt_table["Size"]
+        factor_tilt_table["Quality寄与"] = factor_tilt_table["Weight"] * factor_tilt_table["Quality"]
+        factor_tilt_table["Investment寄与"] = factor_tilt_table["Weight"] * factor_tilt_table["Investment"]
         per_ticker_html = (
-            "<div class='table-card'><h3>個別回帰のばらつき</h3>"
+            "<div class='table-card'><h3>主要銘柄のファクター傾き</h3>"
             + _frame_to_html(
-                per_ticker_table[["Ticker", "Weight", "N", "R_squared", "Adjusted_R_squared", "Beta"]],
+                factor_tilt_table[
+                    [
+                        "Ticker",
+                        "Weight",
+                        "観測月数",
+                        "Beta",
+                        "Value",
+                        "Size",
+                        "Quality",
+                        "Investment",
+                    ]
+                ],
                 max_rows=30,
             )
+            + "</div>"
+        )
+
+        contribution_table = (
+            factor_tilt_table[
+                [
+                    "Ticker",
+                    "Weight",
+                    "Beta寄与",
+                    "Value寄与",
+                    "Size寄与",
+                    "Quality寄与",
+                    "Investment寄与",
+                ]
+            ]
+            .sort_values("Weight", ascending=False)
+            .head(20)
+        )
+        per_ticker_html += (
+            "<div class='table-card'><h3>ファクター寄与の内訳</h3>"
+            + _frame_to_html(contribution_table, max_rows=20)
             + "</div>"
         )
 

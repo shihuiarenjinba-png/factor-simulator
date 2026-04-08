@@ -74,10 +74,14 @@ class QuantEngine:
                             'Ticker': ticker,
                             'Weight': float(weight_map.get(ticker, 0.0)),
                             'N': int(n_obs),
+                            'Beta': float(model.params.get('mkt_rf', 0.0)),
+                            'Size': float(model.params.get('smb', 0.0)),
+                            'Value': float(model.params.get('hml', 0.0)),
+                            'Quality': float(model.params.get('rmw', 0.0)),
+                            'Investment': float(model.params.get('cma', 0.0)),
                             'R_squared': float(model.rsquared),
                             'Adjusted_R_squared': float(model.rsquared_adj),
                             'Alpha': float(model.params.get('const', 0.0)),
-                            'Beta': float(model.params.get('mkt_rf', 0.0)),
                         }
                     )
                 except Exception:
@@ -86,7 +90,7 @@ class QuantEngine:
             if not rows:
                 return pd.DataFrame()
 
-            out = pd.DataFrame(rows).sort_values(['Weight', 'R_squared'], ascending=[False, False]).reset_index(drop=True)
+            out = pd.DataFrame(rows).sort_values(['Weight', 'N'], ascending=[False, False]).reset_index(drop=True)
             return out
         except Exception:
             return pd.DataFrame()
