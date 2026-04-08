@@ -35,6 +35,27 @@ class QuantEngine:
     # 時系列多変量回帰分析 (二段構え: 共通期間一括 or 個別加重平均)
     # =========================================================================
     @staticmethod
+    def build_portfolio_return_series(df_hist_ret, df_weights, coverage_floor=0.80):
+        if df_hist_ret.empty or df_weights.empty:
+            return pd.Series(dtype=float), pd.Series(dtype=float)
+
+        valid_tickers = [t for t in df_weights['Ticker'] if t in df_hist_ret.columns]
+        if not valid_tickers:
+            return pd.Series(dtype=float), pd.Series(dtype=float)
+
+        weight_map = dict(zip(df_weights['Ticker'], df_weights['Weight']))
+        w_series = pd.Series({t: weight_map[t] for t in valid_tickers}, dtype=float)
+        if w_series.sum() <= 0:
+            return pd.Series(dtype=float), pd.Series(dtype=float)
+        w_series = w_series / w_series.sum()
+
+        partial_rets = df_hist_ret[valid_tickers].copy()
+        available_weight = partial_rets.notna().mul(w_series, axis=1).sum(axis=1)
+        weighted_sum = partial_rets.mul(w_series, axis=1).sum(axis=1, skipna=True)
+        port_ret = (weighted_sum / available_weight).where(available_weight >= coverage_floor)
+        return port_ret.dropna(), available_weight
+
+    @staticmethod
     def build_individual_regression_table(df_hist_ret, df_weights, df_ff5, min_n_obs=24):
         if df_hist_ret.empty or df_ff5.empty or df_weights.empty or sm is None:
             return pd.DataFrame()
@@ -174,11 +195,12 @@ class QuantEngine:
                 # 大型バスケットでは全銘柄の完全共通期間が極端に短くなりやすいため、
                 # 各月で観測できた銘柄だけにウェイトを再配分してポートフォリオ系列を作る。
                 # -------------------------------------------------------------
-                partial_rets = df_hist_ret[valid_tickers].copy()
-                available_weight = partial_rets.notna().mul(w_series, axis=1).sum(axis=1)
-                weighted_sum = partial_rets.mul(w_series, axis=1).sum(axis=1, skipna=True)
                 coverage_floor = 0.80
-                port_ret_reweighted = (weighted_sum / available_weight).where(available_weight >= coverage_floor)
+                port_ret_reweighted, available_weight = QuantEngine.build_portfolio_return_series(
+                    df_hist_ret[valid_tickers],
+                    pd.DataFrame({'Ticker': valid_tickers, 'Weight': w_series.values}),
+                    coverage_floor=coverage_floor,
+                )
                 aligned_reweighted = pd.concat([port_ret_reweighted.rename('Port_Ret'), df_ff5], axis=1, join='inner').dropna()
                 n_reweighted_obs = len(aligned_reweighted)
 

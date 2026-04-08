@@ -499,6 +499,40 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
     }
     insights = QuantEngine.generate_insights(exposures)
 
+    benchmark_diag = None
+    try:
+        nikkei_frame = DataProvider.fetch_market_rates(days=365 * lookback_years)
+        portfolio_series, coverage_series = QuantEngine.build_portfolio_return_series(hist_ret, weight_df, coverage_floor=0.80)
+        aligned_benchmark = pd.concat(
+            [
+                portfolio_series.rename("portfolio"),
+                nikkei_frame.get("Rm", pd.Series(dtype=float)).rename("nikkei"),
+            ],
+            axis=1,
+            join="inner",
+        ).dropna()
+        if len(aligned_benchmark) >= 12:
+            corr = float(aligned_benchmark["portfolio"].corr(aligned_benchmark["nikkei"]))
+            benchmark_var = float(aligned_benchmark["nikkei"].var())
+            beta_vs_nikkei = (
+                float(aligned_benchmark["portfolio"].cov(aligned_benchmark["nikkei"]) / benchmark_var)
+                if benchmark_var > 0
+                else 0.0
+            )
+            tracking_error = float((aligned_benchmark["portfolio"] - aligned_benchmark["nikkei"]).std() * np.sqrt(12.0))
+            mean_gap = float((aligned_benchmark["portfolio"] - aligned_benchmark["nikkei"]).mean() * 12.0)
+            avg_cov = float(coverage_series.loc[aligned_benchmark.index].mean()) if not coverage_series.empty else float("nan")
+            benchmark_diag = {
+                "months": int(len(aligned_benchmark)),
+                "correlation": corr,
+                "beta_vs_nikkei": beta_vs_nikkei,
+                "tracking_error": tracking_error,
+                "annual_gap": mean_gap,
+                "avg_coverage": avg_cov,
+            }
+    except Exception:
+        benchmark_diag = None
+
     form = f"""
     <form class="control-grid" method="post" enctype="multipart/form-data">
       <label>モード
@@ -538,6 +572,25 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
             ("Alpha", f"{float(regression.get('Alpha', 0.0)):.4f}"),
         ]
     )
+
+    benchmark_metrics_html = ""
+    benchmark_note_html = ""
+    if benchmark_diag is not None:
+        benchmark_metrics_html = _render_metrics(
+            [
+                ("対N225相関", f"{benchmark_diag['correlation']:.3f}"),
+                ("対N225ベータ", f"{benchmark_diag['beta_vs_nikkei']:.3f}"),
+                ("対N225追随誤差", f"{benchmark_diag['tracking_error']:.3f}"),
+                ("比較月数", str(benchmark_diag["months"])),
+            ]
+        )
+        benchmark_note_html = (
+            "<p class='note'>"
+            "上の Market Beta は Ken French Japan の Mkt-RF に対する値です。"
+            " こちらは、アップロードしたバスケットが実際の ^N225 月次リターンにどれくらい追随しているかの診断です。"
+            f" 平均月次カバレッジ {benchmark_diag['avg_coverage'] * 100:.1f}% / 年率ギャップ {benchmark_diag['annual_gap']:.3f}"
+            "</p>"
+        )
 
     table = pd.DataFrame(
         [
@@ -708,6 +761,8 @@ def _render_page(params: dict[str, str], files: dict[str, dict[str, object]]) ->
       <p class="note">{escape(note)}</p>
       {diagnostics_html}
       {metrics}
+      {benchmark_metrics_html}
+      {benchmark_note_html}
       {preview_html}
       <div class="two-col">
         {_bar_chart(exposures)}
