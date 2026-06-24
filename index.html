@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="ja" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>factor-simulator — Japan 5-Factor シミュレーター</title>
+<meta name="description" content="Fama-French 風の日本 5 ファクター(Mkt-RF / SMB / HML / RMW / CMA)を題材にしたファクター戦略シミュレーター。`Japan_5_Factors.csv` をロードし、`quant_engine.py` で戦略構築、Vercel 経由でも軽量 UI を配信。">
+<meta property="og:title" content="factor-simulator">
+<meta property="og:description" content="Fama-French 風の日本 5 ファクター(Mkt-RF / SMB / HML / RMW / CMA)を題材にしたファクター戦略シミュレーター。`Japan_5_Factors.csv` をロードし、`quant_engine.py` で戦略構築、Vercel 経由でも軽量 UI を配信。">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://github.com/shihuiarenjinba-png/factor-simulator">
+<meta name="twitter:card" content="summary">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='14' font-size='14'%3E🧮%3C/text%3E%3C/svg%3E">
+<style>
+*,*::before,*::after{box-sizing:border-box}
+:root{
+  --bg:#f8fafc;--surface:#fff;--surface-2:#f1f5f9;--border:#e2e8f0;
+  --text:#0f172a;--text-mute:#64748b;--text-soft:#334155;
+  --accent:#0ea5e9;--accent-hi:#0284c7;--accent-soft:#e0f2fe;
+  --ok:#10b981;--warn:#f59e0b;--danger:#ef4444;
+  --shadow:0 1px 3px rgb(0 0 0 / .04),0 4px 12px rgb(0 0 0 / .04);
+  --radius:12px;--radius-sm:8px;
+}
+html[data-theme="dark"],html[data-theme="auto"] body.dark{
+  --bg:#0a0f1a;--surface:#0f172a;--surface-2:#1e293b;--border:#1f2a3a;
+  --text:#f1f5f9;--text-mute:#94a3b8;--text-soft:#cbd5e1;
+  --accent:#38bdf8;--accent-hi:#0ea5e9;--accent-soft:#0c4a6e;
+  --shadow:0 1px 3px rgb(0 0 0 / .3),0 4px 12px rgb(0 0 0 / .3);
+}
+@media(prefers-color-scheme:dark){
+  html[data-theme="auto"]:not(.theme-forced){
+    --bg:#0a0f1a;--surface:#0f172a;--surface-2:#1e293b;--border:#1f2a3a;
+    --text:#f1f5f9;--text-mute:#94a3b8;--text-soft:#cbd5e1;
+    --accent:#38bdf8;--accent-hi:#0ea5e9;--accent-soft:#0c4a6e;
+    --shadow:0 1px 3px rgb(0 0 0 / .3),0 4px 12px rgb(0 0 0 / .3);
+  }
+}
+html,body{margin:0;padding:0;height:100%;background:var(--bg);color:var(--text)}
+body{
+  font-family:system-ui,-apple-system,"Hiragino Sans","Yu Gothic","Noto Sans CJK JP","Noto Sans JP",sans-serif;
+  line-height:1.6;font-feature-settings:"palt";
+  -webkit-text-size-adjust:100%;
+}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code,kbd{font-family:ui-monospace,"SF Mono",Consolas,"Menlo",monospace;font-size:.92em}
+kbd{
+  background:var(--surface-2);border:1px solid var(--border);border-bottom-width:2px;
+  border-radius:4px;padding:1px 6px;font-size:.82em;color:var(--text-soft);
+}
+.app{max-width:840px;margin:0 auto;padding:24px 20px 64px}
+header.hdr{display:flex;align-items:center;gap:12px;margin-bottom:24px}
+header.hdr .icon{font-size:30px;line-height:1}
+header.hdr h1{margin:0;font-size:24px;font-weight:700;letter-spacing:-.01em;flex:1}
+header.hdr .spacer{flex:1}
+.theme-btn,.icon-btn{
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);
+  width:36px;height:36px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;
+  font-size:16px;color:var(--text-soft);transition:.15s;
+}
+.theme-btn:hover,.icon-btn:hover{background:var(--surface-2);color:var(--text)}
+.badge-row{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px}
+.badge{
+  display:inline-block;background:var(--accent-soft);color:var(--accent-hi);
+  padding:3px 10px;border-radius:999px;font-size:12px;font-weight:600;letter-spacing:.01em;
+}
+.badge.alt{background:var(--surface-2);color:var(--text-soft)}
+.hero{
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+  padding:20px 22px;margin-bottom:20px;box-shadow:var(--shadow);
+}
+.hero p{margin:0;font-size:15.5px;color:var(--text-soft)}
+.actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:24px}
+.action{
+  display:flex;flex-direction:column;align-items:flex-start;justify-content:space-between;
+  padding:14px 16px;background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);cursor:pointer;text-decoration:none!important;color:var(--text);
+  transition:.15s;box-shadow:var(--shadow);position:relative;min-height:88px;
+}
+.action:hover{transform:translateY(-1px);border-color:var(--accent);color:var(--text)}
+.action.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.action.primary .hint{color:rgb(255 255 255 / .8)}
+.action.primary:hover{background:var(--accent-hi);border-color:var(--accent-hi);color:#fff}
+.action .top{display:flex;align-items:center;gap:8px;font-weight:600;font-size:15px}
+.action .top .key{
+  background:rgb(0 0 0 / .08);border-radius:4px;padding:1px 6px;font-size:11px;font-weight:700;
+  font-family:ui-monospace,monospace;letter-spacing:.02em;
+}
+.action.primary .top .key{background:rgb(255 255 255 / .22)}
+.action .hint{font-size:12.5px;color:var(--text-mute);margin-top:4px}
+section{
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+  padding:18px 22px;margin-bottom:14px;box-shadow:var(--shadow);
+}
+section h2{margin:0 0 12px;font-size:15px;font-weight:700;color:var(--text);letter-spacing:.01em}
+section ul{margin:0;padding-left:20px}
+section ul li{margin:3px 0;color:var(--text-soft)}
+details summary{cursor:pointer;list-style:none;font-weight:600;color:var(--text);user-select:none}
+details summary::-webkit-details-marker{display:none}
+details summary::before{content:"▸ ";color:var(--text-mute);transition:.15s;display:inline-block}
+details[open] summary::before{transform:rotate(90deg)}
+pre.code{
+  background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:12px 14px;overflow:auto;font-size:13px;color:var(--text-soft);
+  position:relative;margin:10px 0 0;
+}
+pre.code .copy{
+  position:absolute;top:8px;right:8px;background:var(--surface);border:1px solid var(--border);
+  border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer;color:var(--text-mute);
+  font-family:inherit;
+}
+pre.code .copy:hover{color:var(--text)}
+pre.code .copy.ok{background:var(--ok);color:#fff;border-color:var(--ok)}
+footer.ftr{margin-top:24px;font-size:12.5px;color:var(--text-mute);text-align:center}
+footer.ftr a{color:var(--text-mute);text-decoration:underline}
+.toast{
+  position:fixed;bottom:24px;left:50%;transform:translate(-50%,80px);
+  background:var(--text);color:var(--bg);padding:10px 18px;border-radius:999px;
+  font-size:13px;font-weight:600;opacity:0;transition:.25s;pointer-events:none;z-index:9999;
+  box-shadow:0 8px 24px rgb(0 0 0 / .25);
+}
+.toast.show{transform:translate(-50%,0);opacity:1}
+.shortcuts-modal{
+  display:none;position:fixed;inset:0;background:rgb(0 0 0 / .5);z-index:1000;
+  align-items:center;justify-content:center;padding:20px;
+}
+.shortcuts-modal.show{display:flex}
+.shortcuts-modal .box{
+  background:var(--surface);border-radius:var(--radius);padding:24px;max-width:380px;width:100%;
+  border:1px solid var(--border);box-shadow:0 16px 48px rgb(0 0 0 / .3);
+}
+.shortcuts-modal h3{margin:0 0 14px;font-size:16px}
+.shortcuts-modal .row{display:flex;justify-content:space-between;padding:6px 0;font-size:14px;color:var(--text-soft)}
+.shortcuts-modal kbd{margin-left:4px}
+@media(max-width:480px){
+  .app{padding:16px 14px 48px}
+  header.hdr h1{font-size:20px}
+  .actions{grid-template-columns:1fr 1fr}
+}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <header class="hdr">
+    <div class="icon">🧮</div>
+    <h1>factor-simulator</h1>
+    <button class="icon-btn" id="shortcuts-toggle" title="ショートカット表示 (?)" aria-label="shortcuts">?</button>
+    <button class="theme-btn" id="theme-toggle" title="テーマ切替" aria-label="theme">🌗</button>
+  </header>
+
+  <div class="badge-row">
+    <span class="badge">Lab</span>
+    <span class="badge alt">Python</span><span class="badge alt">Streamlit</span><span class="badge">Vercel</span>
+  </div>
+
+  <div class="hero">
+    <p>Fama-French 風の日本 5 ファクター(Mkt-RF / SMB / HML / RMW / CMA)を題材にしたファクター戦略シミュレーター。`Japan_5_Factors.csv` をロードし、`quant_engine.py` で戦略構築、Vercel 経由でも軽量 UI を配信。</p>
+  </div>
+
+  <div class="actions">
+    <a class="action primary" href="https://github.com/shihuiarenjinba-png/factor-simulator" id="act-github" target="_blank" rel="noopener">
+      <div class="top">📦 GitHub <span class="key">G</span></div>
+      <div class="hint">ソースコード・Issue を見る</div>
+    </a>
+    <a class="action" href="https://github.com/shihuiarenjinba-png/factor-simulator#readme" id="act-readme" target="_blank" rel="noopener">
+      <div class="top">📖 README <span class="key">R</span></div>
+      <div class="hint">セットアップと使い方</div>
+    </a>
+    <button class="action" id="act-copy" type="button">
+      <div class="top">⎘ 起動コマンド <span class="key">C</span></div>
+      <div class="hint">クリップボードへコピー</div>
+    </button>
+    <a class="action" href="https://bpp-676x.vercel.app" id="act-deploy" target="_blank" rel="noopener">
+      <div class="top">🚀 Vercel で見る <span class="key">D</span></div>
+      <div class="hint">bpp-676x.vercel.app</div>
+    </a>
+  </div>
+
+  <section>
+    <h2>主要機能</h2>
+    <ul>
+      <li>`Japan_5_Factors.csv` 同梱で即座にローカル動作</li>
+      <li>`quant_engine.py` でファクター戦略の組み立て</li>
+      <li>`universe_manager.py` で銘柄ユニバース管理</li>
+      <li>`data_provider.py` でデータソース統一</li>
+      <li>Vercel `api/index.py` 経由で軽量 web 配信</li>
+    </ul>
+  </section>
+
+  <section>
+    <details open>
+      <summary>クイックスタート</summary>
+      <pre class="code"><button class="copy" data-copy="quick">Copy</button><code id="cmd-quick">git clone https://github.com/shihuiarenjinba-png/factor-simulator.git
+cd factor-simulator
+pip install -r requirements-local.txt
+streamlit run app.py</code></pre>
+    </details>
+  </section>
+
+  
+
+  <footer class="ftr">
+    <a href="https://github.com/shihuiarenjinba-png/factor-simulator" target="_blank" rel="noopener">shihuiarenjinba-png/factor-simulator</a>
+    <span style="margin:0 6px">·</span>
+    Generated 2026-06-23
+  </footer>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<div class="shortcuts-modal" id="shortcuts-modal" aria-hidden="true">
+  <div class="box">
+    <h3>キーボードショートカット</h3>
+    <div class="row"><span>GitHub を開く</span><span><kbd>G</kbd></span></div>
+    <div class="row"><span>README を開く</span><span><kbd>R</kbd></span></div>
+    <div class="row"><span>起動コマンドをコピー</span><span><kbd>C</kbd></span></div>
+    <div class="row"><span>デプロイ先を開く</span><span><kbd>D</kbd></span></div>
+    <div class="row"><span>テーマ切替</span><span><kbd>T</kbd></span></div>
+    <div class="row"><span>このダイアログ</span><span><kbd>?</kbd> / <kbd>Esc</kbd> で閉じる</span></div>
+  </div>
+</div>
+
+<script>
+(function(){
+  const $ = (s) => document.querySelector(s);
+  const html = document.documentElement;
+  const toast = $("#toast");
+  const modal = $("#shortcuts-modal");
+
+  // ---------- theme ----------
+  const storedTheme = localStorage.getItem("theme") || "auto";
+  applyTheme(storedTheme);
+  function applyTheme(t){
+    if(t === "auto"){
+      html.setAttribute("data-theme","auto");
+      html.classList.remove("theme-forced");
+      document.body.classList.remove("dark");
+    } else if(t === "dark"){
+      html.setAttribute("data-theme","dark");
+      html.classList.add("theme-forced");
+    } else {
+      html.setAttribute("data-theme","light");
+      html.classList.add("theme-forced");
+    }
+  }
+  $("#theme-toggle").addEventListener("click", ()=>{
+    const cur = localStorage.getItem("theme") || "auto";
+    const next = cur === "auto" ? "dark" : cur === "dark" ? "light" : "auto";
+    localStorage.setItem("theme", next);
+    applyTheme(next);
+    showToast("テーマ: " + (next === "auto" ? "自動" : next === "dark" ? "ダーク" : "ライト"));
+  });
+
+  // ---------- toast ----------
+  let toastTimer = null;
+  function showToast(msg){
+    toast.textContent = msg;
+    toast.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(()=>toast.classList.remove("show"), 1600);
+  }
+
+  // ---------- copy ----------
+  function copyTarget(id){
+    const node = document.getElementById(id);
+    if(!node) return;
+    const text = node.textContent.trim();
+    navigator.clipboard.writeText(text).then(()=>{
+      showToast("コピーしました");
+    }).catch(()=> showToast("コピー失敗"));
+  }
+  document.querySelectorAll(".copy[data-copy]").forEach(btn=>{
+    btn.addEventListener("click", e=>{
+      e.preventDefault();
+      const target = btn.getAttribute("data-copy");
+      copyTarget("cmd-" + target);
+      btn.classList.add("ok"); btn.textContent = "Copied!";
+      setTimeout(()=>{ btn.classList.remove("ok"); btn.textContent = "Copy"; }, 1200);
+    });
+  });
+  $("#act-copy").addEventListener("click", ()=> copyTarget("cmd-quick"));
+
+  // ---------- shortcuts modal ----------
+  function openModal(){ modal.classList.add("show"); modal.setAttribute("aria-hidden","false"); }
+  function closeModal(){ modal.classList.remove("show"); modal.setAttribute("aria-hidden","true"); }
+  $("#shortcuts-toggle").addEventListener("click", openModal);
+  modal.addEventListener("click", e=>{ if(e.target === modal) closeModal(); });
+
+  // ---------- keyboard shortcuts ----------
+  document.addEventListener("keydown", e=>{
+    if(e.metaKey || e.ctrlKey || e.altKey) return;
+    if(/INPUT|TEXTAREA/.test(document.activeElement.tagName)) return;
+    const k = e.key.toLowerCase();
+    if(k === "escape") return closeModal();
+    if(k === "?" || (e.shiftKey && k === "/")) { e.preventDefault(); return openModal(); }
+    if(modal.classList.contains("show")) return;
+    if(k === "g")  { e.preventDefault(); $("#act-github").click(); }
+    else if(k === "r") { e.preventDefault(); $("#act-readme").click(); }
+    else if(k === "c") { e.preventDefault(); $("#act-copy").click(); }
+    else if(k === "d") { const d = $("#act-deploy"); if(d){ e.preventDefault(); d.click(); } else { showToast("デプロイ先は未設定"); } }
+    else if(k === "t") { e.preventDefault(); $("#theme-toggle").click(); }
+  });
+})();
+</script>
+</body>
+</html>
