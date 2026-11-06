@@ -29,6 +29,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Compile advisor pages
-        run: python -m py_compile industry_benchmark.py edinet_api.py pages/industry_benchmark_advisor.py pages/edinet_financial_advisor.py
+        run: python -m py_compile industry_benchmark.py edinet_api.py edinet_store.py tools/build_edinet_sqlite.py pages/industry_benchmark_advisor.py pages/edinet_financial_advisor.py
       - name: Run advisor unit tests
-        run: python -m unittest tests/test_industry_benchmark.py tests/test_edinet_registry.py tests/test_edinet_api.py -v
+        run: python -m unittest tests/test_industry_benchmark.py tests/test_edinet_registry.py tests/test_edinet_api.py tests/test_edinet_store.py -v
