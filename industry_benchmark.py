@@ -1,179 +1,193 @@
-"""Industry benchmark advisor: pure calculation and interpretation logic.
+"""Japan-market industry benchmark advisor.
 
-Benchmarks are starter reference ranges, not guarantees or professional advice.
-They are deliberately kept separate from the Streamlit UI so formulas can be tested.
+Official Japan-wide reference values are versioned under data/.
+EDINET company-level observations are intentionally kept in a separate registry.
+The product's caution/danger lines are transparent heuristics, not government cutoffs.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from pathlib import Path
 from typing import Optional
 
-
-@dataclass(frozen=True)
-class Range:
-    low: float
-    high: float
-    direction: str = "higher"  # "higher" for margins, "band" for ratios.
-
-
-BENCHMARKS = {
-    "restaurant": {
-        "label": "飲食・レストラン",
-        "gross_margin": Range(55.0, 65.0, "higher"),
-        "net_margin": Range(3.0, 9.0, "higher"),
-        "labor_ratio": Range(28.0, 35.0, "band"),
-    },
-    "retail": {
-        "label": "小売・EC",
-        "gross_margin": Range(20.0, 50.0, "higher"),
-        "net_margin": Range(2.0, 5.0, "higher"),
-        "labor_ratio": Range(10.0, 20.0, "band"),
-    },
-    "manufacturing": {
-        "label": "製造業",
-        "gross_margin": Range(25.0, 35.0, "higher"),
-        "net_margin": Range(5.0, 10.0, "higher"),
-        "labor_ratio": Range(15.0, 30.0, "band"),
-    },
-    "professional_services": {
-        "label": "コンサル・士業・専門サービス",
-        "gross_margin": Range(50.0, 70.0, "higher"),
-        "net_margin": Range(15.0, 25.0, "higher"),
-        "labor_ratio": Range(30.0, 50.0, "band"),
-    },
-    "saas": {
-        "label": "SaaS・ソフトウェア",
-        "gross_margin": Range(60.0, 80.0, "higher"),
-        "net_margin": Range(10.0, 20.0, "higher"),
-        "labor_ratio": None,
-    },
-}
-
+ROOT = Path(__file__).resolve().parent
+DATA = json.loads((ROOT / "data" / "jp_benchmarks_2024.json").read_text(encoding="utf-8"))
+BENCHMARKS = DATA["industries"]
 SOURCE_NOTES = [
-    "Xero (2026): profitability ratio examples by industry — gross/net margin reference ranges.",
-    "WorkCalcs (2026): labor-cost percentage examples by industry.",
-    "These are broad reference ranges. Company size, country, growth stage and accounting policy can materially change a healthy value.",
+    "日本市場向け。業界参考値は財務省「法人企業統計」を主な一次ソースとします。",
+    "注意・危険ラインは政府の認定基準ではなく、業界参考値からの乖離を可視化する本ツール独自ルールです。",
+    "将来の企業別分布はEDINET有価証券報告書から日本基準(J-GAAP)提出企業を優先して別系列で集計します。",
 ]
 
 
-def _require_nonnegative(name: str, value: float) -> float:
+def _num(name: str, value: Optional[float], *, positive: bool = False) -> Optional[float]:
+    if value is None:
+        return None
     value = float(value)
-    if value < 0:
-        raise ValueError(f"{name} must be non-negative")
+    if positive and value <= 0:
+        raise ValueError(f"{name} は0より大きい値が必要です")
     return value
+
+
+def _avg(current: Optional[float], prior: Optional[float]) -> Optional[float]:
+    if current is None:
+        return None
+    if prior is None or prior <= 0:
+        return current
+    return (current + prior) / 2.0
 
 
 def calculate_metrics(
     *,
     revenue: float,
-    cogs: float,
-    net_profit: float,
-    labor_cost: float,
-    fixed_costs: float,
+    operating_profit: float,
+    ordinary_profit: float,
+    net_profit: float = 0.0,
+    current_total_assets: Optional[float] = None,
+    prior_total_assets: Optional[float] = None,
+    equity: Optional[float] = None,
+    current_inventory: Optional[float] = None,
+    prior_inventory: Optional[float] = None,
+    current_receivables: Optional[float] = None,
+    prior_receivables: Optional[float] = None,
 ) -> dict:
-    revenue = float(revenue)
-    if revenue <= 0:
-        raise ValueError("revenue must be greater than zero")
-    cogs = _require_nonnegative("cogs", cogs)
-    labor_cost = _require_nonnegative("labor_cost", labor_cost)
-    fixed_costs = _require_nonnegative("fixed_costs", fixed_costs)
-    net_profit = float(net_profit)
+    revenue = _num("売上高", revenue, positive=True)
+    operating_profit = _num("営業利益", operating_profit)
+    ordinary_profit = _num("経常利益", ordinary_profit)
+    net_profit = _num("当期純利益", net_profit)
 
-    gross_profit = revenue - cogs
-    gross_margin = gross_profit / revenue * 100.0
-    net_margin = net_profit / revenue * 100.0
-    labor_ratio = labor_cost / revenue * 100.0
+    current_total_assets = _num("総資産", current_total_assets)
+    prior_total_assets = _num("前期総資産", prior_total_assets)
+    equity = _num("自己資本", equity)
+    current_inventory = _num("棚卸資産", current_inventory)
+    prior_inventory = _num("前期棚卸資産", prior_inventory)
+    current_receivables = _num("売上債権", current_receivables)
+    prior_receivables = _num("前期売上債権", prior_receivables)
 
-    contribution_ratio = gross_margin / 100.0
-    break_even_revenue: Optional[float]
-    if contribution_ratio > 0:
-        break_even_revenue = fixed_costs / contribution_ratio
-    else:
-        break_even_revenue = None
+    avg_assets = _avg(current_total_assets, prior_total_assets)
+    avg_inventory = _avg(current_inventory, prior_inventory)
+    avg_receivables = _avg(current_receivables, prior_receivables)
 
+    metrics = {
+        "operating_margin": operating_profit / revenue * 100.0,
+        "ordinary_margin": ordinary_profit / revenue * 100.0,
+        "net_margin": net_profit / revenue * 100.0,
+        "ordinary_roa": None,
+        "equity_ratio": None,
+        "inventory_months": None,
+        "receivable_months": None,
+    }
+    if avg_assets and avg_assets > 0:
+        metrics["ordinary_roa"] = ordinary_profit / avg_assets * 100.0
+    if current_total_assets and current_total_assets > 0 and equity is not None:
+        metrics["equity_ratio"] = equity / current_total_assets * 100.0
+    if avg_inventory is not None:
+        metrics["inventory_months"] = avg_inventory / (revenue / 12.0)
+    if avg_receivables is not None:
+        metrics["receivable_months"] = avg_receivables / (revenue / 12.0)
+    return metrics
+
+
+def industry_spec(industry: str, subindustry: Optional[str] = None) -> dict:
+    if industry not in BENCHMARKS:
+        raise KeyError(f"未対応の業種です: {industry}")
+    base = json.loads(json.dumps(BENCHMARKS[industry]))
+    if subindustry and subindustry in base.get("subindustry_overrides", {}):
+        override = base["subindustry_overrides"][subindustry]
+        base["label"] = override["label"]
+        for metric, values in override.get("metrics", {}).items():
+            base["metrics"][metric].update(values)
+    return base
+
+
+def thresholds(reference: float, direction: str) -> dict:
+    policy = DATA["threshold_policy"]
+    if direction == "higher":
+        return {
+            "caution": reference * policy["higher_is_better"]["caution_below_reference_ratio"],
+            "danger": reference * policy["higher_is_better"]["danger_below_reference_ratio"],
+        }
     return {
-        "revenue": revenue,
-        "gross_profit": gross_profit,
-        "gross_margin": gross_margin,
-        "net_margin": net_margin,
-        "labor_ratio": labor_ratio,
-        "break_even_revenue": break_even_revenue,
+        "caution": reference * policy["lower_is_better"]["caution_above_reference_ratio"],
+        "danger": reference * policy["lower_is_better"]["danger_above_reference_ratio"],
     }
 
 
-def classify(value: float, benchmark: Range) -> tuple[str, str, int]:
-    """Return status, plain-language interpretation, and 0-100 subscore."""
-    low, high = benchmark.low, benchmark.high
-    if benchmark.direction == "higher":
-        if value < low:
-            score = max(0, min(99, round(100 * value / low))) if low > 0 else 0
-            return "warning", f"目安の下限 {low:.1f}% を下回っています", score
-        if value <= high:
-            return "healthy", f"目安 {low:.1f}–{high:.1f}% の範囲です", 100
-        return "strong", f"目安上限 {high:.1f}% を上回っています", 100
+def classify(value: float, metric: dict) -> tuple[str, str, int, dict]:
+    reference = float(metric["reference"])
+    direction = metric["direction"]
+    cut = thresholds(reference, direction)
 
-    if low <= value <= high:
-        return "healthy", f"目安 {low:.1f}–{high:.1f}% の範囲です", 100
-    if value > high:
-        excess = value - high
-        score = max(0, round(100 - excess * 5))
-        return "warning", f"目安上限 {high:.1f}% を {excess:.1f}pt 上回っています", score
+    if direction == "higher":
+        if value < cut["danger"]:
+            return "danger", f"危険ライン {cut['danger']:.2f}{metric['unit']} を下回っています", 20, cut
+        if value < cut["caution"]:
+            score = max(21, min(69, round(value / cut["caution"] * 70))) if cut["caution"] else 21
+            return "warning", f"注意ライン {cut['caution']:.2f}{metric['unit']} を下回っています", score, cut
+        if value < reference:
+            return "watch", f"業界参考値 {reference:.2f}{metric['unit']} をやや下回っています", 80, cut
+        return "healthy", f"業界参考値 {reference:.2f}{metric['unit']} 以上です", 100, cut
 
-    gap = low - value
-    score = max(0, round(90 - gap * 2))
-    return "watch", f"目安下限 {low:.1f}% を {gap:.1f}pt 下回っています。省人化か人員不足かを確認してください", score
+    if value > cut["danger"]:
+        return "danger", f"危険ライン {cut['danger']:.2f}{metric['unit']} を上回っています", 20, cut
+    if value > cut["caution"]:
+        return "warning", f"注意ライン {cut['caution']:.2f}{metric['unit']} を上回っています", 60, cut
+    if value > reference:
+        return "watch", f"業界参考値 {reference:.2f}{metric['unit']} より長めです", 80, cut
+    return "healthy", f"業界参考値 {reference:.2f}{metric['unit']} 以下です", 100, cut
 
 
-def diagnose(industry: str, metrics: dict) -> dict:
-    if industry not in BENCHMARKS:
-        raise KeyError(f"unknown industry: {industry}")
-    spec = BENCHMARKS[industry]
-    rows = []
-    advice = []
+ADVICE = {
+    "operating_margin": "本業の利益率です。低い場合は価格、製品ミックス、原価、販管費を順に分解してください。",
+    "ordinary_margin": "営業外損益を含む通常の収益力です。営業利益との差が大きい場合は支払利息などを確認してください。",
+    "ordinary_roa": "総資産に対する通常の収益力です。利益率と資産回転のどちらが弱いか分解してください。",
+    "equity_ratio": "財務の耐久力を見る指標です。低い場合は借入依存と利益蓄積の推移を確認してください。",
+    "inventory_months": "在庫が売上の何か月分あるかを見る指標です。長い場合は滞留在庫・生産計画・販売速度を確認してください。",
+    "receivable_months": "売上債権の回収期間の目安です。長い場合は回収条件・滞留債権・顧客構成を確認してください。",
+}
 
-    for key, title in (
-        ("gross_margin", "粗利率"),
-        ("net_margin", "純利益率"),
-        ("labor_ratio", "人件費率"),
-    ):
-        benchmark = spec.get(key)
-        if benchmark is None:
+
+def diagnose(industry: str, metrics: dict, subindustry: Optional[str] = None) -> dict:
+    spec = industry_spec(industry, subindustry)
+    rows, advice, sources = [], [], set()
+
+    for key, metric in spec["metrics"].items():
+        value = metrics.get(key)
+        if value is None:
             continue
-        status, message, score = classify(float(metrics[key]), benchmark)
+        status, message, score, cut = classify(float(value), metric)
+        source_id = metric["source"]
+        sources.add(source_id)
         rows.append({
             "metric": key,
-            "title": title,
-            "value": float(metrics[key]),
-            "benchmark_low": benchmark.low,
-            "benchmark_high": benchmark.high,
+            "title": metric["label"],
+            "value": float(value),
+            "unit": metric["unit"],
+            "reference": float(metric["reference"]),
+            "caution": cut["caution"],
+            "danger": cut["danger"],
+            "direction": metric["direction"],
             "status": status,
             "message": message,
             "score": score,
+            "source": source_id,
         })
-
-        if key == "gross_margin" and status == "warning":
-            advice.append("粗利率が低めです。値上げ余地、仕入原価、原価の高い商品・案件を順番に確認してください。")
-        elif key == "net_margin" and status == "warning":
-            advice.append("純利益率が低めです。固定費と販管費を金額順に並べ、売上を落とさず削れる費用から確認してください。")
-        elif key == "labor_ratio" and status == "warning":
-            advice.append("人件費率が高めです。売上の弱い時間帯・案件とシフト/工数の対応を確認してください。")
-        elif key == "labor_ratio" and status == "watch":
-            advice.append("人件費率は低めです。効率が良い可能性もありますが、欠員・過重労働・外注費への付け替えがないか確認してください。")
+        if status in {"danger", "warning", "watch"}:
+            advice.append((score, ADVICE[key]))
 
     overall_score = round(sum(row["score"] for row in rows) / len(rows)) if rows else 0
+    advice.sort(key=lambda item: item[0])
     if not advice:
-        advice.append("主要比率は参考レンジ内です。次は月次推移を見て、悪化し始めた指標を先に確認してください。")
-
-    be = metrics.get("break_even_revenue")
-    if be is None:
-        advice.insert(0, "粗利がプラスでないため、固定費を回収する損益分岐売上を計算できません。価格・原価を先に見直してください。")
-    elif metrics["revenue"] < be:
-        advice.insert(0, f"現在売上は概算損益分岐売上を下回ります。まず約 {be - metrics['revenue']:,.0f} の売上差を埋めるか固定費を下げる必要があります。")
+        advice = [(100, "入力された主要指標は現在の参考値から大きく外れていません。次は3〜5年の推移で悪化方向がないか確認してください。")]
 
     return {
         "industry": industry,
         "industry_label": spec["label"],
+        "benchmark_version": DATA["benchmark_version"],
+        "period": DATA["period"],
         "score": overall_score,
         "rows": rows,
-        "advice": advice[:3],
+        "advice": [text for _, text in advice[:3]],
+        "sources": [DATA["sources"][source_id] for source_id in sorted(sources)],
+        "threshold_note": DATA["threshold_policy"]["note"],
     }
