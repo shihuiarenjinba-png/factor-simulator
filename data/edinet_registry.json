@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "market": "JP",
+  "purpose": "EDINET有価証券報告書から取得した企業別ベンチマーク原票を、出典・会計基準・年度・SHA付きで版管理するための台帳。",
+  "policy": {
+    "preferred_accounting_standard": "J-GAAP",
+    "include_ifrs_in_jgaap_benchmark": false,
+    "overwrite_existing_filing": false,
+    "required_fields": [
+      "edinet_code",
+      "doc_id",
+      "company_name",
+      "fiscal_year_end",
+      "accounting_standard",
+      "taxonomy_year",
+      "industry",
+      "source_url",
+      "retrieved_at",
+      "source_sha256"
+    ]
+  },
+  "filings": []
+}

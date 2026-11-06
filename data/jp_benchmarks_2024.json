@@ -1,0 +1,202 @@
+{
+  "schema_version": 1,
+  "market": "JP",
+  "currency": "JPY",
+  "benchmark_version": "MOF_2024_ANNUAL_V1",
+  "period": "FY2024",
+  "published_date": "2025-09-01",
+  "accounting_scope_note": "日本市場向け。商用版の主基準は公的な集計統計と公的機関が示す一般的な財務目安。企業別EDINETデータは本番診断の基準値には使用しない。",
+  "threshold_policy": {
+    "type": "official_guidance_first",
+    "note": "公的機関が明示する目安がある指標はその値を優先。業種別指標は公的集計値との相対比較に留め、根拠のない危険ラインを作らない。"
+  },
+  "sources": {
+    "mof_profitability_2024": {
+      "publisher": "財務省 財務総合政策研究所",
+      "title": "年次別法人企業統計調査（令和6年度） 売上高利益率の推移",
+      "url": "https://www.mof.go.jp/pri/reference/ssc/results/data.htm",
+      "retrieved_note": "製造業全規模: 売上高営業利益率5.4%、売上高経常利益率8.6%。全産業: 5.0%、6.8%。"
+    },
+    "mof_roa_2024": {
+      "publisher": "財務省 財務総合政策研究所",
+      "title": "法人企業統計からみえる企業の財務指標：総資本経常利益率",
+      "url": "https://www.mof.go.jp/pri/reference/ssc/zaimu/",
+      "retrieved_note": "製造業全規模6.8%、全産業全規模5.1%。"
+    },
+    "mof_equity_2024": {
+      "publisher": "財務省 財務総合政策研究所",
+      "title": "年次別法人企業統計調査（令和6年度） 自己資本比率",
+      "url": "https://www.mof.go.jp/pri/reference/ssc/results/data.htm",
+      "retrieved_note": "製造業全規模50.3%、全産業42.1%。"
+    },
+    "mof_inventory_2024": {
+      "publisher": "財務省 財務総合政策研究所",
+      "title": "法人企業統計からみえる企業の財務指標：棚卸資産回転期間",
+      "url": "https://www.mof.go.jp/pri/reference/ssc/zaimu/",
+      "retrieved_note": "製造業全規模1.64か月、全産業1.12か月。"
+    },
+    "mof_receivables_2024": {
+      "publisher": "財務省 財務総合政策研究所",
+      "title": "法人企業統計からみえる企業の財務指標：売上債権回転期間",
+      "url": "https://www.mof.go.jp/pri/reference/ssc/zaimu/",
+      "retrieved_note": "製造業全規模2.26か月、全産業1.93か月。"
+    },
+    "mof_formulas": {
+      "publisher": "財務省 財務総合政策研究所",
+      "title": "法人企業統計における財務営業比率の算式",
+      "url": "https://www.mof.go.jp/pri/reference/ssc/results/calculation.htm"
+    },
+    "jfc_current_ratio": {
+      "publisher": "日本政策金融公庫",
+      "title": "財務診断サービス 指標の見方：流動比率",
+      "url": "https://www.jfc.go.jp/n/zaimushindan/shihyo.html",
+      "retrieved_note": "流動比率が100％に満たない場合は、資金繰りの悪化が考えられると説明。"
+    },
+    "jfc_equity_ratio": {
+      "publisher": "日本政策金融公庫",
+      "title": "決算書の見方と活用：自己資本比率",
+      "url": "https://www.jfc.go.jp/n/finance/keiei/support-plus/detail/column.html?id=c55_392",
+      "retrieved_note": "業種によって異なるが、まず30％を超えているかが一つの目安と説明。"
+    }
+  },
+  "industries": {
+    "all": {
+      "label": "全産業（金融・保険を除く集計を含む）",
+      "metrics": {
+        "operating_margin": {
+          "label": "売上高営業利益率",
+          "reference": 5,
+          "unit": "%",
+          "direction": "higher",
+          "source": "mof_profitability_2024"
+        },
+        "ordinary_margin": {
+          "label": "売上高経常利益率",
+          "reference": 6.8,
+          "unit": "%",
+          "direction": "higher",
+          "source": "mof_profitability_2024"
+        },
+        "ordinary_roa": {
+          "label": "総資本経常利益率",
+          "reference": 5.1,
+          "unit": "%",
+          "direction": "higher",
+          "source": "mof_roa_2024"
+        },
+        "equity_ratio": {
+          "label": "自己資本比率",
+          "reference": 42.1,
+          "unit": "%",
+          "direction": "higher",
+          "source": "mof_equity_2024"
+        },
+        "inventory_months": {
+          "label": "棚卸資産回転期間",
+          "reference": 1.12,
+          "unit": "か月",
+          "direction": "lower",
+          "source": "mof_inventory_2024"
+        },
+        "receivable_months": {
+          "label": "売上債権回転期間",
+          "reference": 1.93,
+          "unit": "か月",
+          "direction": "lower",
+          "source": "mof_receivables_2024"
+        }
+      }
+    },
+    "manufacturing": {
+      "label": "製造業",
+      "metrics": {
+        "operating_margin": {
+          "label": "売上高営業利益率",
+          "reference": 5.4,
+          "unit": "%",
+          "direction": "higher",
+          "source": "mof_profitability_2024"
+        },
+        "ordinary_margin": {
+          "label": "売上高経常利益率",
+          "reference": 8.6,
+          "unit": "%",
+          "direction": "higher",
+          "source": "mof_profitability_2024"
+        },
+        "ordinary_roa": {
+          "label": "総資本経常利益率",
+          "reference": 6.8,
+          "unit": "%",
+          "direction": "higher",
+          "source": "mof_roa_2024"
+        },
+        "equity_ratio": {
+          "label": "自己資本比率",
+          "reference": 50.3,
+          "unit": "%",
+          "direction": "higher",
+          "source": "mof_equity_2024"
+        },
+        "inventory_months": {
+          "label": "棚卸資産回転期間",
+          "reference": 1.64,
+          "unit": "か月",
+          "direction": "lower",
+          "source": "mof_inventory_2024"
+        },
+        "receivable_months": {
+          "label": "売上債権回転期間",
+          "reference": 2.26,
+          "unit": "か月",
+          "direction": "lower",
+          "source": "mof_receivables_2024"
+        }
+      },
+      "subindustry_overrides": {
+        "food": {
+          "label": "食料品製造",
+          "metrics": {
+            "operating_margin": {
+              "reference": 3.6
+            },
+            "ordinary_margin": {
+              "reference": 5.5
+            }
+          }
+        },
+        "chemical": {
+          "label": "化学",
+          "metrics": {
+            "operating_margin": {
+              "reference": 8.5
+            },
+            "ordinary_margin": {
+              "reference": 12.3
+            }
+          }
+        }
+      }
+    }
+  },
+  "absolute_guidance": {
+    "current_ratio": {
+      "label": "流動比率",
+      "unit": "%",
+      "direction": "higher",
+      "threshold": 100,
+      "relation": "minimum",
+      "source": "jfc_current_ratio",
+      "display": "100%未満は要注意"
+    },
+    "equity_ratio_30": {
+      "label": "自己資本比率",
+      "unit": "%",
+      "direction": "higher",
+      "threshold": 30,
+      "relation": "guide",
+      "source": "jfc_equity_ratio",
+      "display": "30%以上が一つの目安"
+    }
+  }
+}

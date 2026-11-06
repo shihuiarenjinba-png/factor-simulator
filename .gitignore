@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 market_data.db
+
+# Generated EDINET dataset; package/deploy artifact, not source.
+data/edinet_financials.sqlite3
