@@ -1,60 +1,72 @@
 import unittest
 
-from industry_benchmark import BENCHMARKS, calculate_metrics, classify, diagnose
+from industry_benchmark import BENCHMARKS, calculate_metrics, diagnose, industry_spec, thresholds
 
 
-class IndustryBenchmarkTests(unittest.TestCase):
-    def test_basic_calculation(self):
+class JapanIndustryBenchmarkTests(unittest.TestCase):
+    def test_manufacturing_reference_values_are_versioned(self):
+        spec = industry_spec("manufacturing")
+        self.assertEqual(spec["metrics"]["operating_margin"]["reference"], 5.4)
+        self.assertEqual(spec["metrics"]["equity_ratio"]["reference"], 50.3)
+        self.assertEqual(spec["metrics"]["inventory_months"]["reference"], 1.64)
+
+    def test_food_and_chemical_override_only_known_profitability_metrics(self):
+        food = industry_spec("manufacturing", "food")
+        chem = industry_spec("manufacturing", "chemical")
+        self.assertEqual(food["metrics"]["operating_margin"]["reference"], 3.6)
+        self.assertEqual(food["metrics"]["ordinary_margin"]["reference"], 5.5)
+        self.assertEqual(chem["metrics"]["operating_margin"]["reference"], 8.5)
+        self.assertEqual(chem["metrics"]["ordinary_margin"]["reference"], 12.3)
+        self.assertEqual(food["metrics"]["equity_ratio"]["reference"], 50.3)
+
+    def test_calculate_japan_financial_metrics(self):
         m = calculate_metrics(
-            revenue=1_000_000,
-            cogs=400_000,
-            net_profit=80_000,
-            labor_cost=300_000,
-            fixed_costs=250_000,
+            revenue=100_000_000,
+            operating_profit=6_000_000,
+            ordinary_profit=8_000_000,
+            net_profit=5_000_000,
+            current_total_assets=120_000_000,
+            prior_total_assets=100_000_000,
+            equity=60_000_000,
+            current_inventory=15_000_000,
+            prior_inventory=13_000_000,
+            current_receivables=20_000_000,
+            prior_receivables=18_000_000,
         )
-        self.assertAlmostEqual(m["gross_margin"], 60.0)
-        self.assertAlmostEqual(m["net_margin"], 8.0)
-        self.assertAlmostEqual(m["labor_ratio"], 30.0)
-        self.assertAlmostEqual(m["break_even_revenue"], 416_666.6667, places=2)
+        self.assertAlmostEqual(m["operating_margin"], 6.0)
+        self.assertAlmostEqual(m["ordinary_margin"], 8.0)
+        self.assertAlmostEqual(m["ordinary_roa"], 8_000_000 / 110_000_000 * 100)
+        self.assertAlmostEqual(m["equity_ratio"], 50.0)
+        self.assertAlmostEqual(m["inventory_months"], 14_000_000 / (100_000_000 / 12))
+        self.assertAlmostEqual(m["receivable_months"], 19_000_000 / (100_000_000 / 12))
 
-    def test_restaurant_reference_can_score_healthy(self):
+    def test_higher_and_lower_magic_lines_are_transparent(self):
+        higher = thresholds(50.0, "higher")
+        lower = thresholds(2.0, "lower")
+        self.assertEqual(higher, {"caution": 37.5, "danger": 25.0})
+        self.assertEqual(lower, {"caution": 2.5, "danger": 3.0})
+
+    def test_diagnosis_exposes_reference_caution_danger_and_sources(self):
         m = calculate_metrics(
-            revenue=1_000_000,
-            cogs=400_000,
-            net_profit=60_000,
-            labor_cost=300_000,
-            fixed_costs=250_000,
+            revenue=100_000_000,
+            operating_profit=2_000_000,
+            ordinary_profit=3_000_000,
+            current_total_assets=120_000_000,
+            prior_total_assets=120_000_000,
+            equity=20_000_000,
+            current_inventory=30_000_000,
+            prior_inventory=30_000_000,
+            current_receivables=30_000_000,
+            prior_receivables=30_000_000,
         )
-        d = diagnose("restaurant", m)
-        self.assertEqual(d["score"], 100)
-        self.assertTrue(all(row["status"] == "healthy" for row in d["rows"]))
-
-    def test_high_labor_ratio_warns(self):
-        status, _, score = classify(45.0, BENCHMARKS["restaurant"]["labor_ratio"])
-        self.assertEqual(status, "warning")
-        self.assertLess(score, 100)
+        d = diagnose("manufacturing", m)
+        self.assertLess(d["score"], 80)
+        self.assertTrue(d["sources"])
+        self.assertTrue(all("reference" in row and "caution" in row and "danger" in row for row in d["rows"]))
 
     def test_zero_revenue_rejected(self):
         with self.assertRaises(ValueError):
-            calculate_metrics(
-                revenue=0,
-                cogs=0,
-                net_profit=0,
-                labor_cost=0,
-                fixed_costs=0,
-            )
-
-    def test_negative_gross_margin_has_no_break_even(self):
-        m = calculate_metrics(
-            revenue=100,
-            cogs=120,
-            net_profit=-40,
-            labor_cost=10,
-            fixed_costs=20,
-        )
-        self.assertIsNone(m["break_even_revenue"])
-        d = diagnose("retail", m)
-        self.assertIn("損益分岐売上", d["advice"][0])
+            calculate_metrics(revenue=0, operating_profit=0, ordinary_profit=0)
 
 
 if __name__ == "__main__":
