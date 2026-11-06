@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "market": "JP",
+  "currency": "JPY",
+  "benchmark_version": "MOF_2024_ANNUAL_V1",
+  "period": "FY2024",
+  "published_date": "2025-09-01",
+  "accounting_scope_note": "財務省法人企業統計の日本企業集計。将来のEDINET企業別ベンチマークは日本基準(J-GAAP)提出企業を優先して別系列で管理する。",
+  "threshold_policy": {
+    "type": "product_heuristic_not_official_cutoff",
+    "higher_is_better": {
+      "caution_below_reference_ratio": 0.75,
+      "danger_below_reference_ratio": 0.5
+    },
+    "lower_is_better": {
+      "caution_above_reference_ratio": 1.25,
+      "danger_above_reference_ratio": 1.5
+    },
+    "note": "注意/危険ラインは政府の認定基準ではなく、業界参考値からの乖離を分かりやすくするための本ツール独自ヒューリスティック。"
+  },
+  "sources": {
+    "mof_profitability_2024": {
+      "publisher": "財務省 財務総合政策研究所",
+      "title": "年次別法人企業統計調査（令和6年度） 売上高利益率の推移",
+      "url": "https://www.mof.go.jp/pri/reference/ssc/results/data.htm",
+      "retrieved_note": "製造業全規模: 売上高営業利益率5.4%、売上高経常利益率8.6%。全産業: 5.0%、6.8%。"
+    },
+    "mof_roa_2024": {
+      "publisher": "財務省 財務総合政策研究所",
+      "title": "法人企業統計からみえる企業の財務指標：総資本経常利益率",
+      "url": "https://www.mof.go.jp/pri/reference/ssc/zaimu/",
+      "retrieved_note": "製造業全規模6.8%、全産業全規模5.1%。"
+    },
+    "mof_equity_2024": {
+      "publisher": "財務省 財務総合政策研究所",
+      "title": "年次別法人企業統計調査（令和6年度） 自己資本比率",
+      "url": "https://www.mof.go.jp/pri/reference/ssc/results/data.htm",
+      "retrieved_note": "製造業全規模50.3%、全産業42.1%。"
+    },
+    "mof_inventory_2024": {
+      "publisher": "財務省 財務総合政策研究所",
+      "title": "法人企業統計からみえる企業の財務指標：棚卸資産回転期間",
+      "url": "https://www.mof.go.jp/pri/reference/ssc/zaimu/",
+      "retrieved_note": "製造業全規模1.64か月、全産業1.12か月。"
+    },
+    "mof_receivables_2024": {
+      "publisher": "財務省 財務総合政策研究所",
+      "title": "法人企業統計からみえる企業の財務指標：売上債権回転期間",
+      "url": "https://www.mof.go.jp/pri/reference/ssc/zaimu/",
+      "retrieved_note": "製造業全規模2.26か月、全産業1.93か月。"
+    },
+    "mof_formulas": {
+      "publisher": "財務省 財務総合政策研究所",
+      "title": "法人企業統計における財務営業比率の算式",
+      "url": "https://www.mof.go.jp/pri/reference/ssc/results/calculation.htm"
+    },
+    "fsa_edinet_taxonomy": {
+      "publisher": "金融庁",
+      "title": "EDINETタクソノミ一覧",
+      "url": "https://www.fsa.go.jp/search/EDINET_Taxonomy_All.html"
+    }
+  },
+  "industries": {
+    "all": {
+      "label": "全産業（金融・保険を除く集計を含む）",
+      "metrics": {
+        "operating_margin": {"label": "売上高営業利益率", "reference": 5.0, "unit": "%", "direction": "higher", "source": "mof_profitability_2024"},
+        "ordinary_margin": {"label": "売上高経常利益率", "reference": 6.8, "unit": "%", "direction": "higher", "source": "mof_profitability_2024"},
+        "ordinary_roa": {"label": "総資本経常利益率", "reference": 5.1, "unit": "%", "direction": "higher", "source": "mof_roa_2024"},
+        "equity_ratio": {"label": "自己資本比率", "reference": 42.1, "unit": "%", "direction": "higher", "source": "mof_equity_2024"},
+        "inventory_months": {"label": "棚卸資産回転期間", "reference": 1.12, "unit": "か月", "direction": "lower", "source": "mof_inventory_2024"},
+        "receivable_months": {"label": "売上債権回転期間", "reference": 1.93, "unit": "か月", "direction": "lower", "source": "mof_receivables_2024"}
+      }
+    },
+    "manufacturing": {
+      "label": "製造業",
+      "metrics": {
+        "operating_margin": {"label": "売上高営業利益率", "reference": 5.4, "unit": "%", "direction": "higher", "source": "mof_profitability_2024"},
+        "ordinary_margin": {"label": "売上高経常利益率", "reference": 8.6, "unit": "%", "direction": "higher", "source": "mof_profitability_2024"},
+        "ordinary_roa": {"label": "総資本経常利益率", "reference": 6.8, "unit": "%", "direction": "higher", "source": "mof_roa_2024"},
+        "equity_ratio": {"label": "自己資本比率", "reference": 50.3, "unit": "%", "direction": "higher", "source": "mof_equity_2024"},
+        "inventory_months": {"label": "棚卸資産回転期間", "reference": 1.64, "unit": "か月", "direction": "lower", "source": "mof_inventory_2024"},
+        "receivable_months": {"label": "売上債権回転期間", "reference": 2.26, "unit": "か月", "direction": "lower", "source": "mof_receivables_2024"}
+      },
+      "subindustry_overrides": {
+        "food": {
+          "label": "食料品製造",
+          "metrics": {
+            "operating_margin": {"reference": 3.6},
+            "ordinary_margin": {"reference": 5.5}
+          }
+        },
+        "chemical": {
+          "label": "化学",
+          "metrics": {
+            "operating_margin": {"reference": 8.5},
+            "ordinary_margin": {"reference": 12.3}
+          }
+        }
+      }
+    }
+  }
+}
