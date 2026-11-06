@@ -14,7 +14,6 @@ import re
 import zipfile
 from typing import Iterable
 
-import requests
 
 BASE = "https://api.edinet-fsa.go.jp/api/v2"
 TIMEOUT = 30
@@ -39,7 +38,8 @@ class EdinetError(RuntimeError):
     pass
 
 
-def _request(path: str, *, api_key: str, params: dict | None = None) -> requests.Response:
+def _request(path: str, *, api_key: str, params: dict | None = None):
+    import requests
     if not api_key.strip():
         raise EdinetError("EDINET APIキーが必要です")
     query = dict(params or {})
