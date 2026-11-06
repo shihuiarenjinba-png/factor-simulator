@@ -7,8 +7,8 @@ from industry_benchmark import BENCHMARKS, SOURCE_NOTES, calculate_metrics, diag
 st.set_page_config(page_title="日本企業 業種別 数字診断", page_icon="🧭", layout="wide")
 
 st.title("🧭 日本企業 業種別 数字診断")
-st.caption("有報・決算書の数字を入れると、日本の公的統計と比較して「どの数字を先に見るか」を返します。")
-st.info("日本市場向け。現在の基準は財務省「法人企業統計」。注意/危険ラインは公式認定基準ではなく、業界参考値からの乖離を分かりやすくする診断ルールです。")
+st.caption("決算書の数字を入れると、公的な業種参考値と市場で一般的に使われる財務目安を並べて表示します。")
+st.info("日本市場向け。企業別EDINETデータは本番基準に使用せず、財務省の公的集計と公的機関の一般的な財務目安を使用します。")
 
 industry = st.selectbox(
     "業種",
@@ -37,28 +37,27 @@ with c2:
     net_profit = st.number_input("当期純利益（円）", value=5_000_000.0, step=500_000.0)
 with c3:
     st.markdown("**入力の目安**")
-    st.caption("まず有価証券報告書・決算書の連結数値を同一年度で入力してください。金額単位は円で統一します。")
+    st.caption("同一年度・同一会計単位の数字を入力してください。金額単位は円で統一します。")
 
-with st.expander("2. 貸借対照表も入力する（ROA・自己資本比率・在庫/売上債権の診断）", expanded=True):
+with st.expander("2. 貸借対照表も入力する", expanded=True):
     a1, a2, a3 = st.columns(3)
     with a1:
-        current_assets_total = st.number_input("当期 総資産（円、0なら未入力）", min_value=0.0, value=120_000_000.0, step=1_000_000.0)
+        current_assets_total = st.number_input("総資産（円、0なら未入力）", min_value=0.0, value=120_000_000.0, step=1_000_000.0)
         prior_assets_total = st.number_input("前期 総資産（円、0なら当期値で近似）", min_value=0.0, value=115_000_000.0, step=1_000_000.0)
-        equity = st.number_input("自己資本（純資産−新株予約権、円）", value=60_000_000.0, step=1_000_000.0)
+        equity = st.number_input("自己資本（円）", value=60_000_000.0, step=1_000_000.0)
     with a2:
-        inv_current = st.number_input("当期 棚卸資産（円）", min_value=0.0, value=14_000_000.0, step=500_000.0)
-        inv_prior = st.number_input("前期 棚卸資産（円、0なら当期値で近似）", min_value=0.0, value=13_000_000.0, step=500_000.0)
+        current_assets = st.number_input("流動資産（円）", min_value=0.0, value=50_000_000.0, step=1_000_000.0)
+        current_liabilities = st.number_input("流動負債（円）", min_value=0.0, value=40_000_000.0, step=1_000_000.0)
     with a3:
-        rec_current = st.number_input("当期 売上債権（受取手形+売掛金、円）", min_value=0.0, value=18_000_000.0, step=500_000.0)
-        rec_prior = st.number_input("前期 売上債権（円、0なら当期値で近似）", min_value=0.0, value=17_000_000.0, step=500_000.0)
+        inv_current = st.number_input("当期 棚卸資産（円）", min_value=0.0, value=14_000_000.0, step=500_000.0)
+        inv_prior = st.number_input("前期 棚卸資産（円）", min_value=0.0, value=13_000_000.0, step=500_000.0)
+        rec_current = st.number_input("当期 売上債権（円）", min_value=0.0, value=18_000_000.0, step=500_000.0)
+        rec_prior = st.number_input("前期 売上債権（円）", min_value=0.0, value=17_000_000.0, step=500_000.0)
 
-st.markdown("### 判定の見方")
-l1, l2, l3, l4 = st.columns(4)
-l1.success("緑：業界参考値以上 / 以下（良い方向）")
-l2.info("青：参考値から少し外れる")
-l3.warning("黄：参考値から25%以上悪化")
-l4.error("赤：参考値から50%以上悪化")
-st.caption("25%/50%は本ツールの見やすさのためのヒューリスティックで、財務省・金融庁が定めた合否基準ではありません。")
+st.markdown("### いつでも見える基準")
+g1, g2 = st.columns(2)
+g1.info("**流動比率：100％**\n\n日本政策金融公庫は、100％未満では資金繰り悪化が考えられると説明しています。")
+g2.info("**自己資本比率：30％**\n\n日本政策金融公庫は、業種差はあるものの30％超を一つの目安としています。")
 
 if st.button("この会社を診断", type="primary", use_container_width=True):
     def optional(v):
@@ -73,6 +72,8 @@ if st.button("この会社を診断", type="primary", use_container_width=True):
             current_total_assets=optional(current_assets_total),
             prior_total_assets=optional(prior_assets_total),
             equity=optional(equity),
+            current_assets=optional(current_assets),
+            current_liabilities=optional(current_liabilities),
             current_inventory=optional(inv_current),
             prior_inventory=optional(inv_prior),
             current_receivables=optional(rec_current),
@@ -86,27 +87,25 @@ if st.button("この会社を診断", type="primary", use_container_width=True):
         st.caption(f"ベンチマーク版: {result['benchmark_version']} / 対象: {result['period']}")
         st.metric("簡易スコア", f"{result['score']} / 100")
 
-        st.markdown("### 指標とマジックナンバー")
-        for row in result["rows"]:
-            if row["direction"] == "higher":
-                line = (
-                    f"**{row['title']}：{row['value']:.2f}{row['unit']}** ｜ "
-                    f"業界参考 {row['reference']:.2f} ｜ 注意 < {row['caution']:.2f} ｜ 危険 < {row['danger']:.2f}"
-                )
-            else:
-                line = (
-                    f"**{row['title']}：{row['value']:.2f}{row['unit']}** ｜ "
-                    f"業界参考 {row['reference']:.2f} ｜ 注意 > {row['caution']:.2f} ｜ 危険 > {row['danger']:.2f}"
-                )
-            line += f" — {row['message']}"
+        st.markdown("### 一般的な財務目安")
+        for row in result["guidance_rows"]:
+            line = f"**{row['title']}：{row['value']:.1f}{row['unit']}** ｜ 目安 {row['threshold']:.1f}{row['unit']} — {row['message']}"
             if row["status"] == "healthy":
                 st.success(line)
-            elif row["status"] == "watch":
-                st.info(line)
-            elif row["status"] == "warning":
-                st.warning(line)
             else:
-                st.error(line)
+                st.warning(line)
+
+        st.markdown("### 業種別の参考値")
+        st.caption("こちらは合否ラインではなく、公的な業種集計との比較です。")
+        for row in result["rows"]:
+            line = (
+                f"**{row['title']}：{row['value']:.2f}{row['unit']}** ｜ "
+                f"業種参考 {row['reference']:.2f}{row['unit']} — {row['message']}"
+            )
+            if row["status"] == "healthy":
+                st.success(line)
+            else:
+                st.info(line)
 
         st.markdown("### 次に確認すること")
         for i, item in enumerate(result["advice"], 1):
@@ -118,19 +117,18 @@ if st.button("この会社を診断", type="primary", use_container_width=True):
             st.caption(src["url"])
         st.caption(result["threshold_note"])
 
-with st.expander("有報データの管理方針"):
+with st.expander("データ方針"):
     st.write(
-        "今後EDINETから企業別データを追加する際は、EDINETコード・docID・会社名・決算期・会計基準・"
-        "タクソノミ年・業種・取得URL・取得日時・原本SHA-256を保存します。日本基準(J-GAAP)とIFRSは混ぜず、"
-        "業界分布は別系列で集計します。"
+        "商用版の主基準は、公的な業種集計と公的機関が明示する一般的な財務目安です。"
+        "企業別EDINETデータは本番診断の基準値には使用しません。"
     )
-    st.write("基準値そのものはコードではなく data/ の版管理JSONで更新します。")
+    st.write("基準値は data/ の版管理JSONで管理し、出典・対象年度を追跡できる状態にします。")
 
 with st.expander("基準値の一次ソース"):
     for note in SOURCE_NOTES:
         st.write("• " + note)
     st.markdown(
         "- 財務省 法人企業統計: https://www.mof.go.jp/pri/reference/ssc/results/data.htm\n"
-        "- 財務指標と算式: https://www.mof.go.jp/pri/reference/ssc/results/calculation.htm\n"
-        "- 金融庁 EDINETタクソノミ: https://www.fsa.go.jp/search/EDINET_Taxonomy_All.html"
+        "- 日本政策金融公庫 財務診断指標: https://www.jfc.go.jp/n/zaimushindan/shihyo.html\n"
+        "- 日本政策金融公庫 決算書の見方: https://www.jfc.go.jp/n/finance/keiei/support-plus/detail/column.html?id=c55_392"
     )
