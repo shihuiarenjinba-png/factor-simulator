@@ -6,6 +6,7 @@ import re  # 正規表現モジュール
 import unicodedata  # サニタイズ用
 import time
 import datetime  # 日付処理用のライブラリ
+from portfolio_input import load_portfolio_upload
 
 # カスタムモジュールの読み込み
 try:
@@ -104,45 +105,9 @@ with st.sidebar.expander("📁 ポートフォリオ入力", expanded=True):
 
     if uploaded_file is not None:
         try:
-            if uploaded_file.name.endswith(".csv"):
-                df_up = pd.read_csv(uploaded_file, encoding="utf-8-sig")
-            else:
-                df_up = pd.read_excel(uploaded_file)
-
-            # ティッカー列の自動検出
-            ticker_col = next((c for c in df_up.columns if any(k in c for k in [
-                "コード", "Ticker", "ticker", "銘柄", "ティッカー", "Symbol", "symbol", "Code", "code"
-            ])), None)
-            if not ticker_col:
-                best_col, best_count = None, 0
-                for c in df_up.columns:
-                    cnt = df_up[c].astype(str).str.contains(r"\b\d{4}\b").sum()
-                    if cnt > best_count:
-                        best_count, best_col = cnt, c
-                if best_count > 0:
-                    ticker_col = best_col
-
-            # ウェイト列の自動検出
-            weight_col = next((c for c in df_up.columns if any(k in c for k in [
-                "Weight", "weight", "ウェイト", "比率", "割合", "保有", "Ratio", "ratio", "%"
-            ])), None)
-
-            if ticker_col:
-                raw_codes = df_up[ticker_col].astype(str).str.extract(r"(\d{4})")[0].dropna().tolist()
-                codes = list(dict.fromkeys(raw_codes))  # 重複排除・順序保持
-                if weight_col:
-                    weights = pd.to_numeric(df_up[weight_col], errors="coerce").fillna(0).tolist()[:len(codes)]
-                else:
-                    weights = [round(100.0 / len(codes), 1)] * len(codes)
-
-                # テーブルに反映（session_stateを上書き）
-                st.session_state.portfolio_df = pd.DataFrame({
-                    "コード": codes,
-                    "ウェイト": [float(w) for w in weights]
-                })
-                st.success(f"✅ {len(codes)} 銘柄を読み込みました。")
-            else:
-                st.error("銘柄コード列が見つかりません。")
+            parsed = load_portfolio_upload(uploaded_file)
+            st.session_state.portfolio_df = parsed
+            st.success(f"✅ {len(parsed)} 銘柄を読み込みました。")
         except Exception as e:
             st.error(f"読み込み失敗: {e}")
 
